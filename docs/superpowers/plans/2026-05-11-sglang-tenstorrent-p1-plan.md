@@ -4,7 +4,7 @@
 
 **Goal:** Deliver an end-to-end single-prompt Llama-3.1-8B BF16 inference server on SGLang, running TP=2 across two Tenstorrent p150a cards via `ttnn.mesh_device` and ETH fabric, as defined by the validated spec.
 
-**Architecture:** Black-box integration. SGLang owns scheduler / HTTP / sampling-call-site; a `tt_transformers` model instance (built via `models.tt_transformers.tt.common.create_tt_model` returning a `Generator`/`LlamaForCausalLM`, verified during Phase 0) owns the model forward and KV cache. New code lives in-tree under `python/sglang/srt/hardware_backend/tenstorrent/`. Pattern mirrors the MLX backend line-by-line: worker overrides `forward_batch_generation`, ModelRunner is a bookkeeping stub, `attn_backend=None`, `sampler=None`, greedy sampling happens in the worker on host torch tensors.
+**Architecture:** Black-box integration. SGLang owns scheduler / HTTP / sampling-call-site; the worker depends only on a 5-method `TTExecutionBackend` ABC (`new_request` / `extend` / `decode_step` / `free` / `reset_all`) resolved at startup via the `TT_EXECUTION_BACKENDS` registry keyed by env var `SGLANG_TT_EXECUTION_BACKEND`. P1 ships exactly one implementation, `TTTransformersExecutionBackend`, wrapping a `tt_transformers` `Generator` / `LlamaForCausalLM` (built via `models.tt_transformers.tt.common.create_tt_model`, verified during Phase 0); a `TTXLAExecutionBackend` slot is reserved for post-P1 (tt-xla replaces deprecated tt-torch). New code lives in-tree under `python/sglang/srt/hardware_backend/tenstorrent/`. Pattern mirrors the MLX backend line-by-line: worker overrides `forward_batch_generation`, ModelRunner is a bookkeeping stub, `attn_backend=None`, `sampler=None`, greedy sampling happens in the worker on host torch tensors. See spec §3.2 invariant #7.
 
 **Tech Stack:** Python 3.10, SGLang main, `ttnn` / `tt-metal` (bundled in dev docker image), `tt_transformers`, PyTorch (host-side for sampling and tensor bridging), `pytest` for unit tests.
 
@@ -1452,7 +1452,7 @@ Run through spec §0–§13 with this plan in hand and confirm each item maps to
 - §1 (hardware/software) — Phase 0
 - §2 (prerequisites) — Phase 0
 - §3 (architecture) — Phases A, D, E, F, G, H
-- §4.1 (new files) — every file listed has a Task (A.1–A.3, D.1–D.2, E.1–E.4, F.1–F.2, G.1–G.4)
+- §4.1 (new files) — every file listed has a Task (A.1–A.3, D.1–D.2, E.1–E.4, F.1–F.4, G.1–G.4)
 - §4.2 (core mods) — Phase B (~17 files) + Phase C (scheduler dispatch)
 - §5 (data flow) — Phase G.2 (pseudocode reproduced verbatim)
 - §6.1 (server-args defaults) — Phase E.1 (full body copied)
