@@ -320,7 +320,12 @@ hardware_backend/tenstorrent/tp_worker.py: TTTpModelWorker(TpModelWorker)
            can_run_cuda_graph=False)  # + other fields per MLX
 
      # --- P1 guard: only EXTEND/DECODE besides IDLE ---
-     if not (mwb.forward_mode.is_extend() or mwb.forward_mode.is_decode()):
+     # CRITICAL: ForwardMode.is_extend() returns True for EXTEND, MIXED,
+     # DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, AND DLLM_EXTEND
+     # (forward_batch_info.py:111-119) — it is NOT a single-mode predicate.
+     # Use explicit enum equality so MIXED / SPLIT_PREFILL / DLLM_EXTEND
+     # raise as required by §3.2 invariant #6.
+     if mwb.forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
        raise NotImplementedError(
            f"P1 supports EXTEND/DECODE/IDLE only, got {mwb.forward_mode}. "
            f"Chunked prefill / mixed / DLLM must stay disabled via "
@@ -331,11 +336,11 @@ hardware_backend/tenstorrent/tp_worker.py: TTTpModelWorker(TpModelWorker)
      assert mwb.reqs is not None and len(mwb.reqs) == 1
      req_id = mwb.reqs[0].rid
 
-     if mwb.forward_mode.is_extend():
+     if mwb.forward_mode == ForwardMode.EXTEND:
        prompt_tokens = mwb.input_ids  # torch.Tensor[L] on CPU
        self.execution_backend.new_request(req_id, prompt_tokens)
        logits = self.execution_backend.extend(req_id)  # host torch.Tensor
-     else:  # DECODE
+     else:  # DECODE (other modes raised above)
        last_tok = int(mwb.input_ids[-1].item())
        logits = self.execution_backend.decode_step(req_id, last_tok)
 
@@ -697,6 +702,8 @@ P1 explicitly does **not** require:
 | 10 | Llama-3.1-8B weights gated, HF token expiry mid-development | Low | Low | Documented as setup step. |
 | 11 | **Silent-wrong-output hazard A**: implementer wires `model_runner.sample(logits_output, ForwardBatch.init_new(mwb, runner))` but `attn_backend=None` makes `ForwardBatch.init_new` produce zero positions / `support_triton` checks fail silently → sampler returns garbage tokens. | **High** if it happens | Low | §3.2 invariant #2 + §5.1 pseudocode mandate greedy-in-worker. Test (§8.2) catches via greedy mismatch with HF reference. Implementer must NOT add `model_runner.sample()` in P1. |
 | 12 | **Silent-wrong-output hazard B**: `disable_overlap_schedule` not set → `FutureMap` allocates `-1` sentinel indices that the synchronous TT path never resolves → those `-1`s get appended to `req.output_ids` as token ids → output is malformed. | **High** if it happens | Medium (default is overlap=on) | §6.1 forces `disable_overlap_schedule = True`. Test (§8.1) smoke catches via "Paris" assertion. |
+| 13 | **`ForwardMode.is_extend()` is multi-mode, not single-mode.** Returns True for EXTEND, MIXED, DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, AND DLLM_EXTEND (`forward_batch_info.py:111-119`). Using it as the dispatch condition in `_forward_batch_generation_tt` would silently admit MIXED / DLLM_EXTEND into the EXTEND branch, contradicting invariant #6. | **High** if it happens | Medium (the predicate name is misleading) | §5.1 pseudocode uses explicit enum equality (`mwb.forward_mode == ForwardMode.EXTEND`), NOT `is_extend()`. `test_forward_mode_guard.py` covers MIXED/SPLIT_PREFILL/DLLM_EXTEND paths to lock the contract. |
+| 14 | **`TT_EXECUTION_BACKENDS` NameError trap** if a future contributor reorders the import-after-statement in `execution/__init__.py`. The registry dict must be declared before the backend modules are imported (their `@register_tt_execution_backend` decorators fire at import time). | Low (caught immediately by Python) | Low (the `noqa: E402` + explanatory comment block already exist; CI would catch on first `import`) | Plan F.1 Step 1 spells out the ordering with inline "Step 1: declare registry FIRST" / "Step 2: NOW import" comments. `test_execution_backend_registry.py` exercises a fresh process import path. |
 
 ---
 

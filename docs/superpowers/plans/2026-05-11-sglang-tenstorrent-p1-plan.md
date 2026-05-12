@@ -70,11 +70,11 @@ print('create_tt_model signature:', inspect.signature(create_tt_model))
 
 Expected: prints all three. Capture the exact method names that perform prefill, decode, KV-cache management — these drive Phase F.
 
-- [ ] **Step 2:** Append the captured method-name list to `phase0-evidence.txt`. Phase F.1 / F.2 will reference these names when implementing `TTLlamaWrapper.extend` / `decode_step`. Likely mapping (verify against actual `Generator` API):
-  - `wrapper.extend(req_id)` → `generator.prefill_forward(...)` or similar
-  - `wrapper.decode_step(req_id, tok)` → `generator.decode_forward(...)` or similar
-  - `wrapper.new_request(req_id, prompt)` → allocate per-request state (may need our own bookkeeping if Generator doesn't expose per-req allocate/free)
-  - `wrapper.free(req_id)` → release per-request state
+- [ ] **Step 2:** Append the captured method-name list to `phase0-evidence.txt`. Phase F.1 / F.2 will reference these names when implementing `TTTransformersExecutionBackend.extend` / `decode_step` (the P1 impl of the `TTExecutionBackend` ABC — see Phase F header for the spec amendment). Likely mapping (verify against actual `Generator` API):
+  - `backend.extend(req_id)` → `generator.prefill_forward(...)` or similar
+  - `backend.decode_step(req_id, tok)` → `generator.decode_forward(...)` or similar
+  - `backend.new_request(req_id, prompt)` → allocate per-request state (may need our own bookkeeping if Generator doesn't expose per-req allocate/free)
+  - `backend.free(req_id)` → release per-request state
 
 - [ ] **Step 3:** If `Generator` does not expose enough public methods to drive prefill/decode externally (e.g. only a `generate()` that owns the whole loop), **STOP and escalate** — Risk #1 has fired in a different form. The wrapper layer cannot drive prefill/decode externally, and we'd need to upstream hooks into `tt_transformers` or redesign.
 
@@ -777,7 +777,35 @@ SGLANG_TT_EXECUTION_BACKEND = EnvStr("")
 
 Add it near `SGLANG_USE_MLX` for locality.
 
-- [ ] **Step 5:** Create `execution/tt_transformers_backend.py` with `class TTTransformersExecutionBackend(TTExecutionBackend):` decorated `@register_tt_execution_backend("tt_transformers")`. The class body is the existing `llama_adapter.py:TTLlamaWrapper` implementation moved verbatim — just rename the class and adjust imports. The 5 method stubs (currently raising `"lands in Phase F.2"` NotImplementedError) carry over unchanged.
+- [ ] **Step 5:** Create `execution/tt_transformers_backend.py` with `class TTTransformersExecutionBackend(TTExecutionBackend):` decorated `@register_tt_execution_backend("tt_transformers")`. The class body is the existing `llama_adapter.py:TTLlamaWrapper` implementation moved verbatim with three deltas:
+
+  1. Rename the class `TTLlamaWrapper` → `TTTransformersExecutionBackend`.
+  2. Add `from .base import TTExecutionBackend` and make the class inherit from it (so the registry's type annotation matches).
+  3. **HOIST the lazy imports from inside `__init__` up to module scope behind `try/except ImportError`** — this is non-negotiable for F.3 testability:
+
+     ```python
+     # In llama_adapter.py these lived inside __init__ (deferred for
+     # non-TT-host importability). For F.3 mocking we need them on the
+     # module namespace, so hoist them but keep the non-TT-host
+     # importability via try/except + None sentinels.
+     try:
+         import ttnn
+         from models.tt_transformers.tt.common import create_tt_model
+         from models.tt_transformers.tt.generator import Generator
+         from models.tt_transformers.tt.model_config import DecodersPrecision
+     except ImportError:
+         ttnn = None
+         create_tt_model = None
+         Generator = None
+         DecodersPrecision = None
+     ```
+
+     Then in `__init__`, add a single-line guard before the first use:
+     `assert create_tt_model is not None, "tt_transformers not importable; install tt-metal or activate its venv"`.
+
+  Reason: F.3 uses `@patch("...tt_transformers_backend.create_tt_model")`, which fails if the name isn't a module attribute. The in-`__init__` form in the prototype was for non-TT-host importability — module-scope `try/except` preserves that AND exposes the names for patching.
+
+  The 5 method stubs (currently raising `"lands in Phase F.2"` NotImplementedError) carry over unchanged.
 
 - [ ] **Step 6:** `git rm python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py` (use `git rm`, NOT plain `rm` — we want git to record the file's removal so future blame on `tt_transformers_backend.py` traces back to commit `152b67c8a`). Run `grep -rn "llama_adapter\|TTLlamaWrapper" python/sglang/` and update any leftover references (Phase A/E artifacts may reference the old name in comments).
 
@@ -824,7 +852,7 @@ The exact ttnn calls inside each method depend on `Generator`/`LlamaForCausalLM`
 
 Two test files: one tests the lifecycle methods of `TTTransformersExecutionBackend` directly (mocked tt_transformers), the other tests the registry + factory + env-var resolution path.
 
-- [ ] **Step 1:** Write `test_wrapper_lifecycle.py`:
+- [ ] **Step 1:** Write `test_wrapper_lifecycle.py`. **PREREQUISITE:** F.1 Step 5 must have hoisted `ttnn`, `create_tt_model`, `Generator`, `DecodersPrecision` to module scope in `tt_transformers_backend.py` (behind `try/except ImportError`). Without that, the `@patch(f"{_MODULE}.create_tt_model")` decorator AttributeErrors because the name isn't on the module namespace. Verify with `grep -n "^import\|^from\|^try:" python/sglang/srt/hardware_backend/tenstorrent/execution/tt_transformers_backend.py` before running tests.
 
 ```python
 import pytest
@@ -1062,7 +1090,12 @@ class TTTpModelWorker(TpModelWorker):
             )
 
         # --- P1 guard: only EXTEND/DECODE besides IDLE ---
-        if not (mwb.forward_mode.is_extend() or mwb.forward_mode.is_decode()):
+        # CRITICAL: ForwardMode.is_extend() is multi-mode — returns True
+        # for EXTEND, MIXED, DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL,
+        # AND DLLM_EXTEND (forward_batch_info.py:111-119). Use explicit
+        # equality so MIXED / SPLIT_PREFILL / DLLM_EXTEND raise per
+        # invariant #6 instead of silently entering the EXTEND branch.
+        if mwb.forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
             raise NotImplementedError(
                 f"P1 supports EXTEND/DECODE/IDLE only, got {mwb.forward_mode}. "
                 f"Chunked prefill / mixed / DLLM must stay disabled via "
@@ -1073,11 +1106,11 @@ class TTTpModelWorker(TpModelWorker):
         assert mwb.reqs is not None and len(mwb.reqs) == 1
         req_id = mwb.reqs[0].rid
 
-        if mwb.forward_mode.is_extend():
+        if mwb.forward_mode == ForwardMode.EXTEND:
             prompt_tokens = mwb.input_ids  # torch.Tensor[L], CPU
             self.execution_backend.new_request(req_id, prompt_tokens)
             logits = self.execution_backend.extend(req_id)  # host torch.Tensor
-        else:  # DECODE
+        else:  # DECODE (other modes already raised above)
             last_tok = int(mwb.input_ids[-1].item())
             logits = self.execution_backend.decode_step(req_id, last_tok)
 
