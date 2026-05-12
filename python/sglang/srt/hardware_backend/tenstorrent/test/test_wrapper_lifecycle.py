@@ -27,7 +27,12 @@ def _create_tt_model_4tuple():
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
-def test_lifecycle_roundtrip(_mock_ttnn, _mock_gen, mock_create):
+def test_lifecycle_roundtrip(_mock_ttnn, _mock_gen, mock_create, monkeypatch):
+    # monkeypatch.setenv("LLAMA_DIR", "") forces pytest to snapshot the
+    # env-var and restore it after the test — production __init__ writes
+    # os.environ["LLAMA_DIR"] = model_path unconditionally and would
+    # otherwise leak across tests.
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
@@ -47,7 +52,27 @@ def test_lifecycle_roundtrip(_mock_ttnn, _mock_gen, mock_create):
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
-def test_reset_all_clears_state(_mock_ttnn, _mock_gen, mock_create):
+def test_extend_then_free_no_decode(_mock_ttnn, _mock_gen, mock_create, monkeypatch):
+    """Prefill-only path: new_request → extend → free (no decode_step)."""
+    monkeypatch.setenv("LLAMA_DIR", "")
+    mock_create.return_value = _create_tt_model_4tuple()
+    with patch("os.path.isdir", return_value=True):
+        be = TTTransformersExecutionBackend(
+            model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256
+        )
+        be.new_request("r1", [1, 2, 3, 4, 5])
+        _ = be.extend("r1")
+        # After extend, current_offset == prompt_len.
+        assert be._req_state["r1"]["current_offset"] == 5
+        be.free("r1")
+        assert "r1" not in be._req_state
+
+
+@patch(f"{_MODULE}.create_tt_model")
+@patch(f"{_MODULE}.Generator")
+@patch(f"{_MODULE}.ttnn")
+def test_reset_all_clears_state(_mock_ttnn, _mock_gen, mock_create, monkeypatch):
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
@@ -63,7 +88,8 @@ def test_reset_all_clears_state(_mock_ttnn, _mock_gen, mock_create):
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
-def test_duplicate_req_id_raises(_mock_ttnn, _mock_gen, mock_create):
+def test_duplicate_req_id_raises(_mock_ttnn, _mock_gen, mock_create, monkeypatch):
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
@@ -77,7 +103,8 @@ def test_duplicate_req_id_raises(_mock_ttnn, _mock_gen, mock_create):
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
-def test_unknown_req_id_raises_keyerror(_mock_ttnn, _mock_gen, mock_create):
+def test_unknown_req_id_raises_keyerror(_mock_ttnn, _mock_gen, mock_create, monkeypatch):
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
@@ -92,7 +119,8 @@ def test_unknown_req_id_raises_keyerror(_mock_ttnn, _mock_gen, mock_create):
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
-def test_free_unknown_is_idempotent(_mock_ttnn, _mock_gen, mock_create):
+def test_free_unknown_is_idempotent(_mock_ttnn, _mock_gen, mock_create, monkeypatch):
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
@@ -117,9 +145,10 @@ def test_missing_model_path_raises():
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
 def test_active_requests_gauge_inc_and_dec(
-    _mock_ttnn, _mock_gen, mock_create, mock_gauge
+    _mock_ttnn, _mock_gen, mock_create, mock_gauge, monkeypatch
 ):
     """new_request increments the gauge; free decrements it."""
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
@@ -135,7 +164,8 @@ def test_active_requests_gauge_inc_and_dec(
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
 @patch(f"{_MODULE}.ttnn")
-def test_reset_all_zeros_gauge(_mock_ttnn, _mock_gen, mock_create, mock_gauge):
+def test_reset_all_zeros_gauge(_mock_ttnn, _mock_gen, mock_create, mock_gauge, monkeypatch):
+    monkeypatch.setenv("LLAMA_DIR", "")
     mock_create.return_value = _create_tt_model_4tuple()
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
