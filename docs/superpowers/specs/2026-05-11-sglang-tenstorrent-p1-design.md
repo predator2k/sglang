@@ -194,7 +194,7 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
 4. No `torch.distributed`, no NCCL, no Gloo, no ProcessGroup, no per-rank workers.
 5. SGLang's KV pool is `_DummyKVCache` (zero device allocation); KV lives inside `tt_transformers` per-request state. The dummy pool is constructed **directly inside `TTModelRunner.initialize()`** with the matching constructor signature — the `get_mha_kv_pool_cls()` factory is **never invoked and raises NotImplementedError defensively** (see §6.1).
 6. Allowed `forward_mode` values: `EXTEND`, `DECODE`, `IDLE`. **IDLE returns an empty `GenerationBatchResult(logits_output=LogitsProcessorOutput(next_token_logits=None), can_run_cuda_graph=False)`** — MLX handles this at `tp_worker.py:136-140` and we must mirror it (scheduler produces IDLE batches even with max_running_requests=1 for sync / draining). MIXED/SPLIT_PREFILL/DLLM_EXTEND raise `NotImplementedError`.
-7. **`TTExecutionBackend` is the only seam the worker depends on.** The 5-method ABC (`new_request` / `extend` / `decode_step` / `free` / `reset_all`) is the boundary; everything below it (ttnn calls, tt_transformers method dispatch, page tables, etc.) is implementation detail of `TTTransformersExecutionBackend`. P1 ships exactly one implementation; the registry + ABC exist so a future `TTXLAExecutionBackend` (post-P1, see §11) is a backend-swap rather than a Phase-F rewrite. Worker and ModelRunner code must **NOT** import `tt_transformers` symbols directly — go through the backend interface.
+7. **`TTExecutionBackend` is the only seam the worker depends on.** The 5-method ABC (`new_request` / `extend` / `decode_step` / `free` / `reset_all`) is the boundary; everything below it (ttnn calls, tt_transformers method dispatch, page tables, etc.) is implementation detail of `TTTransformersExecutionBackend`. P1 ships exactly one implementation; the registry + ABC exist so a future `TTXLAExecutionBackend` (post-P1, see §11) is a backend-swap rather than a Phase-F rewrite. **Worker code (`tp_worker.py`) must NOT import `tt_transformers` symbols directly** — go through the backend interface. (`TTModelRunner` is a bookkeeping stub that already never touches `tt_transformers`; the constraint matters only for the worker.)
 
 ---
 
@@ -452,6 +452,8 @@ def apply_server_args_defaults(self, server_args):
     # No NCCL / disaggregation
     server_args.enable_dp_attention = False
 ```
+
+**Env-only knob (not in server_args):** `SGLANG_TT_EXECUTION_BACKEND` — selects which `TTExecutionBackend` implementation to load (`auto` → P1 default `tt_transformers`; `tt_xla` reserved for post-P1, raises `NotImplementedError` today). Lives in `python/sglang/srt/environ.py` rather than `server_args` to keep the TT-specific knob contained to the OOT backend (§4.2). Users opt into the experimental tt-xla path via `SGLANG_TT_EXECUTION_BACKEND=tt_xla` once that backend is implemented (see §11 "P2-coverage").
 
 Plus class-level overrides:
 ```python

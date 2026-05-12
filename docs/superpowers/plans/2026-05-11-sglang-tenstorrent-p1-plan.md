@@ -618,6 +618,10 @@ This task replaces the deprecated `llama_adapter.py` (originally committed by an
 Mirror of SGLang's attention_registry.py pattern. P1 ships exactly one real
 backend (tt_transformers); tt_xla is a registered placeholder so the
 post-P1 add-a-backend path is a swap rather than a Phase-F rewrite.
+
+IMPORTANT: the registry dict MUST be declared before the backend modules
+are imported — their @register_tt_execution_backend(...) decorators fire
+at import time and would NameError otherwise.
 """
 
 from __future__ import annotations
@@ -627,12 +631,7 @@ from sglang.srt.hardware_backend.tenstorrent.execution.base import (
     TTExecutionBackend,
 )
 
-# Importing the backend modules registers them via decorator side-effects.
-from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: F401
-    tt_transformers_backend,
-    tt_xla_backend,
-)
-
+# Step 1: declare the registry FIRST.
 TT_EXECUTION_BACKENDS: dict[str, type[TTExecutionBackend]] = {}
 
 
@@ -641,6 +640,14 @@ def register_tt_execution_backend(name: str):
         TT_EXECUTION_BACKENDS[name] = cls
         return cls
     return _wrap
+
+
+# Step 2: NOW import the backend modules — their decorators populate the dict.
+# noqa: E402 because these imports must follow the registry declaration above.
+from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402,F401
+    tt_transformers_backend,
+    tt_xla_backend,
+)
 
 
 def resolve_execution_backend_name(requested: str | None = None) -> str:
@@ -662,7 +669,7 @@ def get_tt_execution_backend(name: str | None = None) -> type[TTExecutionBackend
     return TT_EXECUTION_BACKENDS[resolved]
 ```
 
-Note the chicken-and-egg: the registry dict has to exist before the backend modules' decorators fire. The standard Python idiom is to declare `TT_EXECUTION_BACKENDS = {}` *before* the `from ... import tt_transformers_backend` line — adjust import order accordingly.
+Note: the `noqa: E402` is intentional — the import-after-statement is the *correct* shape here, not a code-style issue to suppress lightly. The earlier subagent review flagged this as a CRITICAL trap; the comment on the registry declaration + the noqa make the requirement obvious to future readers.
 
 - [ ] **Step 2:** Create `execution/base.py` — the ABC:
 
@@ -744,11 +751,20 @@ class TTXLAExecutionBackend(TTExecutionBackend):
             "tt_transformers or leave unset to use the auto default)."
         )
 
-    def new_request(self, req_id, prompt_tokens): raise NotImplementedError
-    def extend(self, req_id): raise NotImplementedError
-    def decode_step(self, req_id, last_token): raise NotImplementedError
-    def free(self, req_id): raise NotImplementedError
-    def reset_all(self): raise NotImplementedError
+    def new_request(self, req_id, prompt_tokens):
+        raise NotImplementedError
+
+    def extend(self, req_id):
+        raise NotImplementedError
+
+    def decode_step(self, req_id, last_token):
+        raise NotImplementedError
+
+    def free(self, req_id):
+        raise NotImplementedError
+
+    def reset_all(self):
+        raise NotImplementedError
 ```
 
 - [ ] **Step 4:** Add to `environ.py`:
@@ -898,7 +914,29 @@ def test_tt_xla_construction_raises_with_pointer():
     cls = get_tt_execution_backend("tt_xla")
     with pytest.raises(NotImplementedError, match="P2-coverage"):
         cls(model_path="/tmp", mesh_device=None, max_seq_len=128)
+
+
+def test_env_var_selects_backend(monkeypatch):
+    """The worker's resolve path is `resolve_execution_backend_name()` with
+    no args — the env var is the only input. Test that explicitly so a
+    regression in `envs.SGLANG_TT_EXECUTION_BACKEND.get()` doesn't slip past.
+    """
+    monkeypatch.setenv("SGLANG_TT_EXECUTION_BACKEND", "tt_xla")
+    # Bust any module-level cache on the env reader if envs is lru_cached.
+    envs.SGLANG_TT_EXECUTION_BACKEND.get.cache_clear()  # if applicable
+    assert resolve_execution_backend_name() == "tt_xla"
+
+
+def test_env_var_unset_defaults_to_tt_transformers(monkeypatch):
+    monkeypatch.delenv("SGLANG_TT_EXECUTION_BACKEND", raising=False)
+    assert resolve_execution_backend_name() == "tt_transformers"
 ```
+
+The `monkeypatch.setenv` / `delenv` tests exercise the worker's real lookup
+path (which passes no args). If `envs.SGLANG_TT_EXECUTION_BACKEND.get()` is
+lru-cached, the `.cache_clear()` call covers that — drop the line if `EnvStr`
+re-reads `os.environ` on every call. Verify by grepping `class EnvStr` in
+`environ.py` before keeping/removing the cache_clear line.
 
 - [ ] **Step 3:** Run: `pytest python/sglang/srt/hardware_backend/tenstorrent/test/test_wrapper_lifecycle.py python/sglang/srt/hardware_backend/tenstorrent/test/test_execution_backend_registry.py -v`. **Pass:** all green.
 
@@ -929,7 +967,21 @@ print('integration smoke ok')
 
 **Pass:** prints non-zero logits shape, `integration smoke ok`. Wall-time including weight load: expect 30–60 s (PCIe Gen3 x1 bottleneck on Device 1 — spec §5.2).
 
-- [ ] **Step 2:** Repeat with `SGLANG_TT_EXECUTION_BACKEND=tt_xla` and confirm it raises `NotImplementedError` containing "P2-coverage". This is a 5-second test that exercises the env-var → registry → factory path end-to-end, ensuring the post-P1 swap really is a one-knob change.
+- [ ] **Step 2:** Repeat with `SGLANG_TT_EXECUTION_BACKEND=tt_xla` and confirm it raises `NotImplementedError` containing "P2-coverage" — this is a 5-second test that exercises the env-var → registry → factory path end-to-end, ensuring the post-P1 swap really is a one-knob change:
+
+```bash
+SGLANG_PLATFORM=tenstorrent SGLANG_TT_EXECUTION_BACKEND=tt_xla python -c "
+from sglang.srt.hardware_backend.tenstorrent.execution import get_tt_execution_backend
+BackendCls = get_tt_execution_backend()
+try:
+    BackendCls(model_path='/tmp', mesh_device=None, max_seq_len=128)
+except NotImplementedError as e:
+    assert 'P2-coverage' in str(e), e
+    print('tt_xla swap path ok')
+"
+```
+
+**Pass:** prints `tt_xla swap path ok`. No mesh device required — the NotImplementedError fires before any hardware access.
 
 **Decision gate at end of Phase F:** if `Generator`/`LlamaForCausalLM` does not expose the methods we need to drive prefill/decode externally — e.g. the only public surface is a `generate()` that owns the whole loop — **STOP and escalate**. The wrapper layer cannot be salvaged without either upstreaming hooks into `tt_transformers` or rewriting the loop. Spec §10 #1 (high severity) covers this; the answer is renegotiate the spec, not silently swap models. The ABC + registry remain valid — only the `tt_transformers` impl would need rework.
 
@@ -1066,14 +1118,14 @@ def _mock_mwb(mode: ForwardMode):
 @pytest.mark.parametrize("bad_mode", [ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL, ForwardMode.DLLM_EXTEND])
 def test_unsupported_modes_raise(bad_mode):
     worker = TTTpModelWorker.__new__(TTTpModelWorker)  # skip __init__
-    worker.wrapper = MagicMock()
+    worker.execution_backend = MagicMock()
     with pytest.raises(NotImplementedError, match="P1 supports EXTEND/DECODE/IDLE only"):
         worker._forward_batch_generation_tt(_mock_mwb(bad_mode))
 
 
 def test_idle_returns_empty_result():
     worker = TTTpModelWorker.__new__(TTTpModelWorker)
-    worker.wrapper = MagicMock()
+    worker.execution_backend = MagicMock()
     res = worker._forward_batch_generation_tt(_mock_mwb(ForwardMode.IDLE))
     assert res.logits_output.next_token_logits is None
     assert res.can_run_cuda_graph is False
@@ -1277,7 +1329,7 @@ Adjust prompt count to consume ~1 hour at the observed decode rate.
 | Cold first-prefill TTFT | Fresh server start → first request 500-tok prompt; record TTFT |
 | Warm prefill latency 100 / 500 / 1k / 4k | Issue prompts of each length after warmup; record TTFT |
 | Warm decode steady-state tok/s | Concurrency=1 over 5 min after warmup; tokens / elapsed |
-| D2H measured latency | Add inline timing around `ttnn.to_torch(logits_ttnn)` in wrapper; record p50 / p99 |
+| D2H measured latency | Add inline timing around the `ttnn.to_torch(...)` call **inside `TTTransformersExecutionBackend`** (worker no longer touches ttnn — see §3.2 invariant #7); record p50 / p99 as `tt_d2h_latency_ms` |
 
 - [ ] **Step 2:** Append a "P1 observed performance" section to the spec file. Format as a markdown table; include date, docker image hash, git commit. This is acceptance criterion #4 (§9).
 
