@@ -87,12 +87,15 @@ class TTSRTPlatform(SRTPlatform):
         server_args.cpu_offload_gb = 0  # 0 = offloader disabled (also default)
         server_args.enable_torch_compile = False
 
-        # User-facing device identity. Note: scheduler.init_overlap calls
-        # torch.get_device_module(self.device), and self.device flows from
-        # model_runner.device — NOT from this string. TTModelRunner.__init__
-        # overrides model_runner.device = "cpu" so torch's device-module
-        # lookup works while we keep this user-facing label.
-        server_args.device = "tenstorrent"
+        # torch has no "tenstorrent" device module — ModelRunner.__init__
+        # calls torch.get_device_module(server_args.device).set_device(...)
+        # during init_torch_distributed, which runs BEFORE we can override
+        # self.device in TTModelRunner. So we set "cpu" up front; the TT
+        # platform identity comes from SGLANG_PLATFORM=tenstorrent and is
+        # already activated. Host tensors flow through CPU torch anyway
+        # (sampling, kv-bookkeeping); the real device work lives inside
+        # the TTExecutionBackend via ttnn.
+        server_args.device = "cpu"
 
         # TP visibility: SGLang sees tp_size = 1 in P1. The "TP=2" mesh is
         # entirely inside ttnn's mesh_device — invisible to SGLang. Users
@@ -107,6 +110,12 @@ class TTSRTPlatform(SRTPlatform):
 
         # No NCCL / disaggregation
         server_args.enable_dp_attention = False
+
+        # Disable grammar backend — P1 does completion-only, no JSON / regex /
+        # tool-call constraints. The bundled xgrammar in tt-metal docker is
+        # older than current sglang expects (missing StructuralTag), so
+        # picking "none" avoids an ImportError at scheduler init.
+        server_args.grammar_backend = "none"
 
     def get_mha_kv_pool_cls(self):
         # TTModelRunner (Phase D) constructs _DummyKVCache directly;
@@ -126,6 +135,25 @@ class TTSRTPlatform(SRTPlatform):
         # P1 sets support_cuda_graph()=False so the framework will not
         # call this. If it does, that's a bug — fail loudly.
         raise NotImplementedError("P1 does not use graph runners")
+
+    # ---- Memory accounting (called by ServerArgs.__post_init__) ----
+
+    # Blackhole p150a: 28 GB GDDR6 per card. The framework only uses this
+    # to size mem_fraction_static heuristically; SGLang's "device memory"
+    # accounting is irrelevant to ttnn's internal KV management (P1 is
+    # black-box), so the precise number doesn't drive correctness — just
+    # avoids a NotImplementedError in ServerArgs.__post_init__.
+    _DEVICE_TOTAL_MEMORY_BYTES = 28 * (1024**3)
+
+    def get_device_total_memory(self, device_id: int = 0) -> int:
+        return self._DEVICE_TOTAL_MEMORY_BYTES
+
+    def get_current_memory_usage(self, device=None) -> float:
+        # P1 does NOT track per-process memory on TT cards — ttnn owns
+        # the allocator internally. Return 0.0 (no peak observed); the
+        # value flows into stats logging but not into any scheduling
+        # decision because mem_fraction_static is fixed at startup.
+        return 0.0
 
 
 class MeshDeviceCtx:
