@@ -200,8 +200,22 @@ class TTTpModelWorker(TpModelWorker):
                 f"apply_server_args_defaults."
             )
 
-        # max_running_requests=1 ⇒ at most one req in the batch.
-        assert mwb.reqs is not None and len(mwb.reqs) == 1
+        # max_running_requests=1 ⇒ at most one req in the batch normally.
+        # SGLang's scheduler can briefly dispatch a 0-req batch between
+        # active requests (e.g. when a finished req is being torn down
+        # and the next hasn't started yet); treat that like IDLE rather
+        # than crashing the scheduler subprocess with an AssertionError.
+        # A multi-req batch in P1 is a real bug — raise so we surface it.
+        if mwb.reqs is None or len(mwb.reqs) == 0:
+            return GenerationBatchResult(
+                logits_output=LogitsProcessorOutput(next_token_logits=None),
+                can_run_cuda_graph=False,
+            )
+        if len(mwb.reqs) > 1:
+            raise NotImplementedError(
+                f"P1 supports max_running_requests=1; scheduler dispatched "
+                f"{len(mwb.reqs)} reqs in mode {mwb.forward_mode}"
+            )
         req_id = mwb.reqs[0].rid
 
         # Reconcile per-request backend state before dispatch (mirrors MLX).
