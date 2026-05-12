@@ -28,14 +28,18 @@ The model picks weights from the LLAMA_DIR env var inside ModelArgs.__init__
 before calling create_tt_model so the tt_transformers code finds the right
 checkpoint without leaking docker-mount semantics into upper layers.
 
-Real forward (F.2) and integration smoke (F.4) land next.
+F.2 (this revision) fills in the 5 lifecycle methods. Integration smoke
+on real hardware lands in F.4.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
+
+import torch
 
 from sglang.srt.hardware_backend.tenstorrent.execution import (
     register_tt_execution_backend,
@@ -58,6 +62,54 @@ except ImportError:
     create_tt_model = None
     Generator = None
     DecodersPrecision = None
+
+# Prometheus instruments for spec §6.2 performance counters. Module-scope so
+# F.3 tests can mock them flat (e.g. `@patch(f"{_MODULE}._TT_EXTEND_LATENCY_MS")`).
+# Fall back to a no-op shim if prometheus_client is unavailable (e.g. CI smoke
+# environments) so import never fails.
+try:
+    from prometheus_client import Gauge, Histogram
+except ImportError:
+    class _NoOpMetric:
+        def labels(self, *a, **kw):
+            return self
+
+        def observe(self, *a, **kw):
+            pass
+
+        def inc(self, *a, **kw):
+            pass
+
+        def dec(self, *a, **kw):
+            pass
+
+        def set(self, *a, **kw):
+            pass
+
+    def Histogram(*a, **kw):  # type: ignore[no-redef]
+        return _NoOpMetric()
+
+    def Gauge(*a, **kw):  # type: ignore[no-redef]
+        return _NoOpMetric()
+
+
+_TT_EXTEND_LATENCY_MS = Histogram(
+    "tt_extend_latency_ms",
+    "Per-request extend (prefill) latency on the TT backend, in milliseconds.",
+)
+_TT_DECODE_LATENCY_MS = Histogram(
+    "tt_decode_latency_ms",
+    "Per-step decode latency on the TT backend, in milliseconds.",
+)
+_TT_D2H_LATENCY_MS = Histogram(
+    "tt_d2h_latency_ms",
+    "Per-call device-to-host transfer latency on the TT backend, in milliseconds.",
+)
+_TT_ACTIVE_REQUESTS = Gauge(
+    "tt_active_requests",
+    "Currently-active request count on the TT backend (0 or 1 in P1).",
+)
+
 
 logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
 
@@ -180,34 +232,170 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
             },
         )
 
-    # ----- Per-request lifecycle (Phase F.2 fills in the real bodies) -----
+    # ----- Per-request lifecycle (Phase F.2) -----
 
-    def new_request(self, req_id: str, prompt_tokens: list[int]) -> None:
-        """Allocate per-request KV / position state. Phase F.2 body."""
-        raise NotImplementedError(
-            "TTTransformersExecutionBackend.new_request lands in Phase F.2"
+    def new_request(self, req_id: str, prompt_tokens: Any) -> None:
+        """Allocate per-request bookkeeping.
+
+        tt_transformers (with ``paged_attention_config=None``) manages KV
+        state internally and binds it to a user slot. We don't touch ttnn
+        here — actual KV writes happen on the first ``extend`` call. This
+        method just records the prompt + position counter the worker uses
+        to drive subsequent ``decode_step`` calls.
+        """
+        if req_id in self._req_state:
+            raise ValueError(f"req_id {req_id!r} already active")
+
+        # Accept torch tensors as well as plain Python sequences.
+        if hasattr(prompt_tokens, "tolist"):
+            tokens = prompt_tokens.tolist()
+        else:
+            tokens = list(prompt_tokens)
+        tokens = [int(t) for t in tokens]
+
+        self._req_state[req_id] = {
+            "prompt_tokens": tokens,
+            "current_offset": 0,
+            "user_id": 0,  # P1 batch=1: every request lives in slot 0.
+        }
+
+        _TT_ACTIVE_REQUESTS.inc()
+
+        logger.debug(
+            "req.new",
+            extra={"req_id": req_id, "prompt_len": len(tokens)},
         )
 
     def extend(self, req_id: str):
-        """Run prefill on prompt_tokens. Returns last-token logits. Phase F.2."""
-        raise NotImplementedError(
-            "TTTransformersExecutionBackend.extend lands in Phase F.2"
+        """Run prefill on the request's prompt; return last-token logits.
+
+        Drives ``Generator.prefill_forward_single_user_text`` (the
+        batch=1 path from the captured Phase 0.2 surface) and then pulls
+        logits to host via ``process_decode_output_host``.
+        """
+        if req_id not in self._req_state:
+            raise KeyError(f"unknown req_id {req_id!r}")
+        state = self._req_state[req_id]
+        tokens = state["prompt_tokens"]
+
+        prompt_len = len(tokens)
+        token_tensor = torch.as_tensor(tokens, dtype=torch.long)
+
+        start = time.perf_counter()
+        try:
+            tt_out = self._generator.prefill_forward_single_user_text(
+                token_tensor,
+                page_table=None,           # non-paged in P1
+                user_id=state["user_id"],  # P1 batch=1 always 0
+                last_token_idx=prompt_len - 1,
+                kv_cache=None,             # tt_transformers manages KV internally
+            )
+            # TODO(F.4): split D2H timing from the surrounding device call so
+            # we can populate _TT_D2H_LATENCY_MS independently. Real-HW only.
+            logits = self._generator.process_decode_output_host(
+                tt_out, is_tokens=False
+            )
+        except Exception as exc:
+            logger.error(
+                "req.error",
+                extra={"req_id": req_id, "stage": "prefill", "exception": repr(exc)},
+            )
+            raise
+        finally:
+            _TT_EXTEND_LATENCY_MS.observe((time.perf_counter() - start) * 1000.0)
+
+        # prefill output is [1, prompt_len, vocab]; we want the last position.
+        last_logits = logits[0, -1, :]
+
+        state["current_offset"] = prompt_len
+
+        logger.debug(
+            "req.extend",
+            extra={
+                "req_id": req_id,
+                "prompt_len": prompt_len,
+                "current_offset": state["current_offset"],
+            },
         )
+
+        return last_logits
 
     def decode_step(self, req_id: str, last_token: int):
-        """Run one decode step. Returns next-token logits. Phase F.2."""
-        raise NotImplementedError(
-            "TTTransformersExecutionBackend.decode_step lands in Phase F.2"
+        """Advance by one token; return next-token logits.
+
+        Drives ``Generator.decode_forward_text`` and pulls logits to host
+        via ``process_decode_output_host``.
+        """
+        if req_id not in self._req_state:
+            raise KeyError(f"unknown req_id {req_id!r}")
+        state = self._req_state[req_id]
+        start_pos = state["current_offset"]
+
+        token_tensor = torch.as_tensor([int(last_token)], dtype=torch.long)
+
+        start = time.perf_counter()
+        try:
+            tt_out = self._generator.decode_forward_text(
+                token_tensor,
+                start_pos=start_pos,
+                page_table=None,
+                kv_cache=None,
+                enable_trace=True,
+                read_from_device=True,
+                sampling_params=None,
+            )
+            # TODO(F.4): split D2H timing from the surrounding device call so
+            # we can populate _TT_D2H_LATENCY_MS independently. Real-HW only.
+            logits = self._generator.process_decode_output_host(
+                tt_out, is_tokens=False
+            )
+        except Exception as exc:
+            logger.error(
+                "req.error",
+                extra={"req_id": req_id, "stage": "decode", "exception": repr(exc)},
+            )
+            raise
+        finally:
+            _TT_DECODE_LATENCY_MS.observe((time.perf_counter() - start) * 1000.0)
+
+        # decode output is [batch=1, vocab]; reduce to flat [vocab].
+        next_logits = logits[0, :]
+
+        state["current_offset"] = start_pos + 1
+
+        logger.debug(
+            "req.decode",
+            extra={
+                "req_id": req_id,
+                "current_offset": state["current_offset"],
+            },
         )
+
+        return next_logits
 
     def free(self, req_id: str) -> None:
-        """Release per-request state. Phase F.2 body."""
-        raise NotImplementedError(
-            "TTTransformersExecutionBackend.free lands in Phase F.2"
-        )
+        """Release per-request bookkeeping.
+
+        The non-paged tt_transformers KV cache is bound to a fixed user
+        slot; with batch=1 and ``user_id=0`` the slot is implicitly
+        overwritten by the next ``extend``. There is no explicit per-
+        request KV free call in the captured Phase 0.2 surface, so this
+        method only drops host-side state and the active-requests gauge.
+        Idempotent: an unknown req_id logs a WARN and returns.
+        """
+        if req_id not in self._req_state:
+            logger.warning("req.free_unknown", extra={"req_id": req_id})
+            return
+
+        self._req_state.pop(req_id)
+        _TT_ACTIVE_REQUESTS.dec()
+
+        logger.debug("req.free", extra={"req_id": req_id})
 
     def reset_all(self) -> None:
-        """Drop all per-request state (e.g. on scheduler restart). Phase F.2."""
-        raise NotImplementedError(
-            "TTTransformersExecutionBackend.reset_all lands in Phase F.2"
-        )
+        """Drop all per-request state (e.g. on scheduler shutdown / restart)."""
+        cleared = len(self._req_state)
+        self._req_state.clear()
+        _TT_ACTIVE_REQUESTS.set(0)
+
+        logger.info("req.reset_all", extra={"cleared": cleared})
