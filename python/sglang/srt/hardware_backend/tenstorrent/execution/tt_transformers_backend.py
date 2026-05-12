@@ -119,7 +119,12 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         # leaking docker mount semantics into the rest of the wrapper.
         os.environ["LLAMA_DIR"] = model_path
 
-        tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]
+        _DTYPE_MAP = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}
+        if dtype not in _DTYPE_MAP:
+            raise ValueError(
+                f"dtype must be one of {sorted(_DTYPE_MAP)}; got {dtype!r}"
+            )
+        tt_dtype = _DTYPE_MAP[dtype]
 
         # `optimizations` is a callable(model_args) → DecodersPrecision —
         # the demo's "performance" preset, identical to phase 0.1's
@@ -163,8 +168,9 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         self._req_state: dict[str, Any] = {}
 
         logger.info(
-            "tt_wrapper_init",
+            "tt_execution_backend_init",
             extra={
+                "backend": "tt_transformers",
                 "model_path": model_path,
                 "max_seq_len": max_seq_len,
                 "dtype": dtype,
@@ -176,7 +182,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
 
     # ----- Per-request lifecycle (Phase F.2 fills in the real bodies) -----
 
-    def new_request(self, req_id: str, prompt_tokens) -> None:
+    def new_request(self, req_id: str, prompt_tokens: list[int]) -> None:
         """Allocate per-request KV / position state. Phase F.2 body."""
         raise NotImplementedError(
             "TTTransformersExecutionBackend.new_request lands in Phase F.2"

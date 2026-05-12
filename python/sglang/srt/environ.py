@@ -332,6 +332,8 @@ class Envs:
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
+
+    # Tenstorrent
     SGLANG_TT_EXECUTION_BACKEND = EnvStr("")
 
     # NPU

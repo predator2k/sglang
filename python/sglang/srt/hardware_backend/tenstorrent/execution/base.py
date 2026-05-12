@@ -23,7 +23,7 @@ class TTExecutionBackend(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def new_request(self, req_id: str, prompt_tokens) -> None:
+    def new_request(self, req_id: str, prompt_tokens: list[int]) -> None:
         """Allocate per-request KV / position state."""
 
     @abc.abstractmethod

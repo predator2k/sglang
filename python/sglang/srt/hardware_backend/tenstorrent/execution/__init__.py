@@ -11,6 +11,8 @@ at import time and would NameError otherwise.
 
 from __future__ import annotations
 
+from typing import Callable
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tenstorrent.execution.base import (
     TTExecutionBackend,
@@ -20,10 +22,15 @@ from sglang.srt.hardware_backend.tenstorrent.execution.base import (
 TT_EXECUTION_BACKENDS: dict[str, type[TTExecutionBackend]] = {}
 
 
-def register_tt_execution_backend(name: str):
-    def _wrap(cls):
+def register_tt_execution_backend(
+    name: str,
+) -> Callable[[type[TTExecutionBackend]], type[TTExecutionBackend]]:
+    """Class decorator that registers a TTExecutionBackend subclass under `name`."""
+
+    def _wrap(cls: type[TTExecutionBackend]) -> type[TTExecutionBackend]:
         TT_EXECUTION_BACKENDS[name] = cls
         return cls
+
     return _wrap
 
 
