@@ -166,9 +166,11 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
                 "python_env/bin/activate)"
             )
 
-        # tt_transformers' ModelArgs reads LLAMA_DIR / HF_MODEL from env.
-        # Set LLAMA_DIR so create_tt_model picks up our model path without
-        # leaking docker mount semantics into the rest of the wrapper.
+        # tt_transformers' ModelArgs reads LLAMA_DIR / HF_MODEL from env
+        # and asserts exactly one is set (model_config.py:499). The
+        # tt-inference-server docker image pre-sets BOTH, so clear HF_MODEL
+        # before writing LLAMA_DIR or the assert fires.
+        os.environ.pop("HF_MODEL", None)
         os.environ["LLAMA_DIR"] = model_path
 
         _DTYPE_MAP = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}
@@ -279,7 +281,9 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         tokens = state["prompt_tokens"]
 
         prompt_len = len(tokens)
-        token_tensor = torch.as_tensor(tokens, dtype=torch.long)
+        # tt_transformers' Model.prepare_inputs_prefill asserts tokens.dim() == 2.
+        # We're batch=1 in P1, so unsqueeze to [1, prompt_len].
+        token_tensor = torch.as_tensor(tokens, dtype=torch.long).unsqueeze(0)
 
         start = time.perf_counter()
         try:
@@ -290,10 +294,16 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
                 last_token_idx=prompt_len - 1,
                 kv_cache=None,             # tt_transformers manages KV internally
             )
+            # Prefill output uses Model.process_output_prefill (NOT
+            # Generator.process_decode_output_host — that's decode-only).
+            # The device's get_last_token=(idx//32)*32 returns only the last
+            # 32-token block of logits, so the index passed here is
+            # (prompt_len-1) % 32 — the local position within that block.
+            # The model returns [vocab] directly.
             # TODO(F.4): split D2H timing from the surrounding device call so
             # we can populate _TT_D2H_LATENCY_MS independently. Real-HW only.
-            logits = self._generator.process_decode_output_host(
-                tt_out, is_tokens=False
+            last_logits = self._model.process_output_prefill(
+                tt_out, last_token_idx=(prompt_len - 1) % 32
             )
         except Exception as exc:
             logger.error(
@@ -304,9 +314,6 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
             raise
         finally:
             _TT_EXTEND_LATENCY_MS.observe((time.perf_counter() - start) * 1000.0)
-
-        # prefill output is [1, prompt_len, vocab]; we want the last position.
-        last_logits = logits[0, -1, :]
 
         state["current_offset"] = prompt_len
 
@@ -330,25 +337,29 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         if req_id not in self._req_state:
             raise KeyError(f"unknown req_id {req_id!r}")
         state = self._req_state[req_id]
-        start_pos = state["current_offset"]
+        offset = state["current_offset"]
 
-        token_tensor = torch.as_tensor([int(last_token)], dtype=torch.long)
+        # tt_transformers decode expects 2D token tensor [B=1, 1] and
+        # start_pos as a LongTensor (Generator.decode_forward_text:262 calls
+        # torch.chunk(start_pos, data_parallel, 0); ints don't chunk).
+        token_tensor = torch.as_tensor([[int(last_token)]], dtype=torch.long)
+        start_pos_tensor = torch.as_tensor([offset], dtype=torch.long)
 
         start = time.perf_counter()
         try:
-            tt_out = self._generator.decode_forward_text(
+            # read_from_device=True makes decode_forward_text ALREADY call
+            # process_decode_output_host internally — returns host tensor
+            # of shape [B, S, vocab]. Do not re-process.
+            # TODO(F.4): split D2H timing from the surrounding device call so
+            # we can populate _TT_D2H_LATENCY_MS independently. Real-HW only.
+            logits = self._generator.decode_forward_text(
                 token_tensor,
-                start_pos=start_pos,
+                start_pos=start_pos_tensor,
                 page_table=None,
                 kv_cache=None,
                 enable_trace=True,
                 read_from_device=True,
                 sampling_params=None,
-            )
-            # TODO(F.4): split D2H timing from the surrounding device call so
-            # we can populate _TT_D2H_LATENCY_MS independently. Real-HW only.
-            logits = self._generator.process_decode_output_host(
-                tt_out, is_tokens=False
             )
         except Exception as exc:
             logger.error(
@@ -360,10 +371,11 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         finally:
             _TT_DECODE_LATENCY_MS.observe((time.perf_counter() - start) * 1000.0)
 
-        # decode output is [batch=1, vocab]; reduce to flat [vocab].
-        next_logits = logits[0, :]
+        # decode_forward_text(read_from_device=True) returns [B=1, S=1, vocab];
+        # reduce to flat [vocab].
+        next_logits = logits[0, 0, :]
 
-        state["current_offset"] = start_pos + 1
+        state["current_offset"] = offset + 1
 
         logger.debug(
             "req.decode",
