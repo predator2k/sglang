@@ -335,6 +335,7 @@ class Envs:
 
     # Tenstorrent
     SGLANG_TT_EXECUTION_BACKEND = EnvStr("")
+    SGLANG_TT_PREFILL_PAD_STEP = EnvStr("")
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)

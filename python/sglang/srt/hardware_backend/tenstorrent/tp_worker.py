@@ -127,3 +127,105 @@ class TTTpModelWorker(TpModelWorker):
         MLX returns None here (mlx/tp_worker.py:85-86); we do the same.
         """
         return None
+
+    def forward_batch_generation(
+        self,
+        model_worker_batch,
+        forward_batch=None,
+        pp_proxy_tensors=None,
+        is_verify=False,
+        skip_attn_backend_init=False,
+    ) -> "GenerationBatchResult":
+        """Polarity mirrors MLX (mlx/tp_worker.py:103-114): if mwb is not
+        None, take our path; else fall back to parent (None → speculative
+        decoding scratch path; never reached in P1).
+        """
+        if model_worker_batch is not None:
+            return self._forward_batch_generation_tt(model_worker_batch)
+        return super().forward_batch_generation(
+            model_worker_batch,
+            forward_batch,
+            pp_proxy_tensors,
+            is_verify,
+            skip_attn_backend_init,
+        )
+
+    def _cleanup_stale_rids(self, forward_mode, current_rids: set):
+        """Release per-request backend state for reqs that dropped out of
+        the decode batch. Called from _forward_batch_generation_tt before
+        invoking new_request / decode_step.
+        """
+        if not hasattr(self, "_tt_active_rids"):
+            self._tt_active_rids = set()
+        if forward_mode.is_decode():
+            stale = self._tt_active_rids - current_rids
+            for rid in stale:
+                try:
+                    self.execution_backend.free(rid)
+                except Exception as exc:
+                    logger.warning(
+                        "tt_free_failed",
+                        extra={"req_id": rid, "reason": repr(exc)},
+                        exc_info=True,
+                    )
+            self._tt_active_rids = current_rids
+        else:
+            self._tt_active_rids |= current_rids
+
+    def _forward_batch_generation_tt(self, mwb) -> "GenerationBatchResult":
+        # In-method imports avoid module-load issues during plugin discovery —
+        # sglang.srt.managers chain is heavy. Spec §3.2 invariant #7 still
+        # respected: no ttnn / concrete-backend imports.
+        import torch
+
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        # IDLE: mirror MLX (mlx/tp_worker.py:136-140) exactly.
+        if mwb.forward_mode.is_idle():
+            return GenerationBatchResult(
+                logits_output=LogitsProcessorOutput(next_token_logits=None),
+                can_run_cuda_graph=False,
+            )
+
+        # P1 supports EXTEND/DECODE only besides IDLE. Use explicit equality
+        # because ForwardMode.is_extend() ALSO returns True for MIXED,
+        # DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, DLLM_EXTEND — those must
+        # raise per spec §3.2 invariant #6.
+        if mwb.forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
+            raise NotImplementedError(
+                f"P1 supports EXTEND/DECODE/IDLE only, got {mwb.forward_mode}. "
+                f"Chunked prefill / mixed / DLLM must stay disabled via "
+                f"apply_server_args_defaults."
+            )
+
+        # max_running_requests=1 ⇒ at most one req in the batch.
+        assert mwb.reqs is not None and len(mwb.reqs) == 1
+        req_id = mwb.reqs[0].rid
+
+        # Reconcile per-request backend state before dispatch (mirrors MLX).
+        self._cleanup_stale_rids(
+            mwb.forward_mode, {req.rid for req in mwb.reqs}
+        )
+
+        if mwb.forward_mode == ForwardMode.EXTEND:
+            # mwb.input_ids is a 1-D torch.LongTensor of token IDs on CPU.
+            # Coerce to list[int]; the backend handles padding to step.
+            prompt_tokens = mwb.input_ids.tolist()
+            self.execution_backend.new_request(req_id, prompt_tokens)
+            logits = self.execution_backend.extend(req_id)  # host torch.Tensor[vocab]
+        else:  # DECODE
+            last_tok = int(mwb.input_ids[-1].item())
+            logits = self.execution_backend.decode_step(req_id, last_tok)
+
+        # Greedy sampling on host. We never call model_runner.sample because
+        # model_runner.sampler is None per spec §3.2 invariant #2. Backend
+        # already returns host torch tensors — no ttnn import here.
+        next_token_ids = torch.argmax(logits.float(), dim=-1, keepdim=True).long()
+
+        return GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=False,
+        )

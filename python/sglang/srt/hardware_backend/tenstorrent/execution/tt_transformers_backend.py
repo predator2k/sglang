@@ -41,6 +41,7 @@ from typing import Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tenstorrent.execution import (
     register_tt_execution_backend,
 )
@@ -221,6 +222,24 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         self._dtype = dtype
         self._req_state: dict[str, Any] = {}
 
+        # SGLANG_TT_PREFILL_PAD_STEP — empty string = "use default 128".
+        # The tt_transformers prefill kernel hard-asserts seq_len % 128 == 0,
+        # so the step MUST be a positive multiple of 128. Higher values
+        # (e.g. 256, 512) trade memory for fewer recompiles when prompt-
+        # length distributions cluster.
+        pad_step_raw = envs.SGLANG_TT_PREFILL_PAD_STEP.get() or "128"
+        try:
+            self._prefill_pad_step = int(pad_step_raw)
+        except ValueError:
+            raise ValueError(
+                f"SGLANG_TT_PREFILL_PAD_STEP must be an integer, got {pad_step_raw!r}"
+            )
+        if self._prefill_pad_step <= 0 or self._prefill_pad_step % 128 != 0:
+            raise ValueError(
+                f"SGLANG_TT_PREFILL_PAD_STEP must be a positive multiple of 128 "
+                f"(tt_transformers' hard kernel constraint); got {self._prefill_pad_step}"
+            )
+
         logger.info(
             "tt_execution_backend_init",
             extra={
@@ -280,10 +299,25 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         state = self._req_state[req_id]
         tokens = state["prompt_tokens"]
 
-        prompt_len = len(tokens)
+        real_prompt_len = len(tokens)
+        # tt_transformers' prefill kernel asserts seq_len % 128 == 0. Right-pad
+        # the input with the LAST real token so we satisfy the constraint
+        # without changing the semantic last-token logits we'll read out.
+        # We read logits at last_token_idx=(real_prompt_len-1)%32 within the
+        # 32-token block tt_transformers returns; the padded tail's KV state
+        # sits in the cache but should not affect decode_step output as long
+        # as decode's start_pos=real_prompt_len caps attention at the real
+        # position (verified on hardware in Phase G.5).
+        step = self._prefill_pad_step
+        padded_len = ((real_prompt_len + step - 1) // step) * step
+        if padded_len > real_prompt_len:
+            filler = tokens[-1]
+            padded_tokens = list(tokens) + [filler] * (padded_len - real_prompt_len)
+        else:
+            padded_tokens = list(tokens)
         # tt_transformers' Model.prepare_inputs_prefill asserts tokens.dim() == 2.
-        # We're batch=1 in P1, so unsqueeze to [1, prompt_len].
-        token_tensor = torch.as_tensor(tokens, dtype=torch.long).unsqueeze(0)
+        # We're batch=1 in P1, so unsqueeze to [1, padded_len].
+        token_tensor = torch.as_tensor(padded_tokens, dtype=torch.long).unsqueeze(0)
 
         start = time.perf_counter()
         try:
@@ -291,19 +325,19 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
                 token_tensor,
                 page_table=None,           # non-paged in P1
                 user_id=state["user_id"],  # P1 batch=1 always 0
-                last_token_idx=prompt_len - 1,
+                last_token_idx=real_prompt_len - 1,
                 kv_cache=None,             # tt_transformers manages KV internally
             )
             # Prefill output uses Model.process_output_prefill (NOT
             # Generator.process_decode_output_host — that's decode-only).
             # The device's get_last_token=(idx//32)*32 returns only the last
             # 32-token block of logits, so the index passed here is
-            # (prompt_len-1) % 32 — the local position within that block.
+            # (real_prompt_len-1) % 32 — the local position within that block.
             # The model returns [vocab] directly.
             # TODO(F.4): split D2H timing from the surrounding device call so
             # we can populate _TT_D2H_LATENCY_MS independently. Real-HW only.
             last_logits = self._model.process_output_prefill(
-                tt_out, last_token_idx=(prompt_len - 1) % 32
+                tt_out, last_token_idx=(real_prompt_len - 1) % 32
             )
         except Exception as exc:
             logger.error(
@@ -315,13 +349,14 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         finally:
             _TT_EXTEND_LATENCY_MS.observe((time.perf_counter() - start) * 1000.0)
 
-        state["current_offset"] = prompt_len
+        state["current_offset"] = real_prompt_len
 
         logger.debug(
             "req.extend",
             extra={
                 "req_id": req_id,
-                "prompt_len": prompt_len,
+                "prompt_len": real_prompt_len,
+                "padded_prompt_len": padded_len,
                 "current_offset": state["current_offset"],
             },
         )
