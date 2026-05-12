@@ -308,13 +308,43 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         # sits in the cache but should not affect decode_step output as long
         # as decode's start_pos=real_prompt_len caps attention at the real
         # position (verified on hardware in Phase G.5).
+        # tt_transformers has two prefill kernel constraints:
+        #   1. seq_len % 128 == 0 always
+        #   2. seq_len % MAX_QKV_MM_SEQ_LEN == 0 when seq_len > 2048
+        #      (attention.py:684, MAX_QKV_MM_SEQ_LEN defaults to 2048)
+        # Use the larger step automatically once we cross the 2048 boundary
+        # so short prompts stay tight and long ones round to the multi-K
+        # tile shape the QKV matmul wants.
         step = self._prefill_pad_step
+        if real_prompt_len > 2048 and step < 2048:
+            step = 2048
         padded_len = ((real_prompt_len + step - 1) // step) * step
         if padded_len > real_prompt_len:
             filler = tokens[-1]
             padded_tokens = list(tokens) + [filler] * (padded_len - real_prompt_len)
         else:
             padded_tokens = list(tokens)
+
+        # P1 doesn't implement paged attention, so we cannot use
+        # tt_transformers' chunked-prefill path
+        # (Generator.prefill_forward_single_user_text:164 asserts
+        # page_table is not None for chunks). The chunk ceiling is set by
+        # the MAX_PREFILL_CHUNK_SIZE env var in 1024-token units;
+        # platform.apply_server_args_defaults sets it to 8 (= 8192 tokens)
+        # for the P300 (2x p150a) config which is missing from
+        # tt_transformers' default table. Fail loudly with a clear
+        # remediation pointer rather than letting the scheduler crash
+        # with an opaque AssertionError deep in the device call.
+        max_chunk_size = int(os.environ.get("MAX_PREFILL_CHUNK_SIZE", "8")) * 1024
+        if padded_len > max_chunk_size:
+            raise ValueError(
+                f"prompt length {real_prompt_len} (padded to {padded_len}) "
+                f"exceeds MAX_PREFILL_CHUNK_SIZE={max_chunk_size} tokens. "
+                f"P1 does not support chunked / paged prefill; either "
+                f"shorten the prompt or raise MAX_PREFILL_CHUNK_SIZE "
+                f"(env var, units of 1024). Going much higher than 16 may "
+                f"exceed p150a L1 capacity."
+            )
         # tt_transformers' Model.prepare_inputs_prefill asserts tokens.dim() == 2.
         # We're batch=1 in P1, so unsqueeze to [1, padded_len].
         token_tensor = torch.as_tensor(padded_tokens, dtype=torch.long).unsqueeze(0)

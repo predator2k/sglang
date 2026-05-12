@@ -117,6 +117,23 @@ class TTSRTPlatform(SRTPlatform):
         # picking "none" avoids an ImportError at scheduler init.
         server_args.grammar_backend = "none"
 
+        # tt_transformers' MAX_PREFILL_CHUNK_SIZES_DIV1024 table has no
+        # "P300" (2x p150a) entry, so it falls back to 4 (= 4*1024 = 4096
+        # tokens) — any prompt longer than that triggers tt_transformers'
+        # chunked-prefill path, which REQUIRES paged attention
+        # (Generator.prefill_forward_single_user_text:164 asserts
+        # `page_table is not None`). P1 runs non-paged, so chunking is
+        # off-limits.
+        #
+        # Lift the single-chunk ceiling to 8K tokens (well above the 5K
+        # workloads we want to support) by setting the env var the table
+        # consults. p150a L1 is large enough for an 8K-token prefill of
+        # Llama-3.1-8B in BFP8/BF16 — anything bigger may OOM L1, hence
+        # the conservative 8 (not 16/32). Override on the command line
+        # if needed.
+        import os
+        os.environ.setdefault("MAX_PREFILL_CHUNK_SIZE", "8")
+
     def get_mha_kv_pool_cls(self):
         # TTModelRunner (Phase D) constructs _DummyKVCache directly;
         # this factory should never be invoked. Raise loudly if it is.

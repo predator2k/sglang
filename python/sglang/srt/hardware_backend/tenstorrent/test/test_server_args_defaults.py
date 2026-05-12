@@ -21,7 +21,13 @@ def test_defaults_set_p1_constraints():
     assert sa.pre_warm_nccl is False
     assert sa.cpu_offload_gb == 0
     assert sa.enable_torch_compile is False
-    assert sa.device == "tenstorrent"
+    # G.5 fix: server_args.device must be "cpu" (not "tenstorrent") —
+    # torch.get_device_module() in ModelRunner.init_torch_distributed
+    # doesn't know about the "tenstorrent" device type. The TT platform
+    # identity flows from SGLANG_PLATFORM=tenstorrent independently.
+    assert sa.device == "cpu"
+    # G.5: grammar must be disabled — bundled xgrammar lacks StructuralTag.
+    assert sa.grammar_backend == "none"
     assert sa.tp_size == 1
     assert sa.enable_dp_attention is False
 
