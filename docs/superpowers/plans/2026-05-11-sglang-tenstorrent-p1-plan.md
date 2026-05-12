@@ -800,10 +800,30 @@ Add it near `SGLANG_USE_MLX` for locality.
          DecodersPrecision = None
      ```
 
-     Then in `__init__`, add a single-line guard before the first use:
-     `assert create_tt_model is not None, "tt_transformers not importable; install tt-metal or activate its venv"`.
+     Then in `__init__`, add a guard block **before** any use of the hoisted names. The existing `llama_adapter.py:97` line `tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]` consumes `ttnn` immediately — if you keep that pattern, the dtype-map AttributeErrors on `None.bfloat16` BEFORE the assert runs. Two acceptable shapes (pick one):
 
-  Reason: F.3 uses `@patch("...tt_transformers_backend.create_tt_model")`, which fails if the name isn't a module attribute. The in-`__init__` form in the prototype was for non-TT-host importability — module-scope `try/except` preserves that AND exposes the names for patching.
+     ```python
+     # Option A: hard-fail with a clear message
+     if create_tt_model is None or ttnn is None:
+         raise RuntimeError(
+             "tt_transformers / ttnn not importable; install tt-metal or "
+             "activate its venv (source /home/container_app_user/tt-metal/"
+             "python_env/bin/activate)"
+         )
+     tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]
+     ```
+
+     ```python
+     # Option B: defer the dtype lookup behind the assert
+     assert ttnn is not None and create_tt_model is not None, (
+         "tt_transformers / ttnn not importable; install tt-metal..."
+     )
+     tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]
+     ```
+
+     Option A is preferred for production code (RuntimeError is more visible than AssertionError in `-O` mode); Option B is fine for the F.1 prototype.
+
+  Reason: F.3 uses `@patch("...tt_transformers_backend.create_tt_model")`, which fails if the name isn't a module attribute. The in-`__init__` form in the prototype was for non-TT-host importability — module-scope `try/except` preserves that AND exposes the names for patching. The dtype-map ordering note above is the round-4 review correction.
 
   The 5 method stubs (currently raising `"lands in Phase F.2"` NotImplementedError) carry over unchanged.
 
@@ -1054,10 +1074,12 @@ except NotImplementedError as e:
 - [ ] **Step 1:** Implement the two methods exactly per spec §5.1 pseudocode. Reproduced here so this plan is self-contained:
 
 ```python
+# NB: worker code MUST NOT import ttnn (spec §3.2 invariant #7) —
+# host torch tensors are produced inside the execution backend.
 import torch
-import ttnn
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 

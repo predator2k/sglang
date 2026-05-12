@@ -300,6 +300,10 @@ hardware_backend/tenstorrent/tp_worker.py: TTTpModelWorker(TpModelWorker)
    # mirror MlxTpModelWorker.forward_batch_generation and
    # MlxTpModelWorker._forward_batch_generation_mlx as of the SGLang
    # revision being built against.
+   #
+   # IMPORTS: worker code must NOT import ttnn (invariant #7). Required:
+   #   from sglang.srt.model_executor.forward_batch_info import ForwardMode
+   # (for the explicit-equality dispatch below, see Risk #13).
 
    def forward_batch_generation(
        self, model_worker_batch: ModelWorkerBatch,
@@ -702,7 +706,7 @@ P1 explicitly does **not** require:
 | 10 | Llama-3.1-8B weights gated, HF token expiry mid-development | Low | Low | Documented as setup step. |
 | 11 | **Silent-wrong-output hazard A**: implementer wires `model_runner.sample(logits_output, ForwardBatch.init_new(mwb, runner))` but `attn_backend=None` makes `ForwardBatch.init_new` produce zero positions / `support_triton` checks fail silently → sampler returns garbage tokens. | **High** if it happens | Low | §3.2 invariant #2 + §5.1 pseudocode mandate greedy-in-worker. Test (§8.2) catches via greedy mismatch with HF reference. Implementer must NOT add `model_runner.sample()` in P1. |
 | 12 | **Silent-wrong-output hazard B**: `disable_overlap_schedule` not set → `FutureMap` allocates `-1` sentinel indices that the synchronous TT path never resolves → those `-1`s get appended to `req.output_ids` as token ids → output is malformed. | **High** if it happens | Medium (default is overlap=on) | §6.1 forces `disable_overlap_schedule = True`. Test (§8.1) smoke catches via "Paris" assertion. |
-| 13 | **`ForwardMode.is_extend()` is multi-mode, not single-mode.** Returns True for EXTEND, MIXED, DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, AND DLLM_EXTEND (`forward_batch_info.py:111-119`). Using it as the dispatch condition in `_forward_batch_generation_tt` would silently admit MIXED / DLLM_EXTEND into the EXTEND branch, contradicting invariant #6. | **High** if it happens | Medium (the predicate name is misleading) | §5.1 pseudocode uses explicit enum equality (`mwb.forward_mode == ForwardMode.EXTEND`), NOT `is_extend()`. `test_forward_mode_guard.py` covers MIXED/SPLIT_PREFILL/DLLM_EXTEND paths to lock the contract. |
+| 13 | **`ForwardMode.is_extend()` is multi-mode, not single-mode.** Returns True for EXTEND, MIXED, DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, AND DLLM_EXTEND (`forward_batch_info.py:111-119`). Using it as the dispatch condition in `_forward_batch_generation_tt` would silently admit MIXED / DLLM_EXTEND into the EXTEND branch, contradicting invariant #6. | **High** if it happens | Medium (the predicate name is misleading) | §5.1 pseudocode uses explicit enum equality (`mwb.forward_mode == ForwardMode.EXTEND`), NOT `is_extend()`. **Enforcement lives in `python/sglang/srt/hardware_backend/tenstorrent/tp_worker.py:_forward_batch_generation_tt`** — audit there if Risk #13 fires. `test_forward_mode_guard.py` covers MIXED/SPLIT_PREFILL/DLLM_EXTEND paths to lock the contract. |
 | 14 | **`TT_EXECUTION_BACKENDS` NameError trap** if a future contributor reorders the import-after-statement in `execution/__init__.py`. The registry dict must be declared before the backend modules are imported (their `@register_tt_execution_backend` decorators fire at import time). | Low (caught immediately by Python) | Low (the `noqa: E402` + explanatory comment block already exist; CI would catch on first `import`) | Plan F.1 Step 1 spells out the ordering with inline "Step 1: declare registry FIRST" / "Step 2: NOW import" comments. `test_execution_backend_registry.py` exercises a fresh process import path. |
 
 ---
@@ -843,3 +847,15 @@ A general-purpose subagent was tasked with an independent fresh-eyes review on 2
 The author's 5 prior self-review rounds caught architectural-level mistakes (e.g. P1→P2 framing, MLX-style integration choice, sampler/graph_runner=None requirement) but missed all 5 critical findings above. **Takeaway**: spec-level review by the author alone is insufficient for catching API-shape and dispatch-wiring errors. An independent reviewer with `grep` access is materially additive.
 
 The medium-severity findings concerned: `IDLE` mode handling (must be allowed, not raised), CUDA-guard file count (revised from 9 to 17 files), `_DummyKVCache` factory should raise rather than silently succeed, signal handler process placement (Scheduler subprocess, not parent), and `Llama_3_1` import path requires independent verification beyond the existing demo-script proof. All have been incorporated above.
+
+### Amendment review record (TTExecutionBackend ABC + registry)
+
+After the initial spec was approved, a follow-up amendment introduced the `TTExecutionBackend` ABC + `TT_EXECUTION_BACKENDS` registry (`tt_transformers` as P1's real impl, `tt_xla` as a registered placeholder for post-P1). The amendment passed through **4 rounds of independent fresh-eyes subagent review** between commits `6c6b032cf` (round 1 introduction) and the current HEAD. Findings per round:
+
+- **Round 1** (`6c6b032cf`): introduction — 0 findings (initial commit).
+- **Round 2** (review of round 1 → fixed in `4c84c7f1b`): **8 fixes**. 2 CRITICAL (import-order trap in registry `__init__.py`; stale `worker.wrapper` in test fixtures) + 2 IMPORTANT (env-var registry test coverage; `SGLANG_TT_EXECUTION_BACKEND` invisible in §6.1) + 4 NIT.
+- **Round 3** (review of round 2 → fixed in `7ed0e43c1`): **7 fixes**. 2 CRITICAL (broken `.cache_clear()` test call; spec §5.1 still showed `self.wrapper` + worker doing `ttnn.to_torch`) + 3 IMPORTANT (stale `TTLlamaWrapper` references; `git rm` vs `rm`) + 2 NIT.
+- **Round 4** (review of round 3 → fixed in `557ab9132` and a follow-up): **4 fixes**. 2 CRITICAL (`ForwardMode.is_extend()` is multi-mode → silent admit of MIXED/DLLM_EXTEND; `@patch` targets unreachable on lazy in-`__init__` imports) + 1 IMPORTANT (Phase 0.2 forward-looking instruction still named old class) + bonus Risk #14 covering the registry NameError trap.
+- **Round 5** (review of round 4 → fixed in this commit): **3 CRITICAL + 3 IMPORTANT**. CRITICAL: plan G.2 still had `import ttnn` at module scope (violates invariant #7); spec §5.1 + plan G.2 used `ForwardMode.EXTEND` without importing the enum (NameError on copy-paste); F.1 Step 5 hoist instruction didn't address that the existing `llama_adapter.py:97` dtype-map evaluates `ttnn.bfloat16` before the assert fires. IMPORTANT: Risk #13 mitigation didn't name `tp_worker.py` as the enforcement location; Appendix B needed an amendment-review log (this section); Risk row numbers (#13/#14) collide visually with §4.1 file-row numbers (#13/#14) — left as-is since plan refs are unambiguous.
+
+**Takeaway from 5 rounds**: every round caught issues the prior round missed. The repeating pattern was *new code samples* (especially short pseudocode) introducing fresh bugs when fixing older ones — particularly around import semantics (lazy vs module-scope), enum-equality vs predicate methods, and stale identifier renames. The discipline of running another fresh-eyes review after each fix round was load-bearing.
