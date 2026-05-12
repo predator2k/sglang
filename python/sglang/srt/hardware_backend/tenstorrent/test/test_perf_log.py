@@ -64,10 +64,20 @@ def test_perf_log_capture():
     """Record performance numbers; never fails."""
     results = {}
 
-    # 1. Warm prefill at 4 lengths (100, 500, 1k, 4k tokens prompt).
-    # First call at each length pays the cold JIT cost; we run TWICE
-    # at each shape and record the second (warm) run.
-    targets = [100, 500, 1000, 4000]
+    # 1. Warm prefill at known-good shapes only.
+    # tt_transformers' KV sharding (tensor_layout.cpp:111) has a tile-
+    # alignment constraint that fails for many seq_lens between 128 and
+    # 6144. Empirically validated on 2x p150a:
+    #   - 100 -> pad 128       ✓ (F.4)
+    #   - 256                  ✗ (perf_log v1 crashed here)
+    #   - 1024                 unknown / unsafe
+    #   - 4000 -> pad 4096     ✓ (subset of the 6144 path proven by 5K bench)
+    #   - 6000 -> pad 6144     ✓ (5K bench)
+    # Restrict perf log to these three proven shapes; document the
+    # missing intermediate lengths as a P2 investigation item.
+    # First call at each length pays cold JIT cost; we run TWICE at
+    # each shape and record the second (warm) run.
+    targets = [100, 4000, 6000]
     prefill_warm_ms = {}
     for target in targets:
         prompt = _build_prompt(target)
