@@ -642,9 +642,11 @@ def register_tt_execution_backend(name: str):
     return _wrap
 
 
-# Step 2: NOW import the backend modules — their decorators populate the dict.
-# noqa: E402 because these imports must follow the registry declaration above.
-from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402,F401
+# Step 2: NOW import the backend modules — their decorators populate the
+# dict. E402 is suppressed here intentionally: the import MUST follow the
+# registry declaration above, otherwise the decorator NameErrors. Don't
+# silence E402 elsewhere — this is the one legitimate place for it.
+from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402, F401
     tt_transformers_backend,
     tt_xla_backend,
 )
@@ -777,7 +779,7 @@ Add it near `SGLANG_USE_MLX` for locality.
 
 - [ ] **Step 5:** Create `execution/tt_transformers_backend.py` with `class TTTransformersExecutionBackend(TTExecutionBackend):` decorated `@register_tt_execution_backend("tt_transformers")`. The class body is the existing `llama_adapter.py:TTLlamaWrapper` implementation moved verbatim — just rename the class and adjust imports. The 5 method stubs (currently raising `"lands in Phase F.2"` NotImplementedError) carry over unchanged.
 
-- [ ] **Step 6:** Delete `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`. Run `grep -rn "llama_adapter\|TTLlamaWrapper" python/sglang/` and update any leftover references (Phase A/E artifacts may reference the old name in comments).
+- [ ] **Step 6:** `git rm python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py` (use `git rm`, NOT plain `rm` — we want git to record the file's removal so future blame on `tt_transformers_backend.py` traces back to commit `152b67c8a`). Run `grep -rn "llama_adapter\|TTLlamaWrapper" python/sglang/` and update any leftover references (Phase A/E artifacts may reference the old name in comments).
 
 - [ ] **Step 7:** Commit: `refactor(tenstorrent): introduce TTExecutionBackend ABC + registry; tt_transformers as first impl`.
 
@@ -920,10 +922,12 @@ def test_env_var_selects_backend(monkeypatch):
     """The worker's resolve path is `resolve_execution_backend_name()` with
     no args — the env var is the only input. Test that explicitly so a
     regression in `envs.SGLANG_TT_EXECUTION_BACKEND.get()` doesn't slip past.
+
+    EnvField.get() reads os.environ on every call (no lru_cache) — verified
+    against environ.py:54. So monkeypatch.setenv is sufficient; no cache
+    busting needed.
     """
     monkeypatch.setenv("SGLANG_TT_EXECUTION_BACKEND", "tt_xla")
-    # Bust any module-level cache on the env reader if envs is lru_cached.
-    envs.SGLANG_TT_EXECUTION_BACKEND.get.cache_clear()  # if applicable
     assert resolve_execution_backend_name() == "tt_xla"
 
 
@@ -932,11 +936,10 @@ def test_env_var_unset_defaults_to_tt_transformers(monkeypatch):
     assert resolve_execution_backend_name() == "tt_transformers"
 ```
 
-The `monkeypatch.setenv` / `delenv` tests exercise the worker's real lookup
-path (which passes no args). If `envs.SGLANG_TT_EXECUTION_BACKEND.get()` is
-lru-cached, the `.cache_clear()` call covers that — drop the line if `EnvStr`
-re-reads `os.environ` on every call. Verify by grepping `class EnvStr` in
-`environ.py` before keeping/removing the cache_clear line.
+These two tests pass no args to `resolve_execution_backend_name()` —
+matching the worker's real call shape — and use pytest's `monkeypatch` to
+drive the env var. If a future refactor changes `EnvField.get` to be cached,
+these tests will start to flake; fix the caching, don't paper over it here.
 
 - [ ] **Step 3:** Run: `pytest python/sglang/srt/hardware_backend/tenstorrent/test/test_wrapper_lifecycle.py python/sglang/srt/hardware_backend/tenstorrent/test/test_execution_backend_registry.py -v`. **Pass:** all green.
 

@@ -82,7 +82,7 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
         print(LlamaForCausalLM)
         print(inspect.signature(create_tt_model))"
       ```
-      Capture `create_tt_model`'s signature and `Generator`'s public methods (`prefill`, `decode_forward`, etc. — to be verified). These drive Phase F's `TTLlamaWrapper` glue. There is no per-family Python class; model identity comes from the `HF_MODEL` directory contents.
+      Capture `create_tt_model`'s signature and `Generator`'s public methods (`prefill`, `decode_forward`, etc. — to be verified). These drive Phase F's `TTTransformersExecutionBackend` glue (formerly named `TTLlamaWrapper` — see Phase F header for the spec amendment that introduced the ABC + registry). There is no per-family Python class; model identity comes from the `HF_MODEL` directory contents.
 
    If either check fails, see Risk #1 — re-spec, don't silently swap models.
 
@@ -333,11 +333,11 @@ hardware_backend/tenstorrent/tp_worker.py: TTTpModelWorker(TpModelWorker)
 
      if mwb.forward_mode.is_extend():
        prompt_tokens = mwb.input_ids  # torch.Tensor[L] on CPU
-       self.wrapper.new_request(req_id, prompt_tokens)
-       logits_ttnn = self.wrapper.extend(req_id)
+       self.execution_backend.new_request(req_id, prompt_tokens)
+       logits = self.execution_backend.extend(req_id)  # host torch.Tensor
      else:  # DECODE
        last_tok = int(mwb.input_ids[-1].item())
-       logits_ttnn = self.wrapper.decode_step(req_id, last_tok)
+       logits = self.execution_backend.decode_step(req_id, last_tok)
 
      # --- Greedy sampling inside the worker (mirrors MLX argmax path) ---
      # P1 is GREEDY-ONLY (see §3.2 invariant #2). We do NOT call
@@ -346,8 +346,11 @@ hardware_backend/tenstorrent/tp_worker.py: TTTpModelWorker(TpModelWorker)
      # real instance AND build a ForwardBatch.init_new(mwb, runner)
      # (which itself requires attn_backend != None ⇒ another redesign),
      # or implement top-k/top-p directly here on host torch tensors.
-     logits = ttnn.to_torch(logits_ttnn).float()              # [vocab]
-     next_token_ids = torch.argmax(logits, dim=-1, keepdim=True).long()
+     #
+     # NOTE: the execution backend already returned a host torch tensor
+     # (it owns any ttnn.to_torch + dtype massage internally). Worker code
+     # never imports ttnn — see §3.2 invariant #7.
+     next_token_ids = torch.argmax(logits.float(), dim=-1, keepdim=True).long()
      # ★ MLX returns next_token_logits=None in GenerationBatchResult
      #   because sampling already happened — do the same here:
      return GenerationBatchResult(
@@ -773,7 +776,7 @@ Before committing to P2, re-spec based on P1 results. Specifically:
 
 8. **`use_tt()` helper location**: verified — `use_mlx()` lives at `python/sglang/srt/utils/tensor_bridge.py:38`. Add `use_tt()` alongside it. **Critical distinction**: `use_mlx()` returns `bool(envs.SGLANG_USE_MLX.get()) and _MLX_AVAILABLE` (env-var gated). `use_tt()` must NOT introduce `SGLANG_USE_TT` — it should check platform-plugin activation: `isinstance(current_platform, TTSRTPlatform)` or equivalent. The gating semantics differ from MLX even though the function signature is the same.
 
-9. **`tt_transformers` `Generator` API surface — capture in Phase 0.2.** Spec was originally anchored on a non-existent `Llama_3_1` class (corrected post-Phase-0 investigation 2026-05-11). The actual surfaces are `Generator` / `LlamaForCausalLM` / `create_tt_model`. **Still unverified**: which exact method names on `Generator` perform prefill vs decode vs KV-state-allocate-free. Phase 0.2 captures these and feeds them to Phase F's `TTLlamaWrapper` glue. **If `Generator` exposes only a `generate()` loop and no per-step entry points, the wrapper design needs to be redone or `tt_transformers` needs upstream hooks** — this is the live form of Risk #1 after the Llama_3_1 correction.
+9. **`tt_transformers` `Generator` API surface — capture in Phase 0.2.** Spec was originally anchored on a non-existent `Llama_3_1` class (corrected post-Phase-0 investigation 2026-05-11). The actual surfaces are `Generator` / `LlamaForCausalLM` / `create_tt_model`. **Still unverified**: which exact method names on `Generator` perform prefill vs decode vs KV-state-allocate-free. Phase 0.2 captures these and feeds them to Phase F's `TTTransformersExecutionBackend` (the P1 impl of the `TTExecutionBackend` ABC introduced in the spec amendment). **If `Generator` exposes only a `generate()` loop and no per-step entry points, the `TTTransformersExecutionBackend` impl needs to be redone or `tt_transformers` needs upstream hooks** — this is the live form of Risk #1 after the Llama_3_1 correction. The ABC + registry remain valid in either case; only the `tt_transformers` adapter would change.
 
 ---
 
