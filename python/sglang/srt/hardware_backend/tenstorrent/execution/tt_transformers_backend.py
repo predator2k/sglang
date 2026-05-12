@@ -299,6 +299,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
             logger.error(
                 "req.error",
                 extra={"req_id": req_id, "stage": "prefill", "exception": repr(exc)},
+                exc_info=True,
             )
             raise
         finally:
@@ -353,6 +354,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
             logger.error(
                 "req.error",
                 extra={"req_id": req_id, "stage": "decode", "exception": repr(exc)},
+                exc_info=True,
             )
             raise
         finally:
