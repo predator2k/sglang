@@ -44,21 +44,27 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
+    try:
+        from sgl_kernel.kvcacheio import (
+            transfer_kv_all_layer,
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_all_layer_lf_pf,
+            transfer_kv_all_layer_lf_ph,
+            transfer_kv_all_layer_mla,
+            transfer_kv_all_layer_mla_lf_pf,
+            transfer_kv_direct,
+            transfer_kv_per_layer,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_per_layer_mla,
+            transfer_kv_per_layer_mla_pf_lf,
+            transfer_kv_per_layer_pf_lf,
+            transfer_kv_per_layer_ph_lf,
+        )
+    except ImportError:
+        # sgl_kernel is a CUDA/ROCm-only native package and may be missing on
+        # platforms like Tenstorrent. HiCache transfer paths are unreachable
+        # in those builds (no GPU↔host KV transfer), so leave the names unbound.
+        pass
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
