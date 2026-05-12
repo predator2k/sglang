@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.hardware_backend.tenstorrent import warmup
 from sglang.srt.hardware_backend.tenstorrent.execution import (
     get_tt_execution_backend,
 )
@@ -20,6 +21,12 @@ from sglang.srt.hardware_backend.tenstorrent.platform import MeshDeviceCtx
 from sglang.srt.managers.tp_worker import TpModelWorker
 
 logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
+
+# DEFAULT_TT_MAX_SEQ_LEN: fallback when --context-length is not passed.
+# Matches the P1 budget in spec §6.1 (4 GB KV per card / 64 KB per token →
+# ~64k tokens fits; we cap at 4096 to keep first-time compile costs low
+# and stay well under the bucketed warmup set).
+DEFAULT_TT_MAX_SEQ_LEN = 4096
 
 
 class TTTpModelWorker(TpModelWorker):
@@ -45,59 +52,65 @@ class TTTpModelWorker(TpModelWorker):
         logger.info("tt_worker_init_start")
         self._mesh_ctx = MeshDeviceCtx()
 
-        # Resolve the execution backend via the registry. Reads
-        # SGLANG_TT_EXECUTION_BACKEND env var; "auto"/"" → "tt_transformers".
-        # NEVER import TTTransformersExecutionBackend directly here —
-        # spec §3.2 invariant #7 forbids it (worker depends only on
-        # the ABC + registry).
-        BackendCls = get_tt_execution_backend()
-        max_seq_len = self.server_args.context_length or 4096
-
-        self.execution_backend = BackendCls(
-            self.server_args.model_path,
-            self._mesh_ctx.mesh,
-            max_seq_len=max_seq_len,
-        )
-
-        # Warmup. Phase E.3 deliverable; call whatever entry point
-        # warmup.py exposes. If warmup is a no-op stub at this stage,
-        # this call is harmless. Phase E.3 (or a follow-up) populates
-        # the on-disk kernel cache for all bucketed shapes.
         try:
-            from sglang.srt.hardware_backend.tenstorrent import warmup
+            # Resolve the execution backend via the registry. Reads
+            # SGLANG_TT_EXECUTION_BACKEND env var; "auto"/"" → "tt_transformers".
+            # NEVER import TTTransformersExecutionBackend directly here —
+            # spec §3.2 invariant #7 forbids it (worker depends only on
+            # the ABC + registry).
+            BackendCls = get_tt_execution_backend()
+            max_seq_len = self.server_args.context_length or DEFAULT_TT_MAX_SEQ_LEN
 
-            warm_fn = getattr(warmup, "warm_decode_shape", None)
-            if warm_fn is not None:
-                warm_fn(self.execution_backend)
-        except Exception as exc:
-            logger.warning(
-                "tt_warmup_failed",
-                extra={"reason": repr(exc)},
+            self.execution_backend = BackendCls(
+                self.server_args.model_path,
+                self._mesh_ctx.mesh,
+                max_seq_len=max_seq_len,
             )
 
-        # Instantiate the stub ModelRunner. Field name MUST be
-        # self._model_runner (with underscore) — TpModelWorker's
-        # parent code writes/reads this exact attribute; self.model_runner
-        # is a property over the same field.
-        # Match MLX's kwarg-passing pattern exactly (mlx/tp_worker.py:61-79).
-        self._model_runner = TTModelRunner(
-            model_config=self.model_config,
-            mem_fraction_static=self.server_args.mem_fraction_static,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            moe_ep_rank=self.moe_ep_rank,
-            moe_ep_size=self.ep_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            nccl_port=self.nccl_port,
-            dp_rank=self.dp_rank,
-            server_args=self.server_args,
-            is_draft_worker=self.is_draft_worker,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            memory_pool_config=self.memory_pool_config,
-        )
+            # Warmup. Phase E.3 deliverable; call whatever entry point
+            # warmup.py exposes. If warmup is a no-op stub at this stage,
+            # this call is harmless. Phase E.3 (or a follow-up) populates
+            # the on-disk kernel cache for all bucketed shapes.
+            try:
+                warm_fn = getattr(warmup, "warm_decode_shape", None)
+                if warm_fn is not None:
+                    warm_fn(self.execution_backend)
+            except Exception as exc:
+                logger.warning(
+                    "tt_warmup_failed",
+                    extra={"reason": repr(exc)},
+                    exc_info=True,
+                )
+
+            # Instantiate the stub ModelRunner. Field name MUST be
+            # self._model_runner (with underscore) — TpModelWorker's
+            # parent code writes/reads this exact attribute; self.model_runner
+            # is a property over the same field.
+            # Match MLX's kwarg-passing pattern exactly (mlx/tp_worker.py:61-79).
+            self._model_runner = TTModelRunner(
+                model_config=self.model_config,
+                mem_fraction_static=self.server_args.mem_fraction_static,
+                gpu_id=self.gpu_id,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                moe_ep_rank=self.moe_ep_rank,
+                moe_ep_size=self.ep_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                nccl_port=self.nccl_port,
+                dp_rank=self.dp_rank,
+                server_args=self.server_args,
+                is_draft_worker=self.is_draft_worker,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=self.memory_pool_config,
+            )
+        except BaseException:
+            # Ensure the mesh is closed if anything below the mesh-open line
+            # fails — otherwise the next init attempt collides on hardware that
+            # only atexit would have eventually freed.
+            self._mesh_ctx.close()
+            raise
 
         logger.info(
             "tt_worker_init_done",
