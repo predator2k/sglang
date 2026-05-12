@@ -235,7 +235,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.tensor_bridge import use_mlx, use_tt
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -381,7 +381,9 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
+        self.enable_overlap = (
+            not server_args.disable_overlap_schedule and not use_mlx() and not use_tt()
+        )
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -654,6 +656,12 @@ class Scheduler(
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
             self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        elif use_tt():
+            from sglang.srt.hardware_backend.tenstorrent.tp_worker import (
+                TTTpModelWorker,
+            )
+
+            self.tp_worker = TTTpModelWorker(**worker_kwargs)
         else:
             from sglang.srt.managers.tp_worker import TpModelWorker
 
@@ -1318,6 +1326,15 @@ class Scheduler(
             self.result_queue: Deque = deque()
             return
 
+        if use_tt():
+            # Tenstorrent runs single-process with disable_overlap_schedule=True;
+            # no CUDA/MPS streams and no FutureMap needed. enable_overlap is
+            # always False on TT, so result_queue isn't referenced — but we
+            # mirror the MLX shape for safety.
+            self.future_map = None
+            self.result_queue: Deque = deque()
+            return
+
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1511,6 +1528,12 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
+            dispatch_event_loop(self)
+            return
+
+        if use_tt():
+            # Tenstorrent runs the event loop without PyTorch CUDA streams;
+            # ttnn drives the device, scheduler bookkeeping is CPU-only.
             dispatch_event_loop(self)
             return
 
