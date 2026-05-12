@@ -560,12 +560,12 @@ The HTTP server does not return 429 or queue full; clients see latency proportio
 
 | Scenario | Behavior |
 |---|---|
-| ttnn op raises during prefill | catch → `wrapper.free(req_id)` → HTTP 500 sanitized → mesh stays open |
+| ttnn op raises during prefill | catch → `self.execution_backend.free(req_id)` → HTTP 500 sanitized → mesh stays open |
 | ttnn op raises during decode | same; only this request affected |
 | Mesh OOM (prompt too long) | catch ttnn OOM → free → HTTP 413 "prompt exceeds device memory" |
 | Prompt > model context_len | rejected by SGLang scheduler (unchanged) |
 | Unexpected `forward_mode` (MIXED/SPLIT_PREFILL/etc) | `NotImplementedError` → HTTP 500. Should be unreachable given server-args defaults; defensive. |
-| Client disconnect mid-decode | SGLang scheduler cancels req → worker calls `wrapper.free(req_id)` before next step |
+| Client disconnect mid-decode | SGLang scheduler cancels req → worker calls `self.execution_backend.free(req_id)` before next step |
 
 ### 7.3 Shutdown
 
@@ -575,7 +575,7 @@ Concrete: register the handlers inside `TTTpModelWorker._init_model_runner` (whi
 
 | Scenario | Behavior |
 |---|---|
-| SIGTERM / SIGINT to Scheduler subprocess | Handler registered in worker init: `wrapper.reset_all()` → `ttnn.close_mesh_device(mesh)` → exit |
+| SIGTERM / SIGINT to Scheduler subprocess | Handler registered in worker init: `self.execution_backend.reset_all()` → `ttnn.close_mesh_device(mesh)` → exit |
 | Unhandled exception in Scheduler subprocess main loop | `atexit` handler registered in worker init: best-effort `close_mesh_device` |
 | `close_mesh_device` hangs > 5 s | Timeout. Force exit. Log requires `sudo tt-smi -r` before next start. |
 | Docker hard kill (SIGKILL) | Mesh leaks. Next start fails at mesh open → user runs reset script. |
@@ -856,6 +856,7 @@ After the initial spec was approved, a follow-up amendment introduced the `TTExe
 - **Round 2** (review of round 1 → fixed in `4c84c7f1b`): **8 fixes**. 2 CRITICAL (import-order trap in registry `__init__.py`; stale `worker.wrapper` in test fixtures) + 2 IMPORTANT (env-var registry test coverage; `SGLANG_TT_EXECUTION_BACKEND` invisible in §6.1) + 4 NIT.
 - **Round 3** (review of round 2 → fixed in `7ed0e43c1`): **7 fixes**. 2 CRITICAL (broken `.cache_clear()` test call; spec §5.1 still showed `self.wrapper` + worker doing `ttnn.to_torch`) + 3 IMPORTANT (stale `TTLlamaWrapper` references; `git rm` vs `rm`) + 2 NIT.
 - **Round 4** (review of round 3 → fixed in `557ab9132` and a follow-up): **4 fixes**. 2 CRITICAL (`ForwardMode.is_extend()` is multi-mode → silent admit of MIXED/DLLM_EXTEND; `@patch` targets unreachable on lazy in-`__init__` imports) + 1 IMPORTANT (Phase 0.2 forward-looking instruction still named old class) + bonus Risk #14 covering the registry NameError trap.
-- **Round 5** (review of round 4 → fixed in this commit): **3 CRITICAL + 3 IMPORTANT**. CRITICAL: plan G.2 still had `import ttnn` at module scope (violates invariant #7); spec §5.1 + plan G.2 used `ForwardMode.EXTEND` without importing the enum (NameError on copy-paste); F.1 Step 5 hoist instruction didn't address that the existing `llama_adapter.py:97` dtype-map evaluates `ttnn.bfloat16` before the assert fires. IMPORTANT: Risk #13 mitigation didn't name `tp_worker.py` as the enforcement location; Appendix B needed an amendment-review log (this section); Risk row numbers (#13/#14) collide visually with §4.1 file-row numbers (#13/#14) — left as-is since plan refs are unambiguous.
+- **Round 5** (review of round 4 → fixed in `f1524cef9`): **3 CRITICAL + 2 IMPORTANT** (the visual row-number collision was deferred to NIT, not fixed). CRITICAL: plan G.2 still had `import ttnn` at module scope (violates invariant #7); spec §5.1 + plan G.2 used `ForwardMode.EXTEND` without importing the enum (NameError on copy-paste); F.1 Step 5 hoist instruction didn't address that the existing `llama_adapter.py:97` dtype-map evaluates `ttnn.bfloat16` before the assert fires. IMPORTANT: Risk #13 mitigation didn't name `tp_worker.py` as the enforcement location; Appendix B needed an amendment-review log (this section).
+- **Round 6** (review of round 5 → fixed in this commit): **1 CRITICAL + 3 IMPORTANT**. CRITICAL: F.3 lifecycle tests patched `create_tt_model` + `Generator` but not `ttnn` — the round-5 hoist + None sentinel meant non-TT-host test runs would AttributeError in `__init__` before reaching the mocked names; added `@patch(f"{_MODULE}.ttnn")` to both lifecycle tests. IMPORTANT: spec §7.2 / §7.3 still had three `wrapper.free` / `wrapper.reset_all` references that round-3 missed (exactly the regression pattern Appendix B warned about); Round-5 miscount (claimed 3 IMPORTANT, actually 2) corrected here; F.1 Step 5 Option B "fine for the F.1 prototype" recommendation gained a `python -O` caveat (asserts get stripped, so Option B fails silently under optimization).
 
 **Takeaway from 5 rounds**: every round caught issues the prior round missed. The repeating pattern was *new code samples* (especially short pseudocode) introducing fresh bugs when fixing older ones — particularly around import semantics (lazy vs module-scope), enum-equality vs predicate methods, and stale identifier renames. The discipline of running another fresh-eyes review after each fix round was load-bearing.

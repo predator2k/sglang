@@ -821,7 +821,7 @@ Add it near `SGLANG_USE_MLX` for locality.
      tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]
      ```
 
-     Option A is preferred for production code (RuntimeError is more visible than AssertionError in `-O` mode); Option B is fine for the F.1 prototype.
+     Option A is preferred for production code: `RuntimeError` always fires, whereas `assert` is stripped under `python -O` (asserts compile to no-ops with optimization, so Option B would silently AttributeError on `None.bfloat16` if the optimizer is ever turned on). Option B is acceptable for the F.1 prototype **only because we never run with `-O`**; revisit if that changes.
 
   Reason: F.3 uses `@patch("...tt_transformers_backend.create_tt_model")`, which fails if the name isn't a module attribute. The in-`__init__` form in the prototype was for non-TT-host importability — module-scope `try/except` preserves that AND exposes the names for patching. The dtype-map ordering note above is the round-4 review correction.
 
@@ -884,9 +884,17 @@ from sglang.srt.hardware_backend.tenstorrent.execution.tt_transformers_backend i
 _MODULE = "sglang.srt.hardware_backend.tenstorrent.execution.tt_transformers_backend"
 
 
+# NB: also patch `ttnn` — F.1 Step 5's hoist leaves `ttnn = None` on
+# non-TT hosts, and __init__'s dtype-map (or Option A's RuntimeError
+# block) consumes `ttnn.bfloat16` before the mocked names are touched.
+# Without this patch, the guard fires before the test reaches the
+# lifecycle calls.
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
-def test_lifecycle_roundtrip(_mock_gen, _mock_create):
+@patch(f"{_MODULE}.ttnn")
+def test_lifecycle_roundtrip(_mock_ttnn, _mock_gen, _mock_create):
+    # MagicMock supplies bfloat16 / bfloat8_b as auto-attrs; dtype-map
+    # lookup succeeds with non-None sentinel objects.
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
             model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256
@@ -902,7 +910,8 @@ def test_lifecycle_roundtrip(_mock_gen, _mock_create):
 
 @patch(f"{_MODULE}.create_tt_model")
 @patch(f"{_MODULE}.Generator")
-def test_reset_all_clears_state(_mock_gen, _mock_create):
+@patch(f"{_MODULE}.ttnn")
+def test_reset_all_clears_state(_mock_ttnn, _mock_gen, _mock_create):
     with patch("os.path.isdir", return_value=True):
         be = TTTransformersExecutionBackend(
             model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256
