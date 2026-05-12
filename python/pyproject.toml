@@ -172,6 +172,9 @@ vsa = ["torch", "setuptools"]
 sglang = "sglang.cli.main:main"
 killall_sglang = "sglang.cli.killall:main"
 
+[project.entry-points."sglang.srt.platforms"]
+tenstorrent = "sglang.srt.hardware_backend.tenstorrent.platform:activate_tt_platform"
+
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
