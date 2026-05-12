@@ -1,7 +1,7 @@
 """Decode-shape JIT warmup driver.
 
-Runs a dummy short prefill + one decode step through `TTLlamaWrapper` so
-tt-metal's program cache compiles before the first real request. The first
+Runs a dummy short prefill + one decode step through `TTTransformersExecutionBackend`
+so tt-metal's program cache compiles before the first real request. The first
 real prompt then skips the multi-second JIT cost.
 
 Logs `warmup_start` / `warmup_done` per spec §6.2.
@@ -14,7 +14,9 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tenstorrent.llama_adapter import TTLlamaWrapper
+    from sglang.srt.hardware_backend.tenstorrent.execution.tt_transformers_backend import (
+        TTTransformersExecutionBackend,
+    )
 
 logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
 
@@ -22,7 +24,7 @@ _WARMUP_REQ_ID = "__warmup__"
 
 
 def warm_decode_shape(
-    wrapper: "TTLlamaWrapper",
+    wrapper: "TTTransformersExecutionBackend",
     *,
     dummy_token: int = 0,
     prompt_len: int = 32,

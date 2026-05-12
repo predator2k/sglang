@@ -57,7 +57,7 @@ class _DummyKVCache(KVCache):
 
 class _DummyModel:
     """Stand-in so `inspect.signature(model.forward)` and `getattr(model, ...)`
-    in ModelRunner.__init__ don't crash. The real forward lives in TTLlamaWrapper.
+    in ModelRunner.__init__ don't crash. The real forward lives in TTTransformersExecutionBackend.
     """
 
     @staticmethod

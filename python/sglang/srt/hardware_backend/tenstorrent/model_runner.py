@@ -2,7 +2,7 @@
 
 Bookkeeping subclass of `ModelRunner` that skips PyTorch weight loading and
 KV cache allocation — the real model forward and KV management live inside
-`TTLlamaWrapper` (ttnn / tt_transformers). The scheduler still needs a
+`TTTransformersExecutionBackend` (ttnn / tt_transformers). The scheduler still needs a
 ModelRunner-shaped object with `req_to_token_pool`, `token_to_kv_pool`,
 `token_to_kv_pool_allocator`, and a `model` attribute, so we satisfy those
 contracts with the minimum allocations.

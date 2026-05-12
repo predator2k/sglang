@@ -1,0 +1,56 @@
+"""Registry + factory for TT execution backends.
+
+Mirror of SGLang's attention_registry.py pattern. P1 ships exactly one real
+backend (tt_transformers); tt_xla is a registered placeholder so the
+post-P1 add-a-backend path is a swap rather than a Phase-F rewrite.
+
+IMPORTANT: the registry dict MUST be declared before the backend modules
+are imported — their @register_tt_execution_backend(...) decorators fire
+at import time and would NameError otherwise.
+"""
+
+from __future__ import annotations
+
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tenstorrent.execution.base import (
+    TTExecutionBackend,
+)
+
+# Step 1: declare the registry FIRST.
+TT_EXECUTION_BACKENDS: dict[str, type[TTExecutionBackend]] = {}
+
+
+def register_tt_execution_backend(name: str):
+    def _wrap(cls):
+        TT_EXECUTION_BACKENDS[name] = cls
+        return cls
+    return _wrap
+
+
+# Step 2: NOW import the backend modules — their decorators populate the
+# dict. E402 is suppressed here intentionally: the import MUST follow the
+# registry declaration above, otherwise the decorator NameErrors. Don't
+# silence E402 elsewhere — this is the one legitimate place for it.
+from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402, F401
+    tt_transformers_backend,
+    tt_xla_backend,
+)
+
+
+def resolve_execution_backend_name(requested: str | None = None) -> str:
+    """Resolve "auto" / "" / None to the P1 default."""
+    name = (requested or envs.SGLANG_TT_EXECUTION_BACKEND.get() or "auto").lower()
+    if name == "auto":
+        return "tt_transformers"
+    return name
+
+
+def get_tt_execution_backend(name: str | None = None) -> type[TTExecutionBackend]:
+    resolved = resolve_execution_backend_name(name)
+    if resolved not in TT_EXECUTION_BACKENDS:
+        available = ", ".join(sorted(TT_EXECUTION_BACKENDS)) or "<none>"
+        raise ValueError(
+            f"Unknown TT execution backend {resolved!r} (available: {available}). "
+            f"Set SGLANG_TT_EXECUTION_BACKEND or pass an explicit name."
+        )
+    return TT_EXECUTION_BACKENDS[resolved]

@@ -1,4 +1,4 @@
-"""TTLlamaWrapper — thin adapter between SGLang's worker and tt_transformers.
+"""TTTransformersExecutionBackend — thin adapter between SGLang's worker and tt_transformers.
 
 Captured tt_transformers API surface (Phase 0.2 evidence) the wrapper drives:
 
@@ -37,6 +37,28 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.hardware_backend.tenstorrent.execution import (
+    register_tt_execution_backend,
+)
+from sglang.srt.hardware_backend.tenstorrent.execution.base import (
+    TTExecutionBackend,
+)
+
+# In llama_adapter.py these lived inside __init__ (deferred for
+# non-TT-host importability). For F.3 mocking we need them on the
+# module namespace, so hoist them but keep the non-TT-host
+# importability via try/except + None sentinels.
+try:
+    import ttnn
+    from models.tt_transformers.tt.common import create_tt_model
+    from models.tt_transformers.tt.generator import Generator
+    from models.tt_transformers.tt.model_config import DecodersPrecision
+except ImportError:
+    ttnn = None
+    create_tt_model = None
+    Generator = None
+    DecodersPrecision = None
+
 logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
 
 
@@ -54,7 +76,8 @@ def _suggestion_for_not_implemented(detail: str) -> str:
     )
 
 
-class TTLlamaWrapper:
+@register_tt_execution_backend("tt_transformers")
+class TTTransformersExecutionBackend(TTExecutionBackend):
     """Black-box wrapper around a tt_transformers Generator for SGLang.
 
     P1 contract: caller (TTTpModelWorker) drives the wrapper through
@@ -81,18 +104,20 @@ class TTLlamaWrapper:
                 f"-v $HOME/tt-models:/models when running docker"
             )
 
+        # Option A guard: gate every downstream tt_transformers call behind
+        # a single check so non-TT-host imports stay safe but construction
+        # fails fast with a precise remediation pointer.
+        if create_tt_model is None or ttnn is None:
+            raise RuntimeError(
+                "tt_transformers / ttnn not importable; install tt-metal or "
+                "activate its venv (source /home/container_app_user/tt-metal/"
+                "python_env/bin/activate)"
+            )
+
         # tt_transformers' ModelArgs reads LLAMA_DIR / HF_MODEL from env.
         # Set LLAMA_DIR so create_tt_model picks up our model path without
         # leaking docker mount semantics into the rest of the wrapper.
         os.environ["LLAMA_DIR"] = model_path
-
-        # Lazy ttnn imports — wrapper construction must not blow up on
-        # non-TT hosts (e.g. CPU-only unit tests). The imports are
-        # deferred until we know we're inside the tt-metal venv.
-        import ttnn
-        from models.tt_transformers.tt.common import create_tt_model
-        from models.tt_transformers.tt.generator import Generator
-        from models.tt_transformers.tt.model_config import DecodersPrecision
 
         tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]
 
@@ -153,20 +178,30 @@ class TTLlamaWrapper:
 
     def new_request(self, req_id: str, prompt_tokens) -> None:
         """Allocate per-request KV / position state. Phase F.2 body."""
-        raise NotImplementedError("TTLlamaWrapper.new_request lands in Phase F.2")
+        raise NotImplementedError(
+            "TTTransformersExecutionBackend.new_request lands in Phase F.2"
+        )
 
     def extend(self, req_id: str):
         """Run prefill on prompt_tokens. Returns last-token logits. Phase F.2."""
-        raise NotImplementedError("TTLlamaWrapper.extend lands in Phase F.2")
+        raise NotImplementedError(
+            "TTTransformersExecutionBackend.extend lands in Phase F.2"
+        )
 
     def decode_step(self, req_id: str, last_token: int):
         """Run one decode step. Returns next-token logits. Phase F.2."""
-        raise NotImplementedError("TTLlamaWrapper.decode_step lands in Phase F.2")
+        raise NotImplementedError(
+            "TTTransformersExecutionBackend.decode_step lands in Phase F.2"
+        )
 
     def free(self, req_id: str) -> None:
         """Release per-request state. Phase F.2 body."""
-        raise NotImplementedError("TTLlamaWrapper.free lands in Phase F.2")
+        raise NotImplementedError(
+            "TTTransformersExecutionBackend.free lands in Phase F.2"
+        )
 
     def reset_all(self) -> None:
         """Drop all per-request state (e.g. on scheduler restart). Phase F.2."""
-        raise NotImplementedError("TTLlamaWrapper.reset_all lands in Phase F.2")
+        raise NotImplementedError(
+            "TTTransformersExecutionBackend.reset_all lands in Phase F.2"
+        )
