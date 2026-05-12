@@ -54,10 +54,48 @@ class TTSRTPlatform(SRTPlatform):
         return "tenstorrent"
 
     def apply_server_args_defaults(self, server_args):
-        # Real implementation lands in Phase E.1 — full spec §6.1 block.
-        raise NotImplementedError(
-            "apply_server_args_defaults is implemented in Phase E.1"
-        )
+        # P1 hard constraints
+        server_args.max_running_requests = 1
+        server_args.chunked_prefill_size = -1  # -1 disables chunked prefill
+        server_args.disable_radix_cache = True
+
+        # CRITICAL: overlap scheduler creates FutureMap + copy streams that
+        # the synchronous ttnn forward path cannot satisfy. Without this,
+        # FutureMap allocates -1 sentinels that get written into
+        # req.output_ids → garbage tokens.
+        server_args.disable_overlap_schedule = True
+
+        # Sampling backend setting is defensive — P1 actually does greedy
+        # in the worker (see spec §5.1) and never invokes
+        # model_runner.sample(). "pytorch" gives a non-CUDA-specific
+        # selection for any code path that does check this value.
+        server_args.sampling_backend = "pytorch"
+
+        # Disable CUDA-only paths
+        server_args.pre_warm_nccl = False
+        server_args.cpu_offload_gb = 0  # 0 = offloader disabled (also default)
+        server_args.enable_torch_compile = False
+
+        # User-facing device identity. Note: scheduler.init_overlap calls
+        # torch.get_device_module(self.device), and self.device flows from
+        # model_runner.device — NOT from this string. TTModelRunner.__init__
+        # overrides model_runner.device = "cpu" so torch's device-module
+        # lookup works while we keep this user-facing label.
+        server_args.device = "tenstorrent"
+
+        # TP visibility: SGLang sees tp_size = 1 in P1. The "TP=2" mesh is
+        # entirely inside ttnn's mesh_device — invisible to SGLang. Users
+        # invoke with --tp 1 (or omit, defaulting to 1). If they explicitly
+        # pass --tp 2, raise at startup rather than silently override.
+        if server_args.tp_size not in (None, 1):
+            raise ValueError(
+                f"TT backend requires --tp 1 (TT-internal TP=2 is hidden); "
+                f"got --tp {server_args.tp_size}."
+            )
+        server_args.tp_size = 1
+
+        # No NCCL / disaggregation
+        server_args.enable_dp_attention = False
 
     def get_mha_kv_pool_cls(self):
         # TTModelRunner (Phase D) constructs _DummyKVCache directly;
