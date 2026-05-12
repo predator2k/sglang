@@ -10,7 +10,7 @@
 
 ## 0. Executive Summary
 
-Phase 1 (P1) delivers an end-to-end **single-prompt** Llama-3.1-8B BF16 inference server on SGLang, running TP=2 across two p150a cards via ttnn `mesh_device` and ETH fabric. P1 is a **black-box integration**: SGLang acts as the scheduler / HTTP server / sampler, while `tt_transformers.models.llama3` owns the model forward and KV cache internally. P1 deliberately **disables** continuous batching, RadixAttention prefix cache, chunked prefill, and CUDA graphs.
+Phase 1 (P1) delivers an end-to-end **single-prompt** Llama-3.1-8B BF16 inference server on SGLang, running TP=2 across two p150a cards via ttnn `mesh_device` and ETH fabric. P1 is a **black-box integration**: SGLang acts as the scheduler / HTTP server / sampler, while a `tt_transformers` model instance (built via `models.tt_transformers.tt.common.create_tt_model` returning a `Generator` / `LlamaForCausalLM`) owns the model forward and KV cache internally. P1 deliberately **disables** continuous batching, RadixAttention prefix cache, chunked prefill, and CUDA graphs.
 
 P1 → P2/P3 is an **architectural inversion**, not a continuation. After P1, the decision whether to invest in P2 (paged KV + per-layer SGLang attention) must be re-scoped based on observed performance.
 
@@ -63,18 +63,26 @@ docker run --rm \
 
 These are not implementation tasks; they are go/no-go conditions. **If any of these fail, P1 should pause until resolved.**
 
-1. **tt_transformers supports Llama-3.1-8B on Blackhole at the pinned commit, AND exposes a public Llama class.** The user has only verified the Qwen3-1.7B demo. Two things must verify:
-   a. **Demo run** — execute the demo with Llama-3.1-8B:
+1. **tt_transformers supports Llama-3.1-8B on Blackhole at the pinned commit, AND exposes a reusable public API surface.** **(Partially verified 2026-05-11 — see `phase0-evidence.txt` and the post-evidence corrections to this section.)** Two things must verify:
+   a. **Demo run** — execute the demo with Llama-3.1-8B inside docker. Model selection is via the `HF_MODEL` env var (there is no `--model` pytest flag, confirmed by `conftest.py:pytest_addoption`):
       ```bash
+      HF_MODEL=/models/Llama-3.1-8B-Instruct \
       pytest -s -v models/tt_transformers/demo/simple_text_demo.py \
-        -k "performance and batch-1" \
-        --model llama-3.1-8b   # or whatever the flag is in their suite
+        -k "performance and batch-1"
       ```
-   b. **Public class import works** — inside the docker image:
+      Confirmed at line 1053 of `simple_text_demo.py`: `"Llama-3.1-8B"` is in `supported_models`. Confirmed at line 1086: `"P300_Llama-3.1-8B": 38` decode toks/s target on this exact host (P300 = two p150a).
+   b. **Public class surface** — inside the docker image, verify the actual API. **The earlier draft of this spec referenced `tt_transformers.models.llama3.Llama_3_1`; that module/class does NOT exist** in `vllm-tt-metal-src-release-...:0.10.0-55fd115-aa4ae1e`. Actual surface:
       ```bash
-      python -c "from tt_transformers.models.llama3 import Llama_3_1; print(Llama_3_1)"
+      python -c "
+        from models.tt_transformers.tt.generator import Generator
+        from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM  # Generator subclass
+        from models.tt_transformers.tt.common import create_tt_model           # factory, common.py:665
+        import inspect
+        print(Generator)
+        print(LlamaForCausalLM)
+        print(inspect.signature(create_tt_model))"
       ```
-      The exact class name (`Llama_3_1`, `Llama3`, `Llama3_1`, etc.) and import path must be confirmed. Capture its `__init__` signature for the spec's `TTLlamaWrapper` glue. If the only public surface is the demo CLI and not a reusable class, the implementation work expands materially.
+      Capture `create_tt_model`'s signature and `Generator`'s public methods (`prefill`, `decode_forward`, etc. — to be verified). These drive Phase F's `TTLlamaWrapper` glue. There is no per-family Python class; model identity comes from the `HF_MODEL` directory contents.
 
    If either check fails, see Risk #1 — re-spec, don't silently swap models.
 
@@ -108,7 +116,7 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
 | Target | Llama-3.1-8B BF16, TP=2 on 2× p150a | User-specified |
 | Code organization | **In-tree**: `python/sglang/srt/hardware_backend/tenstorrent/` | User-specified |
 | Multi-card execution | **Single-process** + `ttnn.open_mesh_device([0, 1])` + ETH fabric | Only viable model given p150a hardware + ttnn maturity; matches Tenstorrent's own reference impls |
-| Model code source | Reuse `tt_transformers.models.llama3.Llama_3_1` | Avoids per-op Blackhole compatibility risk |
+| Model code source | Reuse `tt_transformers` via `models.tt_transformers.tt.common.create_tt_model` factory + `Generator` / `LlamaForCausalLM` classes (verified 2026-05-11) | Avoids per-op Blackhole compatibility risk |
 | SGLang TP view | `tp_size = 1` (TP=2 hidden inside mesh) | P1 only; P2 will need re-design |
 | Integration pattern | **MLX-style**: worker is forward entry; ModelRunner is bookkeeping stub | Required because `attn_backend=None` is not safe with standard `ModelRunner.forward_batch` path |
 | Phasing | P1 black-box now; P2/P3 deferred and rescoped after P1 | Honest about architectural inversion required for P2 |
@@ -147,14 +155,16 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
 │  TTLlamaWrapper  (NEW, glue around tt_transformers)                 │
 │   - per-request KV state in self._req_state[req_id]                 │
 │   - methods: new_request / extend / decode_step / free / reset_all  │
-│   - wraps tt_transformers.Llama_3_1                                 │
+│   - wraps the Generator/LlamaForCausalLM instance returned by      │
+│     models.tt_transformers.tt.common.create_tt_model                │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  ttnn / tt-metal runtime                                            │
 │   open_mesh_device([0, 1], fabric=Eth)                              │
-│   tt_transformers Llama_3_1 (weights mesh-sharded, TP=2 internal)   │
+│   tt_transformers Generator (built by create_tt_model from HF_MODEL;│
+│     weights mesh-sharded, TP=2 internal)                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -181,7 +191,7 @@ All under `python/sglang/srt/hardware_backend/tenstorrent/`.
 | 3 | `tp_worker.py` | `TTTpModelWorker(TpModelWorker)` — inherits standard worker; overrides `_init_model_runner`, `get_pad_input_ids_func`, `forward_batch_generation`. Adds `_forward_batch_generation_tt(model_worker_batch)` private method analogous to MLX's `_forward_batch_generation_mlx`. **Copy MLX's file as starting point, swap MLX runner references for TT.** | ~200 |
 | 4 | `model_runner.py` | `TTModelRunner(ModelRunner)` — bookkeeping stub. Overrides `__init__` to set `self.device = "cpu"`. Overrides `initialize()`: `attn_backend=None`, `graph_runner=None`, **`sampler=None`** (mirrors MLX), constructs `_DummyKVCache` directly with matching ctor sig. P1 sampling is greedy and happens in the worker, not via `self.sampler` | ~150 |
 | 5 | `model_runner_stub.py` | `_DummyKVCache`, `_DummyModel` (copy MLX pattern) | ~80 |
-| 6 | `llama_adapter.py` | `TTLlamaWrapper` wrapping `tt_transformers.Llama_3_1`, per-request KV state mgmt | ~300 |
+| 6 | `llama_adapter.py` | `TTLlamaWrapper` wrapping the `Generator` instance built by `tt_transformers.tt.common.create_tt_model(HF_MODEL=...)`. Per-request KV state mgmt via `Generator`'s prefill/decode methods (exact method names captured during Phase 0.2). | ~300 |
 | 7 | `warmup.py` | Decode-path warmup driver (runs dummy `[1,1]` decode to JIT program cache) | ~80 |
 | 8 | `scripts/reset_devices.sh` | `sudo tt-smi -r 0000:01:00.0 0000:06:00.0` (documented recovery) | ~10 |
 | 9 | `test/test_platform_activate.py` | Activation returns None when ttnn unavailable | ~50 |
@@ -332,7 +342,7 @@ hardware_backend/tenstorrent/llama_adapter.py: TTLlamaWrapper
      ▼
 ttnn / tt-metal runtime
    mesh_device (open once at server start, closed at shutdown)
-   tt_transformers.Llama_3_1.forward()  — TP=2 sharding internal
+   tt_transformers Generator.prefill/decode_forward — TP=2 sharding internal
      │
      ▼  ttnn.Tensor → torch.Tensor (D2H over ETH gather + PCIe)
 sampling/sampler.py             (unchanged, pytorch path)
@@ -501,7 +511,7 @@ The HTTP server does not return 429 or queue full; clients see latency proportio
 | `import ttnn` fails on non-TT host | try/except in `activate_tt_platform()` | Return `None`. SGLang falls back to base SRTPlatform (or other plugin). No exception. |
 | `ttnn.open_mesh_device([0, 1])` fails | catch on init | Raise `RuntimeError("Mesh device init failed. Try: sudo tt-smi -r 0000:01:00.0 0000:06:00.0")`. Abort. |
 | HF weights path missing | `os.path.isdir` check in `TTLlamaWrapper.__init__` | `FileNotFoundError` with explicit instruction to mount via `-v` |
-| `tt_transformers.Llama_3_1` rejects model config | catch | `NotImplementedError` + suggest verifying tt_transformers commit |
+| `tt_transformers.create_tt_model` rejects HF_MODEL config | catch | `NotImplementedError` + suggest verifying tt_transformers commit and that the HF_MODEL directory matches a supported architecture (see `simple_text_demo.py:supported_models`) |
 | Weights schema mismatch | tt_transformers raises | Re-raise with context |
 | Warmup forward fails | catch in warmup driver | Log full traceback. Abort startup. **Never serve traffic with broken forward.** |
 
@@ -667,7 +677,7 @@ P1 explicitly does **not** require:
 Goal: Replace tt_transformers' internal KV with SGLang-owned paged KV pool; enable RadixAttention prefix cache.
 
 This is **not an extension of P1**. It requires:
-- Forking or monkey-patching `tt_transformers.models.llama3.Attention` so the layer reads/writes our paged KV instead of its internal contiguous KV
+- Forking or monkey-patching `tt_transformers.tt.attention` (the model's Attention layer) so it reads/writes our paged KV instead of its internal contiguous KV
 - Implementing `TTPagedKVPool(MHATokenToKVPool)` backed by `ttnn.Tensor` mesh-sharded pages
 - Re-doing the `tp_size` math: SGLang must see `tp_size=2` (for correct per-card KV sizing) while still single-process; this requires non-trivial work in worker init
 - Registering a real `TTAttnBackend(AttentionBackend)` and adopting SGLang's per-layer attention dispatch
@@ -720,6 +730,8 @@ Before committing to P2, re-spec based on P1 results. Specifically:
 
 8. **`use_tt()` helper location**: verified — `use_mlx()` lives at `python/sglang/srt/utils/tensor_bridge.py:38`. Add `use_tt()` alongside it. **Critical distinction**: `use_mlx()` returns `bool(envs.SGLANG_USE_MLX.get()) and _MLX_AVAILABLE` (env-var gated). `use_tt()` must NOT introduce `SGLANG_USE_TT` — it should check platform-plugin activation: `isinstance(current_platform, TTSRTPlatform)` or equivalent. The gating semantics differ from MLX even though the function signature is the same.
 
+9. **`tt_transformers` `Generator` API surface — capture in Phase 0.2.** Spec was originally anchored on a non-existent `Llama_3_1` class (corrected post-Phase-0 investigation 2026-05-11). The actual surfaces are `Generator` / `LlamaForCausalLM` / `create_tt_model`. **Still unverified**: which exact method names on `Generator` perform prefill vs decode vs KV-state-allocate-free. Phase 0.2 captures these and feeds them to Phase F's `TTLlamaWrapper` glue. **If `Generator` exposes only a `generate()` loop and no per-step entry points, the wrapper design needs to be redone or `tt_transformers` needs upstream hooks** — this is the live form of Risk #1 after the Llama_3_1 correction.
+
 ---
 
 ## 13. References
@@ -742,7 +754,7 @@ python/sglang/srt/hardware_backend/tenstorrent/
 ├── tp_worker.py                 # TTTpModelWorker (forward entry)
 ├── model_runner.py              # TTModelRunner (bookkeeping stub)
 ├── model_runner_stub.py         # _DummyKVCache, _DummyModel
-├── llama_adapter.py             # TTLlamaWrapper around tt_transformers.Llama_3_1
+├── llama_adapter.py             # TTLlamaWrapper around tt_transformers Generator/LlamaForCausalLM (via create_tt_model factory)
 ├── warmup.py                    # decode-path warmup driver
 ├── scripts/
 │   └── reset_devices.sh

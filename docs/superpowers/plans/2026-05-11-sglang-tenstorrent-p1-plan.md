@@ -4,7 +4,7 @@
 
 **Goal:** Deliver an end-to-end single-prompt Llama-3.1-8B BF16 inference server on SGLang, running TP=2 across two Tenstorrent p150a cards via `ttnn.mesh_device` and ETH fabric, as defined by the validated spec.
 
-**Architecture:** Black-box integration. SGLang owns scheduler / HTTP / sampling-call-site; `tt_transformers.models.llama3.Llama_3_1` owns the model forward and KV cache. New code lives in-tree under `python/sglang/srt/hardware_backend/tenstorrent/`. Pattern mirrors the MLX backend line-by-line: worker overrides `forward_batch_generation`, ModelRunner is a bookkeeping stub, `attn_backend=None`, `sampler=None`, greedy sampling happens in the worker on host torch tensors.
+**Architecture:** Black-box integration. SGLang owns scheduler / HTTP / sampling-call-site; a `tt_transformers` model instance (built via `models.tt_transformers.tt.common.create_tt_model` returning a `Generator`/`LlamaForCausalLM`, verified during Phase 0) owns the model forward and KV cache. New code lives in-tree under `python/sglang/srt/hardware_backend/tenstorrent/`. Pattern mirrors the MLX backend line-by-line: worker overrides `forward_batch_generation`, ModelRunner is a bookkeeping stub, `attn_backend=None`, `sampler=None`, greedy sampling happens in the worker on host torch tensors.
 
 **Tech Stack:** Python 3.10, SGLang main, `ttnn` / `tt-metal` (bundled in dev docker image), `tt_transformers`, PyTorch (host-side for sampling and tensor bridging), `pytest` for unit tests.
 
@@ -37,26 +37,46 @@ Spec §2 enumerates 8 prerequisites. Each is a hard go/no-go. **Block all coding
 
 ```bash
 source /home/container_app_user/tt-metal/python_env/bin/activate
+HF_MODEL=/models/Llama-3.1-8B-Instruct \
 pytest -s -v models/tt_transformers/demo/simple_text_demo.py \
-  -k "performance and batch-1" --model llama-3.1-8b
+  -k "performance and batch-1"
 ```
 
-Expected: demo completes, generates non-empty output. **If the `--model` flag name differs in the demo's argparse, capture it now** — also record the model directory layout it expects.
+**There is no `--model` pytest flag** (confirmed 2026-05-11 — see `phase0-evidence.txt`). The demo selects the model purely from the `HF_MODEL` env var. The directory pointed to must contain HF-format weights (`config.json`, safetensors shards, tokenizer files) — the existing `$HOME/tt-models/Qwen3-1.7B` directory is a layout reference.
+
+Expected: demo completes, generates non-empty output, prints decode toks/s near the `P300_Llama-3.1-8B: 38` target (line 1086 of `simple_text_demo.py`).
 
 - [ ] **Step 2:** If the test fails or hangs at mesh open, run `sudo tt-smi -r 0000:01:00.0 0000:06:00.0` and retry once. Two failures in a row → STOP. Risk #1 fired; renegotiate the spec target (do not silently swap to Qwen3).
 
-### Task 0.2: Confirm `Llama_3_1` public class is importable and capture its `__init__` signature
+### Task 0.2: Capture `create_tt_model` / `Generator` / `LlamaForCausalLM` API signatures
 
-- [ ] **Step 1:** Inside the same docker shell:
+**Earlier plan draft referenced `tt_transformers.models.llama3.Llama_3_1`. That class/module does NOT exist** in the pinned docker image (verified 2026-05-11). The actual public surface is in `models.tt_transformers.tt.{generator, generator_vllm, common}`.
+
+- [ ] **Step 1:** Inside docker shell:
 
 ```bash
-python -c "from tt_transformers.models.llama3 import Llama_3_1; \
-  import inspect; print(Llama_3_1); print(inspect.signature(Llama_3_1.__init__))"
+python -c "
+import inspect
+from models.tt_transformers.tt.generator import Generator
+from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM
+from models.tt_transformers.tt.common import create_tt_model
+print('Generator:', Generator)
+print('  methods:', [m for m in dir(Generator) if not m.startswith('_')])
+print('LlamaForCausalLM:', LlamaForCausalLM)
+print('  methods:', [m for m in dir(LlamaForCausalLM) if not m.startswith('_')])
+print('create_tt_model signature:', inspect.signature(create_tt_model))
+"
 ```
 
-Expected: class object printed; signature captured (paste into `phase0-evidence.txt`). The captured signature drives Task F.1 (constructing the wrapper).
+Expected: prints all three. Capture the exact method names that perform prefill, decode, KV-cache management — these drive Phase F.
 
-- [ ] **Step 2:** If `ImportError` or the class doesn't exist under that exact name, try the alternative names from spec §2.1 (`Llama3`, `Llama3_1`). Record what the correct import path is. **If only a CLI demo exists and no reusable class, STOP — Risk #1 has fired** and the spec needs renegotiation per §10 #1.
+- [ ] **Step 2:** Append the captured method-name list to `phase0-evidence.txt`. Phase F.1 / F.2 will reference these names when implementing `TTLlamaWrapper.extend` / `decode_step`. Likely mapping (verify against actual `Generator` API):
+  - `wrapper.extend(req_id)` → `generator.prefill_forward(...)` or similar
+  - `wrapper.decode_step(req_id, tok)` → `generator.decode_forward(...)` or similar
+  - `wrapper.new_request(req_id, prompt)` → allocate per-request state (may need our own bookkeeping if Generator doesn't expose per-req allocate/free)
+  - `wrapper.free(req_id)` → release per-request state
+
+- [ ] **Step 3:** If `Generator` does not expose enough public methods to drive prefill/decode externally (e.g. only a `generate()` that owns the whole loop), **STOP and escalate** — Risk #1 has fired in a different form. The wrapper layer cannot drive prefill/decode externally, and we'd need to upstream hooks into `tt_transformers` or redesign.
 
 ### Task 0.3: Llama-3.1-8B-Instruct weights staged
 
@@ -553,26 +573,26 @@ In a second terminal, run `tt-smi` while `MeshDeviceCtx` is alive — the two de
 
 ## Phase F — `TTLlamaWrapper`
 
-**Goal:** A wrapper around `tt_transformers.models.llama3.Llama_3_1` with the five methods spec §3.2 mandates: `new_request`, `extend`, `decode_step`, `free`, `reset_all`. Holds per-request KV handles in `self._req_state[req_id]`. A unit test on mocked `tt_transformers` passes; an integration smoke produces non-empty logits.
+**Goal:** A wrapper around a `tt_transformers` `Generator`/`LlamaForCausalLM` instance (built by `models.tt_transformers.tt.common.create_tt_model`) with the five methods spec §3.2 mandates: `new_request`, `extend`, `decode_step`, `free`, `reset_all`. Holds per-request KV handles in `self._req_state[req_id]`. A unit test on mocked `tt_transformers` passes; an integration smoke produces non-empty logits.
 
 **Files touched:**
 - Create: `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`
 - Create: `python/sglang/srt/hardware_backend/tenstorrent/test/test_wrapper_lifecycle.py`
 
 **Key API refs:**
-- Captured `Llama_3_1.__init__` signature from Task 0.2 — paste the captured signature into the file header comment.
+- Captured `create_tt_model` signature + `Generator`/`LlamaForCausalLM` method names from Task 0.2 — paste into file header comment.
 - Spec §5.1 — the request path. Wrapper methods produce ttnn tensors returned to the worker; worker calls `ttnn.to_torch()` on them.
 - Spec §3.2 invariant #6 — only `EXTEND`, `DECODE`, `IDLE` reach the wrapper.
 
-**Live risks:** §10 #1 (`Llama_3_1` may not expose the needed methods publicly — see decision gate below), §10 #8 (silent KV bugs in tt_transformers — greedy correctness test in Phase H catches these).
+**Live risks:** §10 #1 (`Generator` may not expose the needed methods publicly to drive prefill/decode externally — see decision gate below), §10 #8 (silent KV bugs in tt_transformers — greedy correctness test in Phase H catches these).
 
 ### Task F.1: `TTLlamaWrapper.__init__` + mesh wiring
 
-- [ ] **Step 1:** Create `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`. Module docstring should list the captured `Llama_3_1.__init__` kwargs verbatim (from Task 0.2 evidence).
+- [ ] **Step 1:** Create `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`. Module docstring should paste the captured `create_tt_model` signature + the `Generator`/`LlamaForCausalLM` method names verbatim (from Task 0.2 evidence).
 
 - [ ] **Step 2:** Implement `__init__(self, model_path: str, mesh_device, *, max_seq_len: int, dtype="bf16")`:
   - `os.path.isdir(model_path)` check → `FileNotFoundError` whose message **must contain the literal word "mount"** (e.g. `f"model_path {model_path!r} not found; mount with -v $HOME/tt-models:/models when running docker"`). The keyword is asserted by F.3's `match="mount"`; keep it stable here so the test doesn't drift.
-  - Construct `self._model = Llama_3_1(...)` with whatever kwargs the captured signature requires.
+  - Construct `self._model = create_tt_model(model_path=model_path, mesh_device=mesh_device, ...)` using the kwargs captured in Phase 0.2. If `create_tt_model` returns a `Generator` subclass (likely `LlamaForCausalLM` for this model), that's the object you store. Note: `tt_transformers` selects the model class internally based on `HF_MODEL` directory contents.
   - Wrap any `NotImplementedError` from `tt_transformers` with the suggestion-to-verify-commit message from §7.1 row 4.
   - `self._req_state: dict[str, Any] = {}`.
 
@@ -604,7 +624,7 @@ def reset_all(self) -> None:
     """Release all per-request state. Called on SIGTERM."""
 ```
 
-The exact ttnn calls inside each method depend on `Llama_3_1`'s public surface. **If the captured surface uses different method names** (e.g. `prefill` vs `extend`, `step` vs `decode`), keep the wrapper's outer name and adapt inside.
+The exact ttnn calls inside each method depend on `Generator`/`LlamaForCausalLM`'s public surface (captured in Phase 0.2). **If `Generator` uses different method names** (e.g. `prefill_forward` vs `extend`, `decode_forward` vs `decode_step`), keep the wrapper's outer name (the spec-mandated public API) and adapt inside.
 
 - [ ] **Step 2:** Add metrics emission (spec §6.2): `tt_decode_latency_ms`, `tt_extend_latency_ms`, `tt_d2h_latency_ms`, `tt_active_requests`. Use SGLang's existing metrics endpoint registry — do not add new endpoints (spec §6.2 last paragraph).
 
@@ -620,7 +640,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.hardware_backend.tenstorrent.llama_adapter import TTLlamaWrapper
 
 
-@patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.Llama_3_1")
+@patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.create_tt_model")
 def test_lifecycle_roundtrip(mock_llama):
     mock_llama.return_value = MagicMock()
     w = TTLlamaWrapper(model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256)
@@ -635,7 +655,7 @@ def test_lifecycle_roundtrip(mock_llama):
         assert "r1" not in w._req_state
 
 
-@patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.Llama_3_1")
+@patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.create_tt_model")
 def test_reset_all_clears_state(mock_llama):
     w = TTLlamaWrapper(model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256)
     with patch("os.path.isdir", return_value=True):
@@ -646,7 +666,7 @@ def test_reset_all_clears_state(mock_llama):
 
 
 def test_missing_model_path_raises():
-    with patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.Llama_3_1"):
+    with patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.create_tt_model"):
         with pytest.raises(FileNotFoundError, match="mount"):
             TTLlamaWrapper(model_path="/does/not/exist", mesh_device=MagicMock(), max_seq_len=256)
 ```
@@ -680,7 +700,7 @@ print('integration smoke ok')
 
 **Pass:** prints non-zero logits shape, `integration smoke ok`. Wall-time including weight load: expect 30–60 s (PCIe Gen3 x1 bottleneck on Device 1 — spec §5.2).
 
-**Decision gate at end of Phase F:** if `Llama_3_1` does not expose the methods we need to drive prefill/decode externally — e.g. the only public surface is a `generate()` that owns the whole loop — **STOP and escalate**. The wrapper layer cannot be salvaged without either upstreaming hooks into `tt_transformers` or rewriting the loop. Spec §10 #1 (high severity) covers this; the answer is renegotiate the spec, not silently swap models.
+**Decision gate at end of Phase F:** if `Generator`/`LlamaForCausalLM` does not expose the methods we need to drive prefill/decode externally — e.g. the only public surface is a `generate()` that owns the whole loop — **STOP and escalate**. The wrapper layer cannot be salvaged without either upstreaming hooks into `tt_transformers` or rewriting the loop. Spec §10 #1 (high severity) covers this; the answer is renegotiate the spec, not silently swap models.
 
 ---
 
@@ -968,7 +988,7 @@ SGLANG_PLATFORM=tenstorrent pytest python/sglang/srt/hardware_backend/tenstorren
 - If §8.2 fails: **do not proceed to stability or perf logging**. Greedy mismatch with HF is the only signal P1 has for KV correctness (§10 #8). Diagnose first. Likely culprits:
   1. Sampling path called via `model_runner.sample` instead of greedy-in-worker (§10 #11) — re-check Phase G.2 code.
   2. `bonus_token` / `accept_token` confusion only matters if speculative is involved — P1 doesn't use it. **N/A here.**
-  3. KV state corruption inside `Llama_3_1` — verify by replaying the same prompt through `tt_transformers`' demo directly. If demo agrees with HF but our wrapper doesn't, the bug is in the wrapper or the worker.
+  3. KV state corruption inside the `tt_transformers` Generator — verify by replaying the same prompt through `tt_transformers`' demo directly (same `HF_MODEL`). If demo agrees with HF but our wrapper doesn't, the bug is in the wrapper or the worker.
   4. Tokenizer mismatch — Llama 3.1 uses tiktoken-style; verify SGLang's path produces the same `input_ids` as HF's tokenizer (spec §12 #4).
 
 - If §8.1 + §8.2 pass: **P1 acceptance criteria 1 and 2 are met.** Proceed to Phase I.
@@ -1104,7 +1124,7 @@ These come from spec §12 and were not pre-answered. The implementer must resolv
 
 1. **Exact `tt_transformers` commit pin** (§12 #1) — resolve in Phase 0 (Tasks 0.1, 0.2). Pin the docker image hash; do not track main.
 2. **Decode warmup shape coverage** (§12 #2) — does `tt_transformers` JIT once per layer or once total? Resolved by observation in Phase E.3 wall-time.
-3. **`ttnn.from_torch` for int32 prompt tokens on Blackhole** (§12 #3) — surfaces in Phase F.1; if `Llama_3_1` rejects int32, cast to int64 or whatever the library wants.
+3. **`ttnn.from_torch` for int32 prompt tokens on Blackhole** (§12 #3) — surfaces in Phase F.1; if `Generator`'s prefill rejects int32, cast to int64 or whatever the library wants.
 4. **HF tokenizer locale handling** (§12 #4) — surfaces only if Phase H.2 greedy correctness fails for multilingual prompt; diagnose by comparing tokenized prompt ids to HF's tokenizer output.
 5. **`reset_devices.sh` safety while Python holds the device** (§12 #5) — empirically verify by Phase I.3 step 6 (manual reset after SIGKILL). Document the answer in the spec addendum.
 6. **SGLang API drift** (§12 #6) — re-verify every load-bearing identifier in spec §6.1 / §5.1 / §6.2 / §7 with `grep` before each phase that touches it (Phase C re-verifies scheduler line numbers; Phase G re-verifies `forward_batch_generation` signature).

@@ -1,0 +1,196 @@
+================================================================================
+Phase 0 - Task 0.1 Evidence: Llama-3.1-8B on tt_transformers demo
+================================================================================
+
+Date            : 2026-05-11 19:02 PDT
+Host            : SSRL1
+Git branch      : tenstorrent-p1
+Docker image    : ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e
+Image ID        : sha256:e48d532e8ea57141896af4cd2f098b406b081476a6cbb48d110c7f124873ea8f
+Image size      : ~4.1 GB compressed / 17.1 GB on disk
+Status of image : present locally (verified via `docker image ls`)
+
+Hardware visible:
+  /dev/tenstorrent/0, /dev/tenstorrent/1
+  lspci: 01:00.0 Tenstorrent Blackhole, 06:00.0 Tenstorrent Blackhole
+
+--------------------------------------------------------------------------------
+OUTCOME: NEEDS_CONTEXT  (pytest demo NOT executed)
+--------------------------------------------------------------------------------
+
+Reason: Llama-3.1-8B-Instruct weights are NOT present on the host.
+The demo selects its model purely from the HF_MODEL env var (path on
+disk inside the container). Running pytest without weights would only
+produce a trivially-explained "model directory not found" failure that
+adds no information beyond what `ls` already shows.
+
+Detailed evidence below.
+
+================================================================================
+1. Model directory layout on host  (`$HOME/tt-models/`)
+================================================================================
+
+`ls -la /home/mhnie/tt-models/`:
+    drwxr-xr-x  cache/
+    drwxr-xr-x  Qwen3-14B/
+    drwxr-xr-x  Qwen3-1.7B/
+    drwxr-xr-x  Qwen3-8B/
+
+`ls -la /home/mhnie/tt-models/Llama-3.1-8B-Instruct/`:
+    ls: cannot access ... : No such file or directory
+
+`find /home/mhnie/tt-models -maxdepth 3 -iname '*llama*'`:
+    (no results)
+
+`ls /home/mhnie/tt-models/cache`:
+    (empty)
+
+==> No Llama weights anywhere under $HOME/tt-models, in any naming variant.
+==> The demo will exit immediately if asked to load HF_MODEL=/models/Llama-3.1-8B-Instruct.
+
+================================================================================
+2. Demo model-selection mechanism  (corrects spec assumption)
+================================================================================
+
+Script    : /home/container_app_user/tt-metal/models/tt_transformers/demo/simple_text_demo.py
+Conftest  : /home/container_app_user/tt-metal/models/tt_transformers/demo/conftest.py
+
+Findings:
+  - There is NO `--model` pytest flag. `pytest_addoption(parser)` in conftest.py
+    registers only: --input_prompts, --instruct, --repeat_batches, --max_seq_len,
+    --batch_size, --max_generated_tokens, --data_parallel, --paged_attention,
+    --page_params, --sampling_params, --stop_at_eos, --optimizations,
+    --decoder_config_file, --token_accuracy, --stress_test, --enable_trace.
+    No "--model" anywhere.
+
+  - Model selection happens via the env var HF_MODEL. From simple_text_demo.py:
+        line 686:  hf_dir   = os.getenv("HF_MODEL", "")
+        line 703:  hf_model = os.getenv("HF_MODEL", "")
+    The demo reads weights from this directory at runtime. This matches the
+    pattern the user already uses for Qwen3-1.7B (`HF_MODEL=/models/Qwen3-1.7B`).
+
+  - Llama-3.1-8B IS in the demo's supported model list:
+        line 1053:  supported_models = ["Llama-3.2-1B", "Llama-3.2-3B",
+                                        "Llama-3.1-8B", "Llama-3.2-11B",
+                                        "Llama-3.1-70B", "Mistral-7B"]
+
+  - There IS a performance target entry for the dual-Blackhole config:
+        line 1086:  "P300_Llama-3.1-8B": 38   # decode toks/s target
+        line 1084:  "P150_Llama-3.1-8B": 23   # single-card target
+    P150 = one Blackhole p150a, P300 = two p150a's (this host). So
+    Llama-3.1-8B on dual-Blackhole IS a supported configuration per the demo.
+
+  ==> CORRECTION TO PLAN/SPEC: there is no `--model llama-3.1-8b` flag.
+      The working invocation will be exactly the Qwen3 form, swapping HF_MODEL:
+          HF_MODEL=/models/Llama-3.1-8B-Instruct  pytest -s -v \
+              models/tt_transformers/demo/simple_text_demo.py \
+              -k "performance and batch-1"
+
+================================================================================
+3. tt_transformers public class surface  (Task 0.2 lookahead)
+================================================================================
+
+The spec proposes `from tt_transformers.models.llama3 import Llama_3_1`.
+That import path DOES NOT EXIST in this docker image.
+
+Actual layout: /home/container_app_user/tt-metal/models/tt_transformers/
+    PERF.md, README.md, conftest.py, requirements.txt
+    demo/        <- simple_text_demo.py et al
+    lt/
+    model_params/
+    scripts/
+    tests/
+    tt/          <- the actual python module
+        attention.py, ccl.py, common.py, decoder.py, distributed_norm.py,
+        embedding.py, generator.py, generator_vllm.py, lm_head.py,
+        load_checkpoints.py, mixtral_mlp.py, mixtral_moe.py, mlp.py,
+        model.py, model_config.py, multimodal/, rope.py
+
+There is NO `models/llama3` subpackage, NO `Llama_3_1` class anywhere.
+Verified with: `grep -rnE 'class +Llama' models/tt_transformers/`
+    models/tt_transformers/tt/rope.py:213:class LlamaRotaryEmbedding(...)
+    models/tt_transformers/tt/generator_vllm.py:337:class LlamaForCausalLM(Generator):
+
+The reusable wrapping path is:
+    from models.tt_transformers.tt.generator import Generator     # OK, imports cleanly
+    from models.tt_transformers.tt.generator_vllm import LlamaForCausalLM  # vLLM glue
+    from models.tt_transformers.tt.common import create_tt_model  # factory, line 665
+
+`create_tt_model(...)` (common.py:665) is the factory used by the demo itself
+(see imports at the top of simple_text_demo.py). It builds the model from the
+HF_MODEL directory; there is no per-family Python class to instantiate.
+
+Import smoke test (executed inside container):
+    python -c "from models.tt_transformers.tt.generator import Generator; print(Generator)"
+    --> Generator OK
+    --> <class 'models.tt_transformers.tt.generator.Generator'>
+
+==> Task 0.2 should target `Generator` + `create_tt_model` (and possibly
+    `LlamaForCausalLM` from generator_vllm) as the integration surface, not
+    a nonexistent `Llama_3_1` class. The spec §2.1.b expectation needs
+    updating in light of this.
+
+================================================================================
+4. Command that WOULD have been run (kept for the controller's record)
+================================================================================
+
+docker run --rm \
+    --device /dev/tenstorrent \
+    --mount type=bind,src=/dev/hugepages-1G,dst=/dev/hugepages-1G \
+    --ipc host \
+    -v $HOME/tt-models:/models \
+    -e HF_MODEL=/models/Llama-3.1-8B-Instruct \
+    -e MAX_PREFILL_CHUNK_SIZE=4 \
+    --entrypoint bash \
+    ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e \
+    -c "source /home/container_app_user/tt-metal/python_env/bin/activate && \
+        cd /home/container_app_user/tt-metal && \
+        pytest -s -v models/tt_transformers/demo/simple_text_demo.py -k 'performance and batch-1'"
+
+NOT executed because $HOME/tt-models/Llama-3.1-8B-Instruct/ does not exist.
+
+================================================================================
+5. Blocker / next-step recommendation
+================================================================================
+
+To unblock Task 0.1 the user must, on the host:
+
+  1. Ensure HF auth (Llama-3.1-8B-Instruct is gated):
+        huggingface-cli login                # one-time
+     Then accept the license at:
+        https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+
+  2. Download the weights into the expected directory:
+        huggingface-cli download \
+            meta-llama/Llama-3.1-8B-Instruct \
+            --local-dir $HOME/tt-models/Llama-3.1-8B-Instruct
+     Or equivalent. The directory must contain config.json + the safetensors
+     shards + tokenizer files. The Qwen3-1.7B sibling directory is a good
+     reference for the expected layout (since that one already works).
+
+  3. Re-run Task 0.1 with the docker command in section 4 above. No
+     `--model` flag is needed; HF_MODEL is the only switch.
+
+If huggingface access is the blocker (Risk #10 - HF gate), this stays
+NEEDS_CONTEXT until weights land. If, after weights are present, the demo
+fails at mesh open or with a ttnn error, then Step 2 (sudo tt-smi -r
+0000:01:00.0 0000:06:00.0 retry once) applies.
+
+================================================================================
+Files / paths referenced
+================================================================================
+
+  /home/mhnie/tt-models/                       (host model dir, no Llama)
+  /home/mhnie/sglang/docs/superpowers/specs/2026-05-11-sglang-tenstorrent-p1-design.md
+  /home/mhnie/sglang/docs/superpowers/plans/2026-05-11-sglang-tenstorrent-p1-plan.md
+
+Inside container:
+  /home/container_app_user/tt-metal/models/tt_transformers/demo/simple_text_demo.py
+  /home/container_app_user/tt-metal/models/tt_transformers/demo/conftest.py
+  /home/container_app_user/tt-metal/models/tt_transformers/tt/generator.py
+  /home/container_app_user/tt-metal/models/tt_transformers/tt/generator_vllm.py
+  /home/container_app_user/tt-metal/models/tt_transformers/tt/common.py  (create_tt_model:665)
+
+================================================================================
+End of evidence
+================================================================================
