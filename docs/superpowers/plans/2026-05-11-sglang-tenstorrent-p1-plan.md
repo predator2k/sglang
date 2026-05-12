@@ -800,7 +800,13 @@ Add it near `SGLANG_USE_MLX` for locality.
          DecodersPrecision = None
      ```
 
-     Then in `__init__`, add a guard block **before** any use of the hoisted names. The existing `llama_adapter.py:97` line `tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]` consumes `ttnn` immediately — if you keep that pattern, the dtype-map AttributeErrors on `None.bfloat16` BEFORE the assert runs. Two acceptable shapes (pick one):
+     Then in `__init__`, the body order MUST be:
+
+     1. `model_path` existence check (`os.path.isdir` / `FileNotFoundError("...mount...")`) — uses NO hoisted names, so this stays first and `test_missing_model_path_raises` still fires `FileNotFoundError` on CPU-only hosts.
+     2. The ttnn-None guard (Option A or B below) — gates everything below.
+     3. The dtype-map and the `create_tt_model(...)` call — both consume hoisted names.
+
+     The existing `llama_adapter.py:97` line `tt_dtype = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[dtype]` consumes `ttnn` immediately — if you keep that pattern, the dtype-map AttributeErrors on `None.bfloat16` BEFORE the assert runs. Two acceptable shapes for the guard at step 2 (pick one):
 
      ```python
      # Option A: hard-fail with a clear message
