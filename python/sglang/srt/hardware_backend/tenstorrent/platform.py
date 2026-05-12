@@ -1,10 +1,21 @@
-"""TTSRTPlatform skeleton + activate_tt_platform entry point.
+"""TTSRTPlatform + MeshDeviceCtx + activate_tt_platform entry point.
 
 See docs/superpowers/specs/2026-05-11-sglang-tenstorrent-p1-design.md.
 """
 
+from __future__ import annotations
+
+import atexit
+import logging
+import signal
+import threading
+import time
+from typing import Any
+
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+
+logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
 
 
 def activate_tt_platform() -> str | None:
@@ -120,8 +131,158 @@ class TTSRTPlatform(SRTPlatform):
 class MeshDeviceCtx:
     """Per-Scheduler-subprocess mesh-device lifecycle holder.
 
-    Real implementation lands in Phase E.2 (ttnn.open_mesh_device + signal
-    handlers + program cache config + 5s close timeout). For Phase A this
-    is a placeholder so the rest of the module can reference the name.
+    Opens a 1x2 mesh on Tenstorrent devices 0 and 1 with fabric enabled and
+    Blackhole-appropriate dispatch config (MUX + ROW), mirroring the
+    `mesh_device` fixture in tt-metal's conftest.py.
+
+    Signal/atexit handlers MUST be registered from the Scheduler subprocess
+    — registering them at plugin-import time in the parent process would
+    catch the wrong PID's signals. Construct this object from inside the
+    worker init, not from `activate_tt_platform()`.
     """
-    pass
+
+    # Defaults match the demo (Phase 0.1 evidence + tt-metal conftest):
+    # `device_params=[{"fabric_config": True, "trace_region_size": 30_000_000,
+    # "num_command_queues": 1}]`. Override via kwargs if a future workload
+    # needs a different shape.
+    DEFAULT_TRACE_REGION_SIZE = 30_000_000
+    DEFAULT_NUM_COMMAND_QUEUES = 1
+    DEFAULT_MESH_SHAPE = (1, 2)
+    CLOSE_TIMEOUT_S = 5.0
+
+    def __init__(
+        self,
+        *,
+        mesh_shape: tuple[int, int] = DEFAULT_MESH_SHAPE,
+        trace_region_size: int = DEFAULT_TRACE_REGION_SIZE,
+        num_command_queues: int = DEFAULT_NUM_COMMAND_QUEUES,
+    ):
+        import ttnn
+
+        self._ttnn = ttnn
+        self._fabric_was_set = False
+        self.mesh: Any | None = None
+        self._closed = False
+        self._close_lock = threading.Lock()
+
+        # Set fabric BEFORE open_mesh_device (mandatory ordering per
+        # tt-metal/conftest.py set_fabric helper).
+        ttnn.set_fabric_config(
+            ttnn.FabricConfig.FABRIC_1D,
+            ttnn.FabricReliabilityMode.STRICT_INIT,
+            None,  # num_planes
+            ttnn.FabricTensixConfig.MUX,
+        )
+        self._fabric_was_set = True
+
+        # Blackhole + fabric requires ROW dispatch (per
+        # tests/scripts/common.py:get_updated_device_params).
+        dispatch_core_config = ttnn.DispatchCoreConfig(
+            None,  # dispatch_core_type (default)
+            ttnn.DispatchCoreAxis.ROW,
+            ttnn.FabricTensixConfig.MUX,
+        )
+
+        shape = ttnn.MeshShape(*mesh_shape)
+        try:
+            self.mesh = ttnn.open_mesh_device(
+                mesh_shape=shape,
+                dispatch_core_config=dispatch_core_config,
+                trace_region_size=trace_region_size,
+                num_command_queues=num_command_queues,
+            )
+        except Exception:
+            # Reset fabric if open fails so the next attempt isn't blocked.
+            self._reset_fabric_safely()
+            raise
+
+        try:
+            pci_ids = [
+                ttnn.GetPCIeDeviceID(i)
+                for i in range(self.mesh.get_num_devices())
+            ]
+            bdfs = [f"0000:{pid:02x}:00.0" for pid in pci_ids]
+        except Exception:
+            bdfs = []
+
+        logger.info(
+            "mesh_open",
+            extra={
+                "bdfs": bdfs,
+                "mesh_shape": list(mesh_shape),
+                "num_devices": self.mesh.get_num_devices(),
+            },
+        )
+
+        # Register handlers ONLY from the subprocess we're in. SIGTERM/SIGINT
+        # → graceful close. atexit covers normal interpreter shutdown.
+        atexit.register(self._safe_close)
+        try:
+            signal.signal(signal.SIGTERM, self._on_signal)
+            signal.signal(signal.SIGINT, self._on_signal)
+        except ValueError:
+            # signal.signal() only works in main thread; if scheduler runs
+            # in a side thread the registration silently fails. atexit
+            # still covers normal shutdown.
+            logger.warning(
+                "mesh_signal_register_failed",
+                extra={"reason": "not in main thread"},
+            )
+
+    def _on_signal(self, signum, _frame):
+        logger.info("mesh_signal_received", extra={"signum": signum})
+        self._safe_close()
+        # Re-raise default behaviour so the process exits.
+        signal.signal(signum, signal.SIG_DFL)
+        signal.raise_signal(signum)
+
+    def _safe_close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        if self.mesh is None:
+            self._reset_fabric_safely()
+            return
+
+        t0 = time.time()
+        timer_fired = threading.Event()
+
+        def _watchdog():
+            timer_fired.set()
+            logger.warning(
+                "mesh_close_timeout",
+                extra={"elapsed_s": self.CLOSE_TIMEOUT_S},
+            )
+
+        watchdog = threading.Timer(self.CLOSE_TIMEOUT_S, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            for submesh in self.mesh.get_submeshes():
+                self._ttnn.close_mesh_device(submesh)
+            self._ttnn.close_mesh_device(self.mesh)
+        except Exception:
+            logger.exception("mesh_close_error")
+        finally:
+            watchdog.cancel()
+
+        self._reset_fabric_safely()
+        self.mesh = None
+        elapsed = time.time() - t0
+        if not timer_fired.is_set():
+            logger.info("mesh_close", extra={"shutdown_elapsed_s": elapsed})
+
+    def _reset_fabric_safely(self):
+        if not self._fabric_was_set:
+            return
+        try:
+            self._ttnn.set_fabric_config(self._ttnn.FabricConfig.DISABLED)
+        except Exception:
+            logger.exception("mesh_fabric_reset_error")
+        self._fabric_was_set = False
+
+    def close(self):
+        """Public alias for explicit shutdown."""
+        self._safe_close()
