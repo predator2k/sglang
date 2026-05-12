@@ -6,12 +6,22 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+
+try:
+    from torch.cuda.memory import (
+        CUDAPluggableAllocator,
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+except ImportError:
+    # Non-CUDA torch (e.g. tt-metal docker's torch 2.7.1+cpu) lacks these symbols.
+    # Symmetric-memory paths below are unreachable on non-CUDA platforms; leaving
+    # the names as None lets the module import while preserving call-time errors.
+    CUDAPluggableAllocator = None
+    _cuda_beginAllocateCurrentThreadToPool = None
+    _cuda_endAllocateToPool = None
+    _cuda_releasePool = None
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -182,7 +192,7 @@ def restore_symmetric_memory_context(saved_context):
         saved_context.__enter__()
 
 
-def get_nccl_mem_pool() -> torch.cuda.MemPool:
+def get_nccl_mem_pool() -> "torch.cuda.MemPool":
     """
     Get the shared MemPool for all groups.
 

@@ -14,7 +14,22 @@
 """PyTorch hooks for layerwise NVTX profiling."""
 
 import torch
-import torch.cuda.nvtx as nvtx
+
+try:
+    import torch.cuda.nvtx as nvtx
+except (ImportError, AttributeError):
+    # Non-CUDA torch (e.g. tt-metal docker's torch 2.7.1+cpu) lacks torch.cuda.nvtx.
+    # NVTX markers are profiling-only no-ops on non-CUDA platforms.
+    class _NvtxStub:
+        @staticmethod
+        def range_push(_msg):
+            return None
+
+        @staticmethod
+        def range_pop():
+            return None
+
+    nvtx = _NvtxStub()
 
 
 class PytHooks(object):
