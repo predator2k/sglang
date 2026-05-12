@@ -196,6 +196,23 @@ class MeshDeviceCtx:
             self._reset_fabric_safely()
             raise
 
+        # Persist compiled kernel binaries to disk. tt-metal's default is
+        # in-memory only — every fresh process re-JITs all per-shape kernels
+        # (~5–10s per never-seen (seq_len, layer-config) shape). Enabling
+        # this drops fresh-process cold-prefill from ~9.5s to ~250ms when
+        # the shape was previously compiled on this host. The on-disk
+        # binaries are reused across processes; no downside other than disk
+        # footprint.
+        try:
+            ttnn.device.EnablePersistentKernelCache()
+        except Exception as exc:
+            # Non-fatal: an older ttnn build may not have this binding.
+            # The mesh still works; cold-prefill will just remain slow.
+            logger.warning(
+                "persistent_kernel_cache_unavailable",
+                extra={"reason": repr(exc)},
+            )
+
         try:
             pci_ids = [
                 ttnn.GetPCIeDeviceID(i)
