@@ -40,6 +40,24 @@ def use_mlx() -> bool:
     return bool(envs.SGLANG_USE_MLX.get()) and _MLX_AVAILABLE
 
 
+@lru_cache(maxsize=1)
+def use_tt() -> bool:
+    """Return True when SGLang's current platform is the Tenstorrent backend.
+
+    Unlike ``use_mlx()`` (env-var gated), TT activation is driven by
+    SGLang's platform-plugin discovery (``sglang.srt.platforms`` entry
+    point). We lazy-import ``current_platform`` and identify the platform
+    by class name to keep this module free of ttnn-touching code on
+    non-TT hosts.
+    """
+    try:
+        from sglang.srt.platforms import current_platform
+
+        return type(current_platform).__name__ == "TTSRTPlatform"
+    except Exception:
+        return False
+
+
 # MPS has a 4GB (2^32 bytes) limit for MPSTemporaryNDArray allocations.
 # Metal may allocate multiple temporary buffers internally, so we use a
 # conservative threshold of 1GB to avoid hitting the limit.
@@ -222,6 +240,7 @@ def sync_torch() -> None:
 __all__ = [
     "is_mlx_available",
     "use_mlx",
+    "use_tt",
     "mlx_to_torch",
     "torch_to_mlx",
     "get_torch_device",
