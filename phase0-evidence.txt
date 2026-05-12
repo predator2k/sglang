@@ -194,3 +194,134 @@ Inside container:
 ================================================================================
 End of evidence
 ================================================================================
+
+================================================================================
+Task 0.1 RE-RUN 2026-05-11 (with weights)
+================================================================================
+Model dir : /home/mhnie/tt-models/Llama-3.1-8B-Instruct/ (30G, HF safetensors + original/)
+Docker img: ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e
+Branch    : tenstorrent-p1
+Host      : dual-Blackhole (P300); target P300_Llama-3.1-8B = 38 decode tok/s
+
+================================================================================
+Task 0.1 RE-RUN RESULTS (2026-05-11 ~19:42 PDT, weights downloaded)
+================================================================================
+
+OUTCOME: PASSED
+
+Test: pytest -s -v models/tt_transformers/demo/simple_text_demo.py \
+        -k "performance and batch-1"
+Env:  HF_MODEL=/models/Llama-3.1-8B-Instruct, MAX_PREFILL_CHUNK_SIZE=4
+Wall clock: 36.72s total (2.43s setup + 31.11s call + 0.02s teardown)
+
+Performance (single-user, batch=1, P300 = 2x p150a):
+    TTFT (warm, 145 tokens) : 47.61 ms
+    Decode latency          : 17.37 ms / token
+    Decode throughput       : 57.58 tok/s
+    P300_Llama-3.1-8B target: 38 tok/s   <-- exceeded by 51%
+
+Spec's pre-run estimate from §5.2 was:
+    Warm prefill (1k tokens):  300-800 ms
+    Warm decode (per token):   30-70 ms (10-25 tok/s)
+    --> Actual is ~2x better than the optimistic end of the estimate.
+    Spec performance budget can be revised after a fuller measurement
+    in Phase I.2.
+
+Other observations:
+  - Cold-start path: fabric init + checkpoint load completed in <2 min;
+    warmup prefill (1 token batch) then real prefill (145 tokens) both
+    sub-second after first JIT compile.
+  - "Model Llama-3.1-8B does not have prefill targets set for device P300"
+    informational warning — no TTFT target set in the demo's perf table
+    for this specific config. Decode target (38) is the one that matters.
+  - Mesh closed cleanly at teardown ("Closing user mode device drivers").
+
+Risk de-risking:
+  Risk #1 (tt_transformers Llama support)         : RESOLVED (passed)
+  Risk #2 (ttnn synchronous => 10-25 tok/s ceiling): SOFTENED (57 actual)
+  Risk #3 (D2H per-token cost)                     : likely also softened
+                                                     (not separately measured)
+
+================================================================================
+Task 0.2 RE-RUN RESULTS (opportunistic in same docker session, 2026-05-11)
+================================================================================
+
+OUTCOME: PASSED — full API surface captured.
+
+Generator (models.tt_transformers.tt.generator):
+  file: models/tt_transformers/tt/generator.py
+  public methods: [
+    'chat_completion',
+    'decode_forward',
+    'decode_forward_llama_vision',
+    'decode_forward_text',
+    'generate',
+    'prefill_forward',
+    'prefill_forward_llama_vision',
+    'prefill_forward_single_user_text',
+    'prefill_forward_text',
+    'process_decode_output_host',
+    'read_decode_output',
+    'text_completion',
+  ]
+
+LlamaForCausalLM (models.tt_transformers.tt.generator_vllm, Generator subclass):
+  file: models/tt_transformers/tt/generator_vllm.py
+  additional methods: [
+    'allocate_kv_cache',         <-- *** key for wrapper's new_request/free ***
+    'cache_path',
+    'initialize_vllm_model',
+  ]
+
+create_tt_model (models.tt_transformers.tt.common):
+  signature: (
+    mesh_device,
+    instruct,
+    max_batch_size,
+    optimizations,
+    max_seq_len,
+    paged_attention_config: PagedAttentionConfig = None,  <-- *** P2 simplifier ***
+    dtype=DataType.BFLOAT8_B,                              <-- default BFP8 not BF16
+    state_dict=None,
+    num_layers=None,
+  )
+
+Implications for Phase F (TTLlamaWrapper) implementation:
+  - new_request(req_id, prompt_tokens) -> call LlamaForCausalLM.allocate_kv_cache(...)
+  - extend(req_id) -> Generator.prefill_forward_text(...) or
+                       prefill_forward_single_user_text (the latter is exactly
+                       our batch=1 case)
+  - decode_step(req_id, tok) -> Generator.decode_forward_text(...) + read_decode_output
+  - free(req_id) -> release whatever allocate_kv_cache returned (verify API)
+
+Implications for Phase E.1 (apply_server_args_defaults):
+  - We need to decide whether to pass dtype=bfloat16 explicitly (matches spec)
+    or accept default BFP8 (matches working demo). Phase F.1 decision.
+
+Implications for P2/P3 scope (NOT for P1):
+  - `paged_attention_config` is already a constructor arg on create_tt_model.
+    tt_transformers natively supports paged attention. P2's "architectural
+    inversion to fork Attention layer" may be over-scoped — we may be able
+    to just pass a PagedAttentionConfig and inherit paged KV for free.
+    Verify in P2 re-spec; do not act on this now.
+
+================================================================================
+Tasks 0.4 (docker baseline) and 0.6 (ETH/reset/SGLANG_PLATFORM) — implicitly verified
+================================================================================
+
+By running the full pytest demo successfully:
+  - 0.4: docker image runs, ttnn boots, fabric initializes on both p150a's,
+         tt-metal Python env is healthy. Baseline confirmed.
+  - 0.6: ETH fabric came up (fabric_tensix_config=MUX, FabricConfig::FABRIC_1D).
+         tt-smi -r passwordless sudo previously confirmed available.
+         SGLANG_PLATFORM env var is defensive (no other plugins on this host).
+
+Remaining Phase 0:
+  0.3 weights downloaded                                            DONE
+  0.4 docker baseline                                               DONE (via 0.1 success)
+  0.5 pip install -e /sglang/python compatible with docker env      PENDING
+  0.6 ETH/reset/SGLANG_PLATFORM defensiveness                       DONE (via 0.1 success)
+
+================================================================================
+END Task 0.1 / 0.2 RE-RUN evidence
+================================================================================
