@@ -117,6 +117,7 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
 | Code organization | **In-tree**: `python/sglang/srt/hardware_backend/tenstorrent/` | User-specified |
 | Multi-card execution | **Single-process** + `ttnn.open_mesh_device([0, 1])` + ETH fabric | Only viable model given p150a hardware + ttnn maturity; matches Tenstorrent's own reference impls |
 | Model code source | Reuse `tt_transformers` via `models.tt_transformers.tt.common.create_tt_model` factory + `Generator` / `LlamaForCausalLM` classes (verified 2026-05-11) | Avoids per-op Blackhole compatibility risk |
+| Execution-backend surface | `TTExecutionBackend` ABC (5 lifecycle methods) + registry; **P1 implements one backend (`tt_transformers`)**; tt-xla slot reserved for post-P1 | Tenstorrent deprecated tt-torch in favor of tt-xla in <12 months — keep the impl thin and replaceable; mirrors SGLang's `--attention-backend` / `--moe-runner-backend` registry pattern |
 | SGLang TP view | `tp_size = 1` (TP=2 hidden inside mesh) | P1 only; P2 will need re-design |
 | Integration pattern | **MLX-style**: worker is forward entry; ModelRunner is bookkeeping stub | Required because `attn_backend=None` is not safe with standard `ModelRunner.forward_batch` path |
 | Phasing | P1 black-box now; P2/P3 deferred and rescoped after P1 | Honest about architectural inversion required for P2 |
@@ -143,7 +144,7 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
 ┌─────────────────────────────────────────────────────────────────────┐
 │  TTTpModelWorker(TpModelWorker)         (NEW, mirrors MLX exactly)  │
 │   ★ Subclasses TpModelWorker; overrides forward_batch_generation()  │
-│     to route through TTLlamaWrapper instead of standard             │
+│     to route through TTExecutionBackend instead of standard         │
 │     ModelRunner.forward(). Returns GenerationBatchResult with       │
 │     next_token_ids already sampled. Exact method shape: copy        │
 │     MlxTpModelWorker.forward_batch_generation line-by-line and      │
@@ -152,11 +153,29 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  TTLlamaWrapper  (NEW, glue around tt_transformers)                 │
+│  TTExecutionBackend (ABC, 5 lifecycle methods)                      │
+│   .new_request(req_id, prompt_tokens) -> None                       │
+│   .extend(req_id) -> last-token logits (host torch tensor)          │
+│   .decode_step(req_id, last_token) -> next-token logits             │
+│   .free(req_id) -> None                                             │
+│   .reset_all() -> None                                              │
+│                                                                     │
+│  Registry: TT_EXECUTION_BACKENDS = { name -> class }                │
+│  Selection: env SGLANG_TT_EXECUTION_BACKEND (default "auto" →       │
+│             "tt_transformers" in P1)                                │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ P1 impl
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  TTTransformersExecutionBackend  (NEW, glue around tt_transformers) │
 │   - per-request KV state in self._req_state[req_id]                 │
-│   - methods: new_request / extend / decode_step / free / reset_all  │
-│   - wraps the Generator/LlamaForCausalLM instance returned by      │
+│   - wraps the Generator/LlamaForCausalLM instance returned by       │
 │     models.tt_transformers.tt.common.create_tt_model                │
+│   - registered as "tt_transformers"                                 │
+│                                                                     │
+│  (Post-P1) TTXLAExecutionBackend slot — registered as "tt_xla"      │
+│  but currently raises NotImplementedError on construction. See      │
+│  §11 — tt-xla is the natural model-coverage path after P1 ships.    │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
                            ▼
@@ -175,6 +194,7 @@ These are not implementation tasks; they are go/no-go conditions. **If any of th
 4. No `torch.distributed`, no NCCL, no Gloo, no ProcessGroup, no per-rank workers.
 5. SGLang's KV pool is `_DummyKVCache` (zero device allocation); KV lives inside `tt_transformers` per-request state. The dummy pool is constructed **directly inside `TTModelRunner.initialize()`** with the matching constructor signature — the `get_mha_kv_pool_cls()` factory is **never invoked and raises NotImplementedError defensively** (see §6.1).
 6. Allowed `forward_mode` values: `EXTEND`, `DECODE`, `IDLE`. **IDLE returns an empty `GenerationBatchResult(logits_output=LogitsProcessorOutput(next_token_logits=None), can_run_cuda_graph=False)`** — MLX handles this at `tp_worker.py:136-140` and we must mirror it (scheduler produces IDLE batches even with max_running_requests=1 for sync / draining). MIXED/SPLIT_PREFILL/DLLM_EXTEND raise `NotImplementedError`.
+7. **`TTExecutionBackend` is the only seam the worker depends on.** The 5-method ABC (`new_request` / `extend` / `decode_step` / `free` / `reset_all`) is the boundary; everything below it (ttnn calls, tt_transformers method dispatch, page tables, etc.) is implementation detail of `TTTransformersExecutionBackend`. P1 ships exactly one implementation; the registry + ABC exist so a future `TTXLAExecutionBackend` (post-P1, see §11) is a backend-swap rather than a Phase-F rewrite. Worker and ModelRunner code must **NOT** import `tt_transformers` symbols directly — go through the backend interface.
 
 ---
 
@@ -191,7 +211,10 @@ All under `python/sglang/srt/hardware_backend/tenstorrent/`.
 | 3 | `tp_worker.py` | `TTTpModelWorker(TpModelWorker)` — inherits standard worker; overrides `_init_model_runner`, `get_pad_input_ids_func`, `forward_batch_generation`. Adds `_forward_batch_generation_tt(model_worker_batch)` private method analogous to MLX's `_forward_batch_generation_mlx`. **Copy MLX's file as starting point, swap MLX runner references for TT.** | ~200 |
 | 4 | `model_runner.py` | `TTModelRunner(ModelRunner)` — bookkeeping stub. Overrides `__init__` to set `self.device = "cpu"`. Overrides `initialize()`: `attn_backend=None`, `graph_runner=None`, **`sampler=None`** (mirrors MLX), constructs `_DummyKVCache` directly with matching ctor sig. P1 sampling is greedy and happens in the worker, not via `self.sampler` | ~150 |
 | 5 | `model_runner_stub.py` | `_DummyKVCache`, `_DummyModel` (copy MLX pattern) | ~80 |
-| 6 | `llama_adapter.py` | `TTLlamaWrapper` wrapping the `Generator` instance built by `tt_transformers.tt.common.create_tt_model(HF_MODEL=...)`. Per-request KV state mgmt via `Generator`'s prefill/decode methods (exact method names captured during Phase 0.2). | ~300 |
+| 6a | `execution/__init__.py` | Registry: `TT_EXECUTION_BACKENDS: dict[str, type[TTExecutionBackend]]`, decorator `@register_tt_execution_backend(name)`, factory `get_tt_execution_backend(name)` that resolves `"auto"` → P1's default `"tt_transformers"` | ~40 |
+| 6b | `execution/base.py` | `TTExecutionBackend(abc.ABC)` — the 5-method lifecycle contract worker code depends on | ~60 |
+| 6c | `execution/tt_transformers_backend.py` | `TTTransformersExecutionBackend(TTExecutionBackend)` wrapping the `Generator` instance built by `tt_transformers.tt.common.create_tt_model(HF_MODEL=...)`. Per-request KV state mgmt via `Generator`'s prefill/decode methods (exact method names captured during Phase 0.2). Registered as `"tt_transformers"`. | ~300 |
+| 6d | `execution/tt_xla_backend.py` | `TTXLAExecutionBackend(TTExecutionBackend)` placeholder — registered as `"tt_xla"`, raises `NotImplementedError` from `__init__` with a pointer to §11. Lands in P1 so the registry shape is exercised in tests; the real impl is post-P1. | ~30 |
 | 7 | `warmup.py` | Decode-path warmup driver (runs dummy `[1,1]` decode to JIT program cache) | ~80 |
 | 8 | `scripts/reset_devices.sh` | `sudo tt-smi -r 0000:01:00.0 0000:06:00.0` (documented recovery) | ~10 |
 | 9 | `test/test_platform_activate.py` | Activation returns None when ttnn unavailable | ~50 |
@@ -199,8 +222,9 @@ All under `python/sglang/srt/hardware_backend/tenstorrent/`.
 | 11 | `test/test_server_args_defaults.py` | apply_server_args_defaults sets expected fields | ~60 |
 | 12 | `test/test_forward_mode_guard.py` | Worker raises on unsupported forward_mode | ~50 |
 | 13 | `test/test_greedy_correctness.py` | 10-prompt greedy vs HF reference (`@requires_tt`) | ~150 |
+| 14 | `test/test_execution_backend_registry.py` | `TT_EXECUTION_BACKENDS` has `tt_transformers` and `tt_xla` entries; `get_tt_execution_backend("auto")` resolves to `tt_transformers` in P1; `tt_xla` factory raises `NotImplementedError` with a clear pointer | ~40 |
 
-Total P1 new code: ~1500 LoC.
+Total P1 new code: ~1500 LoC (unchanged — the ABC + registry adds ~100 LoC but the wrapper LoC budget absorbs it).
 
 ### 4.2 SGLang core modifications
 
@@ -208,6 +232,7 @@ Total P1 new code: ~1500 LoC.
 |---|---|
 | `python/pyproject.toml` | Add `[project.entry-points."sglang.srt.platforms"]` → `tenstorrent = "sglang.srt.hardware_backend.tenstorrent.platform:activate_tt_platform"` |
 | `python/sglang/srt/utils/tensor_bridge.py` (where `use_mlx()` actually lives — verified) | **Add `use_tt()` helper** with the same call-shape as `use_mlx()`. **NOTE: `use_mlx()` is env-var-gated** (`bool(envs.SGLANG_USE_MLX.get()) and _MLX_AVAILABLE`). TT uses platform-plugin activation instead — `use_tt()` should check `isinstance(current_platform, TTSRTPlatform)` (or the OOT enum), NOT introduce a `SGLANG_USE_TT` env var. The structural analogy is "one boolean dispatch primitive"; the gating semantics differ. |
+| `python/sglang/srt/environ.py` | Add `SGLANG_TT_EXECUTION_BACKEND = EnvStr("")` — selects which `TTExecutionBackend` implementation to load. `""` / `"auto"` → P1 default `"tt_transformers"`. `"tt_xla"` lands post-P1 and currently raises `NotImplementedError`. Env-var instead of `server_args` keeps the choice contained to the TT backend (vs. polluting upstream SGLang's dataclass with TT-specific options). |
 | `python/sglang/srt/managers/scheduler.py` | (a) **Add `use_tt()` dispatch branches alongside existing `use_mlx()` branches** at the ~4 worker-instantiation sites. Line numbers as of SGLang HEAD on 2026-05-11: 384–385, 653, 1312, 1511 — re-verify against current HEAD before editing; (b) guard NCCL-specific overlap paths with `is_cuda()` |
 | `python/sglang/srt/server_args.py` | (a) Document `tenstorrent` as a valid `--device` value in the argparse help text (no `choices=` constraint exists — argparse accepts any string today); (b) guard ~5 `torch.cuda.*` capability detections with `is_cuda()` |
 | `python/sglang/srt/managers/schedule_batch.py` | Line 342 `torch.cuda.current_device()` guard |
@@ -334,9 +359,11 @@ hardware_backend/tenstorrent/tp_worker.py: TTTpModelWorker(TpModelWorker)
      # (see managers/utils.py:26-32) — no further fields needed.
      │
      ▼
-hardware_backend/tenstorrent/llama_adapter.py: TTLlamaWrapper
+hardware_backend/tenstorrent/execution/tt_transformers_backend.py:
+  TTTransformersExecutionBackend (impl of TTExecutionBackend, resolved
+                                  via TT_EXECUTION_BACKENDS registry)
    self._req_state[req_id] holds per-request KV handle
-   .extend()       — runs prefill, returns last-token logits
+   .extend()       — runs prefill, returns last-token logits (host)
    .decode_step()  — advances by one token, returns last-token logits
      │
      ▼
@@ -510,7 +537,7 @@ The HTTP server does not return 429 or queue full; clients see latency proportio
 |---|---|---|
 | `import ttnn` fails on non-TT host | try/except in `activate_tt_platform()` | Return `None`. SGLang falls back to base SRTPlatform (or other plugin). No exception. |
 | `ttnn.open_mesh_device([0, 1])` fails | catch on init | Raise `RuntimeError("Mesh device init failed. Try: sudo tt-smi -r 0000:01:00.0 0000:06:00.0")`. Abort. |
-| HF weights path missing | `os.path.isdir` check in `TTLlamaWrapper.__init__` | `FileNotFoundError` with explicit instruction to mount via `-v` |
+| HF weights path missing | `os.path.isdir` check in `TTTransformersExecutionBackend.__init__` | `FileNotFoundError` with explicit instruction to mount via `-v` |
 | `tt_transformers.create_tt_model` rejects HF_MODEL config | catch | `NotImplementedError` + suggest verifying tt_transformers commit and that the HF_MODEL directory matches a supported architecture (see `simple_text_demo.py:supported_models`) |
 | Weights schema mismatch | tt_transformers raises | Re-raise with context |
 | Warmup forward fails | catch in warmup driver | Log full traceback. Abort startup. **Never serve traffic with broken forward.** |
@@ -672,17 +699,31 @@ P1 explicitly does **not** require:
 
 **P2 and P3 are NOT committed by this spec.** Their feasibility, value, and timing must be reassessed after P1 ships, based on observed P1 performance and stability.
 
-### Phase 2 — paged KV + per-layer attention (architectural inversion)
+### Phase 2 — TWO independent directions (pick one based on P1 results)
 
-Goal: Replace tt_transformers' internal KV with SGLang-owned paged KV pool; enable RadixAttention prefix cache.
+**P2-paged: Paged KV + per-layer attention (architectural inversion).** Replace tt_transformers' internal KV with SGLang-owned paged KV pool; enable RadixAttention prefix cache.
 
-This is **not an extension of P1**. It requires:
+This requires:
 - Forking or monkey-patching `tt_transformers.tt.attention` (the model's Attention layer) so it reads/writes our paged KV instead of its internal contiguous KV
 - Implementing `TTPagedKVPool(MHATokenToKVPool)` backed by `ttnn.Tensor` mesh-sharded pages
 - Re-doing the `tp_size` math: SGLang must see `tp_size=2` (for correct per-card KV sizing) while still single-process; this requires non-trivial work in worker init
 - Registering a real `TTAttnBackend(AttentionBackend)` and adopting SGLang's per-layer attention dispatch
 
-P2 estimate (placeholder, not committed): 2–3 months.
+**Discovery (Phase 0.2):** `models.tt_transformers.tt.common.create_tt_model` natively accepts a `paged_attention_config` kwarg. P2-paged may be much smaller scope than originally feared — possibly just passing a `PagedAttentionConfig` through, not a fork/monkey-patch. Re-evaluate before committing.
+
+P2-paged estimate (placeholder, not committed): 2-3 months — but may shrink to weeks if `paged_attention_config` does what we hope.
+
+**P2-coverage: Add `TTXLAExecutionBackend` (model-coverage expansion).** Implement the second slot in the execution-backend registry to compile arbitrary PyTorch/JAX models via tt-xla (PJRT → StableHLO → TT-MLIR → TT-Metal). The wrapper interface (§3.2) doesn't change — only `execution/tt_xla_backend.py` and `execution/__init__.py` are touched. SGLang's worker/scheduler/etc. are platform-stable.
+
+P2-coverage requires:
+- Studying `tt-xla` PJRT contract + how `torch_xla` builds StableHLO graphs from `nn.Module`
+- Implementing `TTXLAExecutionBackend.__init__` to JIT-compile a Llama (or arbitrary) model and persist the compiled artifact
+- Mapping our 5-method lifecycle onto PJRT calls (prefill + decode are separate graph entry points)
+- Performance comparison against the P1 `tt_transformers` baseline
+
+P2-coverage estimate (placeholder, not committed): unknown — depends heavily on how mature tt-xla is by then. The win is generality: any HF PyTorch model becomes runnable, not just hand-ported tt_transformers ones.
+
+**Decision rule:** if P1 perf is acceptable and Llama is the only model required, P2-paged for prefix caching. If model coverage is the priority, P2-coverage via tt-xla.
 
 ### Phase 3 — batched + continuous batching
 
@@ -740,8 +781,10 @@ Before committing to P2, re-spec based on P1 results. Specifically:
 - Tenstorrent vLLM fork: `github.com/tenstorrent/vllm`
 - tt-metal: `github.com/tenstorrent/tt-metal`
 - tt_transformers Llama demo: `models/tt_transformers/demo/simple_text_demo.py`
+- **tt-xla** (alternative execution path; deprecates tt-torch): `github.com/tenstorrent/tt-xla` — reserved as a registered slot in `TT_EXECUTION_BACKENDS`; real impl post-P1 (see §11)
 - SGLang MLX backend (architecture reference): `python/sglang/srt/hardware_backend/mlx/`
 - SGLang platform interface: `python/sglang/srt/platforms/interface.py`
+- SGLang attention-backend registry (pattern reference): `python/sglang/srt/layers/attention/attention_registry.py`
 
 ---
 
@@ -754,13 +797,18 @@ python/sglang/srt/hardware_backend/tenstorrent/
 ├── tp_worker.py                 # TTTpModelWorker (forward entry)
 ├── model_runner.py              # TTModelRunner (bookkeeping stub)
 ├── model_runner_stub.py         # _DummyKVCache, _DummyModel
-├── llama_adapter.py             # TTLlamaWrapper around tt_transformers Generator/LlamaForCausalLM (via create_tt_model factory)
+├── execution/                   # Swappable execution-backend layer (Phase F)
+│   ├── __init__.py              # TT_EXECUTION_BACKENDS registry + factory + env resolve
+│   ├── base.py                  # TTExecutionBackend(abc.ABC) — 5-method contract
+│   ├── tt_transformers_backend.py  # TTTransformersExecutionBackend — P1's real impl
+│   └── tt_xla_backend.py        # TTXLAExecutionBackend — post-P1 placeholder
 ├── warmup.py                    # decode-path warmup driver
 ├── scripts/
 │   └── reset_devices.sh
 └── test/
     ├── test_platform_activate.py
     ├── test_wrapper_lifecycle.py
+    ├── test_execution_backend_registry.py
     ├── test_server_args_defaults.py
     ├── test_forward_mode_guard.py
     └── test_greedy_correctness.py     # @requires_tt

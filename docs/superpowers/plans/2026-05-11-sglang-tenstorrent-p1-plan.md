@@ -400,7 +400,7 @@ from sglang.srt.hardware_backend.tenstorrent.model_runner_stub import _DummyKVCa
 
 
 class TTModelRunner(ModelRunner):
-    """Bookkeeping stub. Real forward happens in TTLlamaWrapper.
+    """Bookkeeping stub. Real forward happens in TTExecutionBackend.
 
     Mirrors MlxModelRunnerStub field-by-field — open that file and copy
     its load_model / initialize / __init__ overrides verbatim, swapping
@@ -543,7 +543,7 @@ def warm_decode_shape(wrapper, dummy_token: int = 0, prompt_len: int = 32):
     logger.info("warmup_done", extra={"elapsed_s": time.time() - t0})
 ```
 
-`wrapper` is `TTLlamaWrapper` — the API surface is defined in Phase F. **Order: write warmup.py before Phase F so Phase F can wire its call site, but the actual call only fires once the wrapper exists.**
+The `wrapper` parameter takes any `TTExecutionBackend` instance — the API surface is defined in Phase F. Renamed from `TTLlamaWrapper` after the spec amendment that introduces the ABC + registry (see Phase F header). The parameter name `wrapper` in the warmup function stays for readability; the actual type is `TTExecutionBackend`. **Order: write warmup.py before Phase F so Phase F can wire its call site, but the actual call only fires once a concrete backend exists.**
 
 - [ ] **Step 2:** Commit: `feat(tenstorrent): decode-shape JIT warmup driver`.
 
@@ -581,49 +581,207 @@ In a second terminal, run `tt-smi` while `MeshDeviceCtx` is alive — the two de
 
 ---
 
-## Phase F — `TTLlamaWrapper`
+## Phase F — `TTExecutionBackend` interface + `tt_transformers` implementation
 
-**Goal:** A wrapper around a `tt_transformers` `Generator`/`LlamaForCausalLM` instance (built by `models.tt_transformers.tt.common.create_tt_model`) with the five methods spec §3.2 mandates: `new_request`, `extend`, `decode_step`, `free`, `reset_all`. Holds per-request KV handles in `self._req_state[req_id]`. A unit test on mocked `tt_transformers` passes; an integration smoke produces non-empty logits.
+**Goal:** A 5-method ABC (`TTExecutionBackend`) is the only seam the worker depends on; `TTTransformersExecutionBackend` (the P1 implementation) wraps `Generator`/`LlamaForCausalLM` built by `create_tt_model`; a `TTXLAExecutionBackend` placeholder is registered but raises `NotImplementedError` (real impl is post-P1 per spec §11). Unit tests on mocked `tt_transformers` pass; the registry test exercises the auto-resolve; an integration smoke produces non-empty logits via the registry factory, not via direct class import.
+
+Spec amendment rationale (added in this revision): tt-torch was deprecated in favor of tt-xla in <12 months, signalling that Tenstorrent's SW stack still churns rapidly. Making the execution path swappable now — with the same registry pattern SGLang already uses for attention/moe/sampling backends — keeps P1 thin while pre-paying the future refactor cost. See spec §3.1 row "Execution-backend surface", §3.2 invariant #7, §11 "P2-coverage".
 
 **Files touched:**
-- Create: `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`
+- Create: `python/sglang/srt/hardware_backend/tenstorrent/execution/__init__.py` (registry + factory)
+- Create: `python/sglang/srt/hardware_backend/tenstorrent/execution/base.py` (`TTExecutionBackend` ABC)
+- Create: `python/sglang/srt/hardware_backend/tenstorrent/execution/tt_transformers_backend.py` (`TTTransformersExecutionBackend`, P1's real impl)
+- Create: `python/sglang/srt/hardware_backend/tenstorrent/execution/tt_xla_backend.py` (placeholder, raises NotImplementedError)
+- Modify: `python/sglang/srt/environ.py` (add `SGLANG_TT_EXECUTION_BACKEND = EnvStr("")`)
+- Delete: `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py` (the F.1 prototype — its content is split across `execution/base.py` + `execution/tt_transformers_backend.py`)
 - Create: `python/sglang/srt/hardware_backend/tenstorrent/test/test_wrapper_lifecycle.py`
+- Create: `python/sglang/srt/hardware_backend/tenstorrent/test/test_execution_backend_registry.py`
 
 **Key API refs:**
-- Captured `create_tt_model` signature + `Generator`/`LlamaForCausalLM` method names from Task 0.2 — paste into file header comment.
-- Spec §5.1 — the request path. Wrapper methods produce ttnn tensors returned to the worker; worker calls `ttnn.to_torch()` on them.
-- Spec §3.2 invariant #6 — only `EXTEND`, `DECODE`, `IDLE` reach the wrapper.
+- Captured `create_tt_model` signature + `Generator`/`LlamaForCausalLM` method names from Task 0.2 — paste into the `tt_transformers_backend.py` module docstring.
+- Spec §3.2 — the architecture diagram and invariant #7 (worker depends only on the ABC; never imports tt_transformers directly).
+- Spec §5.1 — the request path. Backend methods return host torch tensors (post `Generator.read_decode_output` + `process_decode_output_host`).
+- Spec §3.2 invariant #6 — only `EXTEND`, `DECODE`, `IDLE` reach the backend.
+- SGLang precedent: `python/sglang/srt/layers/attention/attention_registry.py` (`ATTENTION_BACKENDS` dict + `@register_attention_backend` decorator) — copy the *shape* of the registry, not its specific methods.
 
-**Live risks:** §10 #1 (`Generator` may not expose the needed methods publicly to drive prefill/decode externally — see decision gate below), §10 #8 (silent KV bugs in tt_transformers — greedy correctness test in Phase H catches these).
+**Live risks:** §10 #1 (`Generator` may not expose the methods we need — see decision gate at the end), §10 #8 (silent KV bugs in tt_transformers — greedy correctness test in Phase H catches these).
 
-### Task F.1: `TTLlamaWrapper.__init__` + mesh wiring
+### Task F.1: `TTExecutionBackend` ABC + registry + tt-xla placeholder
 
-- [ ] **Step 1:** Create `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`. Module docstring should paste the captured `create_tt_model` signature + the `Generator`/`LlamaForCausalLM` method names verbatim (from Task 0.2 evidence).
+This task replaces the deprecated `llama_adapter.py` (originally committed by an earlier F.1 attempt) with the new `execution/` package layout. The earlier prototype's `__init__` logic is moved verbatim into `tt_transformers_backend.py` — only the file location and class name change.
 
-- [ ] **Step 2:** Implement `__init__(self, model_path: str, mesh_device, *, max_seq_len: int, dtype="bf16")`:
-  - `os.path.isdir(model_path)` check → `FileNotFoundError` whose message **must contain the literal word "mount"** (e.g. `f"model_path {model_path!r} not found; mount with -v $HOME/tt-models:/models when running docker"`). The keyword is asserted by F.3's `match="mount"`; keep it stable here so the test doesn't drift.
-  - Construct `self._model = create_tt_model(model_path=model_path, mesh_device=mesh_device, ...)` using the kwargs captured in Phase 0.2. If `create_tt_model` returns a `Generator` subclass (likely `LlamaForCausalLM` for this model), that's the object you store. Note: `tt_transformers` selects the model class internally based on `HF_MODEL` directory contents.
-  - Wrap any `NotImplementedError` from `tt_transformers` with the suggestion-to-verify-commit message from §7.1 row 4.
-  - `self._req_state: dict[str, Any] = {}`.
+- [ ] **Step 1:** Create `execution/__init__.py`:
 
-- [ ] **Step 3:** Commit: `feat(tenstorrent): TTLlamaWrapper.__init__ wiring tt_transformers`.
+```python
+"""Registry + factory for TT execution backends.
 
-### Task F.2: `new_request` / `extend` / `decode_step` / `free` / `reset_all`
+Mirror of SGLang's attention_registry.py pattern. P1 ships exactly one real
+backend (tt_transformers); tt_xla is a registered placeholder so the
+post-P1 add-a-backend path is a swap rather than a Phase-F rewrite.
+"""
 
-- [ ] **Step 1:** Implement the five methods. Surface shape:
+from __future__ import annotations
+
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tenstorrent.execution.base import (
+    TTExecutionBackend,
+)
+
+# Importing the backend modules registers them via decorator side-effects.
+from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: F401
+    tt_transformers_backend,
+    tt_xla_backend,
+)
+
+TT_EXECUTION_BACKENDS: dict[str, type[TTExecutionBackend]] = {}
+
+
+def register_tt_execution_backend(name: str):
+    def _wrap(cls):
+        TT_EXECUTION_BACKENDS[name] = cls
+        return cls
+    return _wrap
+
+
+def resolve_execution_backend_name(requested: str | None = None) -> str:
+    """Resolve "auto" / "" / None to the P1 default."""
+    name = (requested or envs.SGLANG_TT_EXECUTION_BACKEND.get() or "auto").lower()
+    if name == "auto":
+        return "tt_transformers"
+    return name
+
+
+def get_tt_execution_backend(name: str | None = None) -> type[TTExecutionBackend]:
+    resolved = resolve_execution_backend_name(name)
+    if resolved not in TT_EXECUTION_BACKENDS:
+        available = ", ".join(sorted(TT_EXECUTION_BACKENDS)) or "<none>"
+        raise ValueError(
+            f"Unknown TT execution backend {resolved!r} (available: {available}). "
+            f"Set SGLANG_TT_EXECUTION_BACKEND or pass an explicit name."
+        )
+    return TT_EXECUTION_BACKENDS[resolved]
+```
+
+Note the chicken-and-egg: the registry dict has to exist before the backend modules' decorators fire. The standard Python idiom is to declare `TT_EXECUTION_BACKENDS = {}` *before* the `from ... import tt_transformers_backend` line — adjust import order accordingly.
+
+- [ ] **Step 2:** Create `execution/base.py` — the ABC:
+
+```python
+"""TTExecutionBackend ABC — the 5-method contract for SGLang ↔ TT integration.
+
+The worker (Phase G) imports only this ABC plus the registry factory.
+Concrete backends live in sibling modules.
+"""
+
+from __future__ import annotations
+
+import abc
+from typing import Any
+
+
+class TTExecutionBackend(abc.ABC):
+    """Black-box per-request lifecycle interface.
+
+    Implementations own all device interaction; the worker treats this object
+    as opaque except for these 5 methods. Return types are host torch tensors
+    (the backend is responsible for any device→host transfer + dtype massage).
+    """
+
+    @abc.abstractmethod
+    def __init__(self, model_path: str, mesh_device: Any, *, max_seq_len: int) -> None:
+        ...
+
+    @abc.abstractmethod
+    def new_request(self, req_id: str, prompt_tokens) -> None:
+        """Allocate per-request KV / position state."""
+
+    @abc.abstractmethod
+    def extend(self, req_id: str):
+        """Run prefill on the request's prompt; return last-token logits."""
+
+    @abc.abstractmethod
+    def decode_step(self, req_id: str, last_token: int):
+        """Advance by one token; return next-token logits."""
+
+    @abc.abstractmethod
+    def free(self, req_id: str) -> None:
+        """Release per-request state."""
+
+    @abc.abstractmethod
+    def reset_all(self) -> None:
+        """Drop all per-request state (e.g. on scheduler shutdown)."""
+```
+
+- [ ] **Step 3:** Create `execution/tt_xla_backend.py` — the placeholder:
+
+```python
+"""tt-xla execution backend — POST-P1 PLACEHOLDER.
+
+tt-xla (PJRT → StableHLO → TT-MLIR → TT-Metal) is Tenstorrent's new
+general-purpose PyTorch/JAX frontend; tt-torch is deprecated in its
+favor. The real implementation is post-P1 — see spec §11 "P2-coverage".
+
+This module exists in P1 only so the registry has a "tt_xla" entry; any
+attempt to construct it raises NotImplementedError with a pointer.
+"""
+
+from __future__ import annotations
+
+from sglang.srt.hardware_backend.tenstorrent.execution import (
+    register_tt_execution_backend,
+)
+from sglang.srt.hardware_backend.tenstorrent.execution.base import (
+    TTExecutionBackend,
+)
+
+
+@register_tt_execution_backend("tt_xla")
+class TTXLAExecutionBackend(TTExecutionBackend):
+    def __init__(self, model_path, mesh_device, *, max_seq_len):
+        raise NotImplementedError(
+            "tt-xla execution backend is post-P1; see spec §11 'P2-coverage'. "
+            "P1 ships tt_transformers only (set SGLANG_TT_EXECUTION_BACKEND="
+            "tt_transformers or leave unset to use the auto default)."
+        )
+
+    def new_request(self, req_id, prompt_tokens): raise NotImplementedError
+    def extend(self, req_id): raise NotImplementedError
+    def decode_step(self, req_id, last_token): raise NotImplementedError
+    def free(self, req_id): raise NotImplementedError
+    def reset_all(self): raise NotImplementedError
+```
+
+- [ ] **Step 4:** Add to `environ.py`:
+
+```python
+SGLANG_TT_EXECUTION_BACKEND = EnvStr("")
+```
+
+Add it near `SGLANG_USE_MLX` for locality.
+
+- [ ] **Step 5:** Create `execution/tt_transformers_backend.py` with `class TTTransformersExecutionBackend(TTExecutionBackend):` decorated `@register_tt_execution_backend("tt_transformers")`. The class body is the existing `llama_adapter.py:TTLlamaWrapper` implementation moved verbatim — just rename the class and adjust imports. The 5 method stubs (currently raising `"lands in Phase F.2"` NotImplementedError) carry over unchanged.
+
+- [ ] **Step 6:** Delete `python/sglang/srt/hardware_backend/tenstorrent/llama_adapter.py`. Run `grep -rn "llama_adapter\|TTLlamaWrapper" python/sglang/` and update any leftover references (Phase A/E artifacts may reference the old name in comments).
+
+- [ ] **Step 7:** Commit: `refactor(tenstorrent): introduce TTExecutionBackend ABC + registry; tt_transformers as first impl`.
+
+### Task F.2: `new_request` / `extend` / `decode_step` / `free` / `reset_all` (on `TTTransformersExecutionBackend`)
+
+All edits in this task target `execution/tt_transformers_backend.py` — the renamed home of the F.1 prototype. The 5 currently-NotImplementedError stubs gain real bodies. Worker / model_runner code never sees this class directly; they go through the registry factory.
+
+- [ ] **Step 1:** Implement the five methods. Surface shape (defined by `TTExecutionBackend`):
 
 ```python
 def new_request(self, req_id: str, prompt_tokens) -> None:
-    """Allocate per-request KV handle. prompt_tokens: list[int] or torch.LongTensor."""
+    """Allocate per-request KV / position state. prompt_tokens: list[int] or torch.LongTensor."""
     # spec §6.2: log req.new {req_id, prompt_len}
 
 def extend(self, req_id: str):
-    """Run prefill. Returns ttnn.Tensor of last-token logits, shape [vocab]."""
-    # spec §6.2: log req.extend {req_id, prompt_len}
-    # spec §6.2: emit tt_extend_latency_ms histogram point
+    """Run prefill. Returns torch.Tensor of last-token logits, shape [vocab]."""
+    # spec §6.2: log req.extend, emit tt_extend_latency_ms histogram point
 
 def decode_step(self, req_id: str, last_token: int):
-    """Advance by one token. Returns ttnn.Tensor of next-token logits, shape [vocab]."""
+    """Advance by one token. Returns torch.Tensor of next-token logits, shape [vocab]."""
     # spec §6.2: log req.decode, emit tt_decode_latency_ms
 
 def free(self, req_id: str) -> None:
@@ -634,75 +792,136 @@ def reset_all(self) -> None:
     """Release all per-request state. Called on SIGTERM."""
 ```
 
-The exact ttnn calls inside each method depend on `Generator`/`LlamaForCausalLM`'s public surface (captured in Phase 0.2). **If `Generator` uses different method names** (e.g. `prefill_forward` vs `extend`, `decode_forward` vs `decode_step`), keep the wrapper's outer name (the spec-mandated public API) and adapt inside.
+The exact ttnn calls inside each method depend on `Generator`/`LlamaForCausalLM`'s public surface (captured in Phase 0.2). Likely:
+- `extend` → `Generator.prefill_forward_single_user_text(tokens, page_table=None, user_id=0, last_token_idx=len-1, kv_cache=None)` → `process_decode_output_host(..., is_tokens=False)`
+- `decode_step` → `Generator.decode_forward_text(tokens, start_pos=..., page_table=None, kv_cache=None, enable_trace=True, read_from_device=True, sampling_params=None)`
+
+**If `Generator` uses different method names** than the Phase 0.2 capture, keep the ABC method names stable (the spec-mandated public API) and adapt inside.
 
 - [ ] **Step 2:** Add metrics emission (spec §6.2): `tt_decode_latency_ms`, `tt_extend_latency_ms`, `tt_d2h_latency_ms`, `tt_active_requests`. Use SGLang's existing metrics endpoint registry — do not add new endpoints (spec §6.2 last paragraph).
 
-- [ ] **Step 3:** Commit: `feat(tenstorrent): TTLlamaWrapper lifecycle methods + observability`.
+- [ ] **Step 3:** Commit: `feat(tenstorrent): TTTransformersExecutionBackend lifecycle methods + observability`.
 
-### Task F.3: Unit test — `test_wrapper_lifecycle.py` (CPU, mocked)
+### Task F.3: Unit tests — `test_wrapper_lifecycle.py` + `test_execution_backend_registry.py`
 
-- [ ] **Step 1:** Write:
+Two test files: one tests the lifecycle methods of `TTTransformersExecutionBackend` directly (mocked tt_transformers), the other tests the registry + factory + env-var resolution path.
+
+- [ ] **Step 1:** Write `test_wrapper_lifecycle.py`:
 
 ```python
 import pytest
 from unittest.mock import MagicMock, patch
-from sglang.srt.hardware_backend.tenstorrent.llama_adapter import TTLlamaWrapper
+from sglang.srt.hardware_backend.tenstorrent.execution.tt_transformers_backend import (
+    TTTransformersExecutionBackend,
+)
+
+_MODULE = "sglang.srt.hardware_backend.tenstorrent.execution.tt_transformers_backend"
 
 
-@patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.create_tt_model")
-def test_lifecycle_roundtrip(mock_llama):
-    mock_llama.return_value = MagicMock()
-    w = TTLlamaWrapper(model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256)
-    # Patch os.path.isdir to True for the mock path
+@patch(f"{_MODULE}.create_tt_model")
+@patch(f"{_MODULE}.Generator")
+def test_lifecycle_roundtrip(_mock_gen, _mock_create):
     with patch("os.path.isdir", return_value=True):
-        w.new_request("r1", [1, 2, 3])
-        assert "r1" in w._req_state
-        _ = w.extend("r1")
+        be = TTTransformersExecutionBackend(
+            model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256
+        )
+        be.new_request("r1", [1, 2, 3])
+        assert "r1" in be._req_state
+        _ = be.extend("r1")
         for _ in range(3):
-            _ = w.decode_step("r1", last_token=42)
-        w.free("r1")
-        assert "r1" not in w._req_state
+            _ = be.decode_step("r1", last_token=42)
+        be.free("r1")
+        assert "r1" not in be._req_state
 
 
-@patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.create_tt_model")
-def test_reset_all_clears_state(mock_llama):
-    w = TTLlamaWrapper(model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256)
+@patch(f"{_MODULE}.create_tt_model")
+@patch(f"{_MODULE}.Generator")
+def test_reset_all_clears_state(_mock_gen, _mock_create):
     with patch("os.path.isdir", return_value=True):
-        w.new_request("r1", [1])
-        w.new_request("r2", [2])
-    w.reset_all()
-    assert w._req_state == {}
+        be = TTTransformersExecutionBackend(
+            model_path="/tmp", mesh_device=MagicMock(), max_seq_len=256
+        )
+        be.new_request("r1", [1])
+        be.new_request("r2", [2])
+        be.reset_all()
+        assert be._req_state == {}
 
 
 def test_missing_model_path_raises():
-    with patch("sglang.srt.hardware_backend.tenstorrent.llama_adapter.create_tt_model"):
-        with pytest.raises(FileNotFoundError, match="mount"):
-            TTLlamaWrapper(model_path="/does/not/exist", mesh_device=MagicMock(), max_seq_len=256)
+    # No need to mock create_tt_model — model_path validation happens first.
+    with pytest.raises(FileNotFoundError, match="mount"):
+        TTTransformersExecutionBackend(
+            model_path="/does/not/exist", mesh_device=MagicMock(), max_seq_len=256
+        )
 ```
 
-- [ ] **Step 2:** Run: `pytest python/sglang/srt/hardware_backend/tenstorrent/test/test_wrapper_lifecycle.py -v`. **Pass:** all green.
+- [ ] **Step 2:** Write `test_execution_backend_registry.py`:
 
-- [ ] **Step 3:** Commit: `test(tenstorrent): wrapper lifecycle unit tests`.
+```python
+import pytest
+from unittest.mock import patch
+
+from sglang.srt.hardware_backend.tenstorrent.execution import (
+    TT_EXECUTION_BACKENDS,
+    get_tt_execution_backend,
+    resolve_execution_backend_name,
+)
+from sglang.srt.hardware_backend.tenstorrent.execution.tt_transformers_backend import (
+    TTTransformersExecutionBackend,
+)
+from sglang.srt.hardware_backend.tenstorrent.execution.tt_xla_backend import (
+    TTXLAExecutionBackend,
+)
+
+
+def test_registry_has_both_entries():
+    assert TT_EXECUTION_BACKENDS["tt_transformers"] is TTTransformersExecutionBackend
+    assert TT_EXECUTION_BACKENDS["tt_xla"] is TTXLAExecutionBackend
+
+
+def test_auto_resolves_to_tt_transformers_in_p1():
+    assert resolve_execution_backend_name("auto") == "tt_transformers"
+    assert resolve_execution_backend_name("") == "tt_transformers"
+    assert resolve_execution_backend_name(None) == "tt_transformers"
+
+
+def test_explicit_tt_xla_resolves_to_tt_xla():
+    assert resolve_execution_backend_name("tt_xla") == "tt_xla"
+
+
+def test_unknown_name_raises():
+    with pytest.raises(ValueError, match="Unknown TT execution backend"):
+        get_tt_execution_backend("frobnicate")
+
+
+def test_tt_xla_construction_raises_with_pointer():
+    cls = get_tt_execution_backend("tt_xla")
+    with pytest.raises(NotImplementedError, match="P2-coverage"):
+        cls(model_path="/tmp", mesh_device=None, max_seq_len=128)
+```
+
+- [ ] **Step 3:** Run: `pytest python/sglang/srt/hardware_backend/tenstorrent/test/test_wrapper_lifecycle.py python/sglang/srt/hardware_backend/tenstorrent/test/test_execution_backend_registry.py -v`. **Pass:** all green.
+
+- [ ] **Step 4:** Commit: `test(tenstorrent): execution backend ABC + registry + tt_transformers lifecycle`.
 
 ### Task F.4: Phase F verification — integration smoke (real hardware)
+
+The smoke goes through the registry factory, not a direct class import, so the integration path matches what the worker (Phase G) will use.
 
 - [ ] **Step 1:** Inside docker:
 
 ```bash
 SGLANG_PLATFORM=tenstorrent python -c "
 from sglang.srt.hardware_backend.tenstorrent.platform import MeshDeviceCtx
-from sglang.srt.hardware_backend.tenstorrent.llama_adapter import TTLlamaWrapper
-import ttnn
+from sglang.srt.hardware_backend.tenstorrent.execution import get_tt_execution_backend
 ctx = MeshDeviceCtx()
-w = TTLlamaWrapper('/models/Llama-3.1-8B-Instruct', ctx.mesh, max_seq_len=4096)
-w.new_request('r1', [1, 2, 3, 4, 5])
-logits_ttnn = w.extend('r1')
-import torch
-logits = ttnn.to_torch(logits_ttnn).float()
+BackendCls = get_tt_execution_backend()  # auto → tt_transformers in P1
+be = BackendCls('/models/Llama-3.1-8B-Instruct', ctx.mesh, max_seq_len=4096)
+be.new_request('r1', [1, 2, 3, 4, 5])
+logits = be.extend('r1')  # backend returns host torch tensor
 print('logits shape:', logits.shape, 'dtype:', logits.dtype)
 assert logits.numel() > 0
-w.free('r1')
+be.free('r1')
 ctx.close()
 print('integration smoke ok')
 "
@@ -710,7 +929,9 @@ print('integration smoke ok')
 
 **Pass:** prints non-zero logits shape, `integration smoke ok`. Wall-time including weight load: expect 30–60 s (PCIe Gen3 x1 bottleneck on Device 1 — spec §5.2).
 
-**Decision gate at end of Phase F:** if `Generator`/`LlamaForCausalLM` does not expose the methods we need to drive prefill/decode externally — e.g. the only public surface is a `generate()` that owns the whole loop — **STOP and escalate**. The wrapper layer cannot be salvaged without either upstreaming hooks into `tt_transformers` or rewriting the loop. Spec §10 #1 (high severity) covers this; the answer is renegotiate the spec, not silently swap models.
+- [ ] **Step 2:** Repeat with `SGLANG_TT_EXECUTION_BACKEND=tt_xla` and confirm it raises `NotImplementedError` containing "P2-coverage". This is a 5-second test that exercises the env-var → registry → factory path end-to-end, ensuring the post-P1 swap really is a one-knob change.
+
+**Decision gate at end of Phase F:** if `Generator`/`LlamaForCausalLM` does not expose the methods we need to drive prefill/decode externally — e.g. the only public surface is a `generate()` that owns the whole loop — **STOP and escalate**. The wrapper layer cannot be salvaged without either upstreaming hooks into `tt_transformers` or rewriting the loop. Spec §10 #1 (high severity) covers this; the answer is renegotiate the spec, not silently swap models. The ABC + registry remain valid — only the `tt_transformers` impl would need rework.
 
 ---
 
@@ -737,8 +958,8 @@ print('integration smoke ok')
 
 - [ ] **Step 2:** Create `python/sglang/srt/hardware_backend/tenstorrent/tp_worker.py`. Define `class TTTpModelWorker(TpModelWorker):`. Override `_init_model_runner` to:
   - Instantiate `MeshDeviceCtx` (this is the Scheduler-subprocess location where mesh handlers must register — see spec §7.3).
-  - Instantiate `TTLlamaWrapper(model_path, ctx.mesh, max_seq_len)`.
-  - Run `warmup.warm_decode_shape(self.wrapper)` from Phase E.3.
+  - **Resolve the execution backend via the registry**: `BackendCls = get_tt_execution_backend()` (no arg → reads `SGLANG_TT_EXECUTION_BACKEND` → resolves "auto"/empty to "tt_transformers"). Then `self.execution_backend = BackendCls(model_path, ctx.mesh, max_seq_len=max_seq_len)`. **Do NOT import `TTTransformersExecutionBackend` directly** — spec §3.2 invariant #7 forbids it.
+  - Run `warmup.warm_decode_shape(self.execution_backend)` from Phase E.3.
   - Instantiate `TTModelRunner(...)` and **assign to `self._model_runner`** — note the underscore: `TpModelWorker._init_model_runner` writes to `self._model_runner` (managers/tp_worker.py:347) and `self.model_runner` is a read-only property over the same field. Re-read `MlxTpModelWorker._init_model_runner` for the canonical shape and exact ctor kwargs.
 
 - [ ] **Step 3:** Override `get_pad_input_ids_func` to return a no-op padder (MLX does the same — copy its return value). P1 doesn't batch, so padding is trivial.
@@ -799,16 +1020,17 @@ class TTTpModelWorker(TpModelWorker):
 
         if mwb.forward_mode.is_extend():
             prompt_tokens = mwb.input_ids  # torch.Tensor[L], CPU
-            self.wrapper.new_request(req_id, prompt_tokens)
-            logits_ttnn = self.wrapper.extend(req_id)
+            self.execution_backend.new_request(req_id, prompt_tokens)
+            logits = self.execution_backend.extend(req_id)  # host torch.Tensor
         else:  # DECODE
             last_tok = int(mwb.input_ids[-1].item())
-            logits_ttnn = self.wrapper.decode_step(req_id, last_tok)
+            logits = self.execution_backend.decode_step(req_id, last_tok)
 
         # Greedy sampling in the worker; we never call model_runner.sample
-        # because model_runner.sampler is None (§3.2 invariant #2).
-        logits = ttnn.to_torch(logits_ttnn).float()  # [vocab]
-        next_token_ids = torch.argmax(logits, dim=-1, keepdim=True).long()
+        # because model_runner.sampler is None (§3.2 invariant #2). The
+        # execution backend already returns host torch tensors (it owns
+        # any ttnn.to_torch + dtype massage), so no ttnn import here.
+        next_token_ids = torch.argmax(logits.float(), dim=-1, keepdim=True).long()
 
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
@@ -819,7 +1041,7 @@ class TTTpModelWorker(TpModelWorker):
 
 Match MLX's exact `GenerationBatchResult` field population — re-read `MlxTpModelWorker._forward_batch_generation_mlx` and compare field-by-field. Any extra optional fields MLX sets, set them too.
 
-- [ ] **Step 2:** Add `free()` hook: when scheduler marks a req finished, the worker must call `self.wrapper.free(req_id)`. Wire this into whatever cleanup hook `TpModelWorker` exposes (search `MlxTpModelWorker` for the pattern — it has the same problem).
+- [ ] **Step 2:** Add `free()` hook: when scheduler marks a req finished, the worker must call `self.execution_backend.free(req_id)`. Wire this into whatever cleanup hook `TpModelWorker` exposes (search `MlxTpModelWorker` for the pattern — it has the same problem).
 
 - [ ] **Step 3:** Commit: `feat(tenstorrent): forward_batch_generation with IDLE/EXTEND/DECODE dispatch + greedy sampling`.
 
@@ -1042,7 +1264,7 @@ Adjust prompt count to consume ~1 hour at the observed decode rate.
   - No mesh OOM
   - `abs(p99_final - p99_baseline) / p99_baseline < 0.10`
 
-  **Fail:** capture which minute the first error occurred, attach to incident log. Stability regressions usually indicate KV state leaks (request cleanup not happening) or program-cache eviction misbehavior — `wrapper.free` is the first place to audit.
+  **Fail:** capture which minute the first error occurred, attach to incident log. Stability regressions usually indicate KV state leaks (request cleanup not happening) or program-cache eviction misbehavior — `execution_backend.free` is the first place to audit.
 
 - [ ] **Step 4:** Commit log artifacts (sanitized, no sensitive paths): `test(tenstorrent): 1-hour stability run baseline`.
 
