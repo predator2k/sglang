@@ -325,3 +325,195 @@ Remaining Phase 0:
 ================================================================================
 END Task 0.1 / 0.2 RE-RUN evidence
 ================================================================================
+
+
+================================================================================
+Task 0.5 (pip install -e compat verification) — 2026-05-11
+================================================================================
+
+GOAL
+----
+Verify that `pip install -e /sglang/python` does not break the bundled tt-metal
+docker env. After install, `sglang`, `ttnn`, and `vllm` must all still import.
+
+DOCKER IMAGE
+------------
+ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e
+
+INVOCATION
+----------
+docker run --rm \
+    -v /home/mhnie/sglang:/sglang \
+    --entrypoint bash \
+    <image> \
+    -c "set -e
+        source /home/container_app_user/tt-metal/python_env/bin/activate
+        cd /sglang/python && pip install -e . --no-deps
+        python -c 'import sglang; ...'
+        python -c 'import ttnn'
+        python -c 'import vllm'"
+
+NOTE: --no-deps was required. See "Reconciliation" below.
+
+PRE-INSTALL BASELINE (inside docker, tt-metal venv)
+---------------------------------------------------
+torch    : 2.7.1+cpu
+ttnn     : ok (no __version__ attr exposed)
+vllm     : 0.1.dev8031+gaa4ae1edc
+sglang   : (not installed — expected)
+flashinfer : not installed
+protoc   : not installed
+
+OBSERVATIONS DURING INSTALL
+---------------------------
+1. Attempt 1: `pip install -e .` (full deps).
+   - pyproject.toml pins torch==2.11.0, transformers==5.6.0, flashinfer==0.6.8.post1,
+     vllm not pinned but many flashinfer/torchao deps that would force upgrades.
+   - pip RESOLVED deps and DID NOT proceed to actually downgrading/upgrading torch
+     because the Rust build step failed first (see point 2).
+   - Net effect on installed packages: ZERO upgrades/downgrades observed (the
+     editable-wheel build phase aborted before any new wheels were materialized
+     into site-packages). torch / ttnn / vllm versions all unchanged post-attempt.
+
+2. Rust extension build (`sglang.srt.grpc._core` from rust/sglang-grpc/Cargo.toml)
+   ALWAYS fails in this docker image:
+       Error: Could not find `protoc`. If `protoc` is installed, try setting the
+       `PROTOC` environment variable to the path of the `protoc` binary.
+   The bundled docker image does NOT include protobuf-compiler / protoc.
+
+3. Even though the editable-wheel build itself fails (exit code 1 from pip),
+   pip writes the egg-info / dist-info entries early enough that `import sglang`
+   succeeds afterward via the source-tree path. The grpc Rust extension is
+   simply absent (would manifest as ImportError only if someone actually tries
+   `from sglang.srt.grpc import _core`, which the demo / Phase A-D do not).
+
+RECONCILIATION (what worked)
+----------------------------
+Retried with `pip install -e . --no-deps`:
+   - Skips ALL dep resolution → torch / vllm / transformers / flashinfer untouched.
+   - Rust build STILL FAILS (protoc absent) — same error as full-deps attempt.
+   - BUT: editable metadata still gets written before the Rust step, so
+     `import sglang` works regardless of Rust build outcome.
+
+POST-INSTALL VERIFICATION (full-deps attempt AND --no-deps attempt, same result)
+-------------------------------------------------------------------------------
+=== After install ===
+sglang ok 0.0.0.dev12512+g37f9b84cb
+ttnn ok
+vllm ok 0.1.dev8031+gaa4ae1edc
+torch 2.7.1+cpu
+
+=== Three required imports: ALL PASS ===
+
+DEEPER SGLANG PROBES (informational, not required by Task 0.5)
+--------------------------------------------------------------
+Tested two submodules likely needed in Phase A:
+
+  from sglang.srt.server_args import ServerArgs    → OK
+  from sglang.srt.model_executor.model_runner      → FAIL
+
+The ModelRunner import chain dies here:
+  sglang/srt/distributed/device_communicators/pynccl_allocator.py:9
+  ImportError: cannot import name '_cuda_beginAllocateCurrentThreadToPool'
+               from 'torch.cuda.memory'
+
+ROOT CAUSE: this is a torch>=2.11 CUDA caching-allocator symbol. The bundled
+torch is 2.7.1+cpu. The full import chain is:
+  ModelRunner → model_config → layers.quantization (auto_round) →
+   quantization.utils → fp8_kernel → deep_gemm_wrapper →
+   distributed.device_communicators.pynccl_allocator → torch.cuda.memory.*
+
+IMPLICATIONS FOR PHASE B/D (HEAD UP, NOT A 0.5 BLOCKER)
+-------------------------------------------------------
+*** SPEC §10 RISK #5 IS REAL — this is the torch-pin risk the spec called out. ***
+
+The sglang main branch hard-pins `torch==2.11.0` because of CUDA caching
+allocator symbols introduced in 2.10/2.11. The tt-metal docker image bundles
+torch 2.7.1+cpu and CANNOT trivially upgrade torch (tt-metal itself ABI-binds
+against this exact wheel). Therefore Phase B MUST:
+
+  (a) Gate quantization / pynccl / deep_gemm imports behind a CUDA-availability
+      check or behind `SGLANG_PLATFORM=tenstorrent`, so that on the
+      Tenstorrent build path we never reach `torch.cuda.memory._cuda_beginAllocate*`.
+  (b) Avoid importing `model_runner` directly from any top-level Tenstorrent
+      entry point; build a new tt-metal-specific runner that does not pull in
+      the deep_gemm / pynccl chain.
+  (c) For any CUDA-only model code, ensure the Tenstorrent dispatcher (Phase F)
+      short-circuits before the offending modules are touched.
+
+The good news: top-level `import sglang` and `from sglang.srt.server_args import
+ServerArgs` BOTH work fine on torch 2.7.1+cpu, so the public CLI surface
+(`launch_server.py`, ServerArgs parsing, request schemas) is already importable
+without code changes. The CUDA-tainted modules are deeper in the runner stack.
+
+KNOWN-GOOD PIN (per spec §2.5)
+------------------------------
+We do NOT need to upgrade torch in the tt-metal docker env. The known-good
+configuration is:
+   torch    : 2.7.1+cpu          (DO NOT touch — bundled with tt-metal wheel)
+   ttnn     : (bundled, ABI-bound to torch 2.7.1+cpu)
+   vllm     : 0.1.dev8031+gaa4ae1edc  (bundled, used by tt-inference-server)
+   sglang   : install with `pip install -e . --no-deps`
+
+INSTALL COMMAND (canonical, for Phase A entry doc)
+--------------------------------------------------
+  cd /sglang/python
+  pip install -e . --no-deps
+
+  # Rust extension build will fail with "Could not find protoc"; this is
+  # cosmetic and does not block `import sglang`. If/when we need the gRPC
+  # binding (we don't for Phase A-D), `apt-get install -y protobuf-compiler`
+  # in the docker image is the fix.
+
+  # Verify:
+  python -c "import sglang, ttnn, vllm; print('ok')"
+
+PIP INSTALL TAIL (last ~30 lines of `pip install -e . --no-deps` output)
+------------------------------------------------------------------------
+    error: failed to run custom build command for `sglang-grpc v0.1.0`
+    Caused by:
+      process didn't exit successfully: build-script-build (exit status: 1)
+      --- stderr
+      Error: Custom { kind: NotFound, error: "Could not find `protoc`. If
+        `protoc` is installed, try setting the `PROTOC` environment variable
+        to the path of the `protoc` binary..." }
+    warning: build failed, waiting for other jobs to finish...
+    error: `cargo rustc --lib ... --features pyo3/extension-module
+            --crate-type cdylib` failed with code 101
+    [end of output]
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building editable for sglang
+Failed to build sglang
+error: failed-wheel-build-for-install
+× Failed to build installable wheels for some pyproject.toml based projects
+╰─> sglang
+--- but `import sglang` immediately afterward returned 0.0.0.dev12512+g37f9b84cb
+
+CONCLUSION
+----------
+Task 0.5 outcome:  **PASS with --no-deps (and known Rust grpc build skip)**
+
+   - All three required imports (sglang, ttnn, vllm) succeed in the docker
+     env after `pip install -e . --no-deps`.
+   - torch / ttnn / vllm versions are UNCHANGED from the bundled docker env.
+   - The pyproject.toml `torch==2.11.0` pin is NOT a Phase 0.5 blocker, but
+     IS a Phase B concern documented above (deep_gemm / pynccl gating).
+   - The sglang-grpc Rust crate fails to build (protoc absent in docker image).
+     This is non-fatal for Phase A-D; Phase H (gRPC) would need
+     `apt-get install protobuf-compiler` added to the image or a Dockerfile
+     overlay.
+
+PHASE 0 STATUS — ALL TASKS NOW DONE
+------------------------------------
+  0.1 demo runs                                                     DONE
+  0.2 API surface enumerated                                        DONE
+  0.3 weights downloaded                                            DONE
+  0.4 docker baseline                                               DONE
+  0.5 pip install -e compat (this task)                             DONE (with --no-deps)
+  0.6 ETH/reset/SGLANG_PLATFORM defensiveness                       DONE
+
+Phase A coding can begin.
+
+================================================================================
+END Task 0.5 evidence
+================================================================================

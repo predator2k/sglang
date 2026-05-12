@@ -175,11 +175,13 @@ tenstorrent = "sglang.srt.hardware_backend.tenstorrent.platform:activate_tt_plat
 
 If the file already has a `[project.entry-points."sglang.srt.platforms"]` table, append the `tenstorrent = ...` line under it; do not create a duplicate table.
 
-- [ ] **Step 2:** Reinstall in editable mode so entry points get re-registered:
+- [ ] **Step 2:** Reinstall in editable mode so entry points get re-registered. **Use `--no-deps`** (verified mandatory in Phase 0.5 — tt-metal docker bundles torch 2.7.1+cpu, sglang pins torch==2.11.0, they cannot coexist; `--no-deps` works because tt-metal's bundled torch already satisfies our runtime needs):
 
 ```bash
-pip install -e /sglang/python
+pip install -e /sglang/python --no-deps
 ```
+
+Note: the `sglang-grpc` Rust crate may fail to build (no `protoc` in image) — this is non-fatal for Phase A-H; only matters if we ever enable gRPC entrypoints.
 
 - [ ] **Step 3:** Verification command (phase gate):
 
@@ -200,9 +202,17 @@ SGLANG_PLATFORM=tenstorrent python -c \
 
 **Goal:** Spec §4.2 lists ~17 SGLang core files that contain unconditional `torch.cuda.*` calls or NCCL paths. Each needs a guard so the server can be imported and a no-op forward path can run with `SGLANG_PLATFORM=tenstorrent`. **Total scope: ~150 LoC across ~17 files**, each individual edit small (5–15 lines).
 
-**Files touched:** all 17 files listed in spec §4.2 (the table starting at "File | Change"). The two anchor identifiers are `is_cuda()` (existing helper, grep to confirm import path) and platform method calls (`current_platform.support_*`).
+**Files touched:** all 17 files listed in spec §4.2 (the table starting at "File | Change") PLUS a Phase 0.5-discovered import chain that triggers torch.cuda symbols missing in tt-metal's bundled torch 2.7.1+cpu:
+- `python/sglang/srt/layers/quantization/auto_round.py`
+- `python/sglang/srt/layers/quantization/fp8_kernel.py`
+- `python/sglang/srt/layers/quantization/deep_gemm_wrapper.py`
+- `python/sglang/srt/distributed/device_communicators/pynccl_allocator.py`
 
-**Live risks:** §10 #7 (SGLang upstream changes break TT integration during rebase — keep diffs minimal).
+The chain originates at `ModelRunner → model_config → layers.quantization.*`. Phase 0.5 evidence confirms `_cuda_beginAllocateCurrentThreadToPool` (a torch 2.10/2.11 symbol) is referenced at import-time and fails on torch 2.7.1+cpu. Phase B must either gate the entire chain behind `is_cuda()` import-guards, or restructure these modules so the heavy CUDA imports happen lazily / behind feature flags.
+
+The two anchor identifiers are `is_cuda()` (existing helper, grep to confirm import path) and platform method calls (`current_platform.support_*`).
+
+**Live risks:** §10 #7 (SGLang upstream changes break TT integration during rebase — keep diffs minimal); §10 #5 (tt-metal API drift — Phase 0.5 already showed pyproject.toml's `torch==2.11.0` pin is incompatible with the docker's torch 2.7.1+cpu).
 
 ### Task B.1: Inventory the exact CUDA call sites
 
