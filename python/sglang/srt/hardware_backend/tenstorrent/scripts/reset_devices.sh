@@ -1,4 +1,5 @@
 #!/bin/bash
+# Pinned tt-metal image: ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-models-amd64:latest-rc (sha256:40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c)
 # Recovery script for Tenstorrent devices on this host.
 #
 # Run when a previous SGLang launch left the mesh in a bad state (e.g.

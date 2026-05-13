@@ -588,7 +588,7 @@ Spec went through 4 rounds of subagent-driven review during brainstorming:
 - `superpowers:writing-plans` skill — produces the implementation plan from this spec
 - `superpowers:subagent-driven-development` skill — executes the plan
 - Git remote: `predator2k/sglang` (`origin`). NEVER push to `sgl-project/sglang` per N9
-- tt-metal docker image tag: **TBD at P2a Phase 0** (per R1/R13 mitigation: pin SHA at signature-lock week)
+- tt-metal docker image: `ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-models-amd64:latest-rc` (sha256:`40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c`) — pinned per R1/R13
 
 **Upstream code (tt-metal, read-only)**
 - `tt_transformers` (bundled in tt-metal docker image): `models/tt_transformers/tt/generator_sglang.py`, `common.py`, `attention.py`, `model.py`, `decoder.py`, `generator.py`
