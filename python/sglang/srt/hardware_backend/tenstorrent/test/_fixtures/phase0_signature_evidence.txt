@@ -123,3 +123,13 @@ Evidence: python/sglang/srt/managers/schedule_batch.py:1341-1351
 
 §3.7 implication: the sampler consumes the row in the same forward step, so the
 handler must return a valid (non-None) LogitsProcessorOutput for that step.
+
+================================================================
+Q6 answer
+================================================================
+Q6 answer: req_to_token dtype = int32; page_table forced int32 in TTPagedMetadataBackend? = YES per INV-3
+
+Evidence: memory_pool.py:148-149 — `self.req_to_token = torch.zeros(..., dtype=torch.int32, ...)`
+  generator.py prefill_forward_text line 17: `assert isinstance(page_table, torch.Tensor)` — no upstream dtype assertion; no `.to(int32)` in decode_forward either.
+
+Implication: TTPagedMetadataBackend MUST call `.to(torch.int32)` if upstream is int64.
