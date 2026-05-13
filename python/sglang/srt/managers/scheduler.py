@@ -3170,6 +3170,9 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
+            # Tenstorrent fork: explicit bypass triggered by backend on chunked-prefill failure
+            if getattr(result, "bypass_chunked_req", False):
+                self.chunked_req = None
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():

@@ -39,6 +39,15 @@ _Monthly rebase reminder: run `git rebase upstream/main` and verify each patch
 site above still applies cleanly. Update this file if patch files or line
 numbers change._
 
+## SGLang upstream-class patches in our fork (active monthly rebase target)
+
+| File | Line range (approx) | Purpose | First landed |
+|---|---|---|---|
+| `python/sglang/srt/managers/utils.py` | `GenerationBatchResult` dataclass | Add `bypass_chunked_req: bool = False` for tenstorrent chunked-prefill failure recovery | 2026-05-13 (P2a.2 T2.1) |
+| `python/sglang/srt/managers/scheduler.py` | post-forward result handler (`process_batch_result`, extend branch) | Read `bypass_chunked_req`, clear `self.chunked_req` if set | 2026-05-13 (P2a.2 T2.1) |
+
+---
+
 ## tt-metal upstream-bug patches (P2a.1 hardware-smoke discoveries, 2026-05-13)
 
 | Path | Issue | Submit upstream? |

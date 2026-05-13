@@ -55,6 +55,10 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
+    # Tenstorrent fork patch (R6): backend signals that chunked-prefill should
+    # be abandoned for this request (e.g. unsupported by simple backend).
+    bypass_chunked_req: bool = False
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
