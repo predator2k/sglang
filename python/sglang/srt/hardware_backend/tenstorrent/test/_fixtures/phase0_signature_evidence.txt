@@ -91,3 +91,40 @@ Q5: paged_attention_config in create_tt_model? = True
     INV-4 status: SATISFIED
       paged_attention_config defaults to None (omittable); prefill_forward_text and
       decode_forward each expose page_table= and kv_cache= kwargs also defaulting to None.
+
+================================================================
+Q2: Does req.set_finish_with_abort short-circuit same-iter sampling?
+================================================================
+
+Q2 answer: set_finish_with_abort short-circuits same-iter sampling? = NO
+
+Evidence: python/sglang/srt/managers/schedule_batch.py:1341-1351
+  `set_finish_with_abort` sets req.to_finish (a FINISH_ABORT), NOT req.finished_reason.
+  req.finished() (line 984) returns `self.finished_reason is not None` — so it returns
+  False immediately after set_finish_with_abort, because finished_reason is still None.
+
+  The to_finish -> finished_reason transfer occurs only inside check_finished()
+  (schedule_batch.py:1213-1215):
+      if self.to_finish:
+          self.finished_reason = self.to_finish
+          self.to_finish = None
+  which is called AFTER the sampled token has already been appended to output_ids
+  (scheduler_output_processor_mixin.py:554 for decode, 248 for prefill):
+      req.output_ids.append(next_token_id)   # sample consumed
+      ...
+      req.check_finished(...)                 # only now does to_finish become finished_reason
+
+  The overlap-scheduler skip guard (scheduler_output_processor_mixin.py:531-536) also
+  checks req.finished() (i.e., finished_reason is not None), so it likewise does NOT
+  short-circuit a req that only has to_finish set.
+
+  Comment at scheduler.py:3578 confirms the design explicitly:
+      "The request will still run one prefill forward pass."
+
+Implication for §3.7 error recovery:
+  - If NO (confirmed): the sampler consumes the errored req's logits row in the same
+    forward step that set_finish_with_abort was called. The TTBackendError handler must
+    return a valid LogitsProcessorOutput so the sampler can emit a discarded token.
+    Recommended: return LogitsProcessorOutput(next_token_logits=torch.zeros([B, vocab]))
+    (zero-logits, not None), as None would crash the sampler before check_finished()
+    transfers to_finish -> finished_reason and the abort is acknowledged.
