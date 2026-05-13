@@ -65,6 +65,8 @@ class TTTpModelWorker(TpModelWorker):
                 self.server_args.model_path,
                 self._mesh_ctx.mesh,
                 max_seq_len=max_seq_len,
+                max_batch_size=1,
+                token_to_kv_pool=None,  # simple/B=1 path — no paged allocator
             )
 
             # Warmup. Phase E.3 deliverable; call whatever entry point
@@ -150,28 +152,6 @@ class TTTpModelWorker(TpModelWorker):
             skip_attn_backend_init,
         )
 
-    def _cleanup_stale_rids(self, forward_mode, current_rids: set):
-        """Release per-request backend state for reqs that dropped out of
-        the decode batch. Called from _forward_batch_generation_tt before
-        invoking new_request / decode_step.
-        """
-        if not hasattr(self, "_tt_active_rids"):
-            self._tt_active_rids = set()
-        if forward_mode.is_decode():
-            stale = self._tt_active_rids - current_rids
-            for rid in stale:
-                try:
-                    self.execution_backend.free(rid)
-                except Exception as exc:
-                    logger.warning(
-                        "tt_free_failed",
-                        extra={"req_id": rid, "reason": repr(exc)},
-                        exc_info=True,
-                    )
-            self._tt_active_rids = current_rids
-        else:
-            self._tt_active_rids |= current_rids
-
     def _forward_batch_generation_tt(self, mwb) -> "GenerationBatchResult":
         # In-method imports avoid module-load issues during plugin discovery —
         # sglang.srt.managers chain is heavy. Spec §3.2 invariant #7 still
@@ -180,66 +160,45 @@ class TTTpModelWorker(TpModelWorker):
 
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-        # IDLE: mirror MLX (mlx/tp_worker.py:136-140) exactly.
-        if mwb.forward_mode.is_idle():
+        forward_batch = self._build_forward_batch(mwb)
+        logits_output = self.execution_backend.forward(forward_batch)
+
+        if logits_output.next_token_logits is None:
+            # IDLE / abort path — mirrors MLX (mlx/tp_worker.py:136-140).
             return GenerationBatchResult(
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
+                logits_output=logits_output,
                 can_run_cuda_graph=False,
             )
-
-        # P1 supports EXTEND/DECODE only besides IDLE. Use explicit equality
-        # because ForwardMode.is_extend() ALSO returns True for MIXED,
-        # DRAFT_EXTEND, TARGET_VERIFY, SPLIT_PREFILL, DLLM_EXTEND — those must
-        # raise per spec §3.2 invariant #6.
-        if mwb.forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
-            raise NotImplementedError(
-                f"P1 supports EXTEND/DECODE/IDLE only, got {mwb.forward_mode}. "
-                f"Chunked prefill / mixed / DLLM must stay disabled via "
-                f"apply_server_args_defaults."
-            )
-
-        # max_running_requests=1 ⇒ at most one req in the batch normally.
-        # SGLang's scheduler can briefly dispatch a 0-req batch between
-        # active requests (e.g. when a finished req is being torn down
-        # and the next hasn't started yet); treat that like IDLE rather
-        # than crashing the scheduler subprocess with an AssertionError.
-        # A multi-req batch in P1 is a real bug — raise so we surface it.
-        if mwb.reqs is None or len(mwb.reqs) == 0:
-            return GenerationBatchResult(
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
-                can_run_cuda_graph=False,
-            )
-        if len(mwb.reqs) > 1:
-            raise NotImplementedError(
-                f"P1 supports max_running_requests=1; scheduler dispatched "
-                f"{len(mwb.reqs)} reqs in mode {mwb.forward_mode}"
-            )
-        req_id = mwb.reqs[0].rid
-
-        # Reconcile per-request backend state before dispatch (mirrors MLX).
-        self._cleanup_stale_rids(
-            mwb.forward_mode, {req.rid for req in mwb.reqs}
-        )
-
-        if mwb.forward_mode == ForwardMode.EXTEND:
-            # mwb.input_ids is a 1-D torch.LongTensor of token IDs on CPU.
-            # Coerce to list[int]; the backend handles padding to step.
-            prompt_tokens = mwb.input_ids.tolist()
-            self.execution_backend.new_request(req_id, prompt_tokens)
-            logits = self.execution_backend.extend(req_id)  # host torch.Tensor[vocab]
-        else:  # DECODE
-            last_tok = int(mwb.input_ids[-1].item())
-            logits = self.execution_backend.decode_step(req_id, last_tok)
 
         # Greedy sampling on host. We never call model_runner.sample because
         # model_runner.sampler is None per spec §3.2 invariant #2. Backend
         # already returns host torch tensors — no ttnn import here.
-        next_token_ids = torch.argmax(logits.float(), dim=-1, keepdim=True).long()
+        next_token_ids = torch.argmax(
+            logits_output.next_token_logits.float(), dim=-1, keepdim=True
+        ).long()
 
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
+        )
+
+    def _build_forward_batch(self, mwb):
+        """Build a duck-typed forward_batch namespace from a ModelWorkerBatch.
+
+        For the single-user backend, ForwardBatch (with KV pool wiring) is
+        overkill — expose only the fields the simple backend reads. Phase 3
+        will build a real ForwardBatch for the paged backend.
+
+        The forward_mode guard (EXTEND/DECODE/IDLE only) and 0-req / multi-req
+        guards have moved into TTTransformersExecutionBackend.forward, keeping
+        the worker thin.
+        """
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            forward_mode=mwb.forward_mode,
+            input_ids=mwb.input_ids,
+            batch_size=len(mwb.reqs) if mwb.reqs else 0,
+            reqs=mwb.reqs or [],
         )

@@ -27,25 +27,22 @@ _POST_P1_MSG = (
 @register_tt_execution_backend("tt_xla")
 class TTXLAExecutionBackend(TTExecutionBackend):
     def __init__(
-        self, model_path: str, mesh_device: Any, *, max_seq_len: int
+        self,
+        model_path: str,
+        mesh_device: Any,
+        *,
+        max_seq_len: int,
+        max_batch_size: int = 1,
+        token_to_kv_pool: Any = None,
     ) -> None:
         raise NotImplementedError(
             _POST_P1_MSG
-            + " P1 ships tt_transformers only (set SGLANG_TT_EXECUTION_BACKEND="
-            "tt_transformers or leave unset to use the auto default)."
+            + " P2a ships tt_transformers_single only (set SGLANG_TT_EXECUTION_BACKEND="
+            "tt_transformers_single or leave unset to use the auto default)."
         )
 
-    def new_request(self, req_id: str, prompt_tokens: list[int]) -> None:
+    def forward(self, forward_batch) -> None:
         raise NotImplementedError(_POST_P1_MSG)
 
-    def extend(self, req_id: str):
-        raise NotImplementedError(_POST_P1_MSG)
-
-    def decode_step(self, req_id: str, last_token: int):
-        raise NotImplementedError(_POST_P1_MSG)
-
-    def free(self, req_id: str) -> None:
-        raise NotImplementedError(_POST_P1_MSG)
-
-    def reset_all(self) -> None:
+    def shutdown(self) -> None:
         raise NotImplementedError(_POST_P1_MSG)

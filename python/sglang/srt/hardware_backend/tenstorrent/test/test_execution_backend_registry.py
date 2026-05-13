@@ -23,14 +23,14 @@ from sglang.srt.hardware_backend.tenstorrent.execution.tt_xla_backend import (
 
 
 def test_registry_has_both_entries():
-    assert TT_EXECUTION_BACKENDS["tt_transformers"] is TTTransformersExecutionBackend
+    assert TT_EXECUTION_BACKENDS["tt_transformers_single"] is TTTransformersExecutionBackend
     assert TT_EXECUTION_BACKENDS["tt_xla"] is TTXLAExecutionBackend
 
 
-def test_auto_resolves_to_tt_transformers_in_p1():
-    assert resolve_execution_backend_name("auto") == "tt_transformers"
-    assert resolve_execution_backend_name("") == "tt_transformers"
-    assert resolve_execution_backend_name(None) == "tt_transformers"
+def test_auto_resolves_to_tt_transformers_single_in_p2a():
+    assert resolve_execution_backend_name("auto") == "tt_transformers_single"
+    assert resolve_execution_backend_name("") == "tt_transformers_single"
+    assert resolve_execution_backend_name(None) == "tt_transformers_single"
 
 
 def test_explicit_tt_xla_resolves_to_tt_xla():
@@ -45,7 +45,7 @@ def test_unknown_name_raises():
 def test_tt_xla_construction_raises_with_pointer():
     cls = get_tt_execution_backend("tt_xla")
     with pytest.raises(NotImplementedError, match="P2-coverage"):
-        cls(model_path="/tmp", mesh_device=None, max_seq_len=128)
+        cls(model_path="/tmp", mesh_device=None, max_seq_len=128, max_batch_size=1, token_to_kv_pool=None)
 
 
 def test_env_var_selects_backend(monkeypatch):
@@ -61,6 +61,6 @@ def test_env_var_selects_backend(monkeypatch):
     assert resolve_execution_backend_name() == "tt_xla"
 
 
-def test_env_var_unset_defaults_to_tt_transformers(monkeypatch):
+def test_env_var_unset_defaults_to_tt_transformers_single(monkeypatch):
     monkeypatch.delenv("SGLANG_TT_EXECUTION_BACKEND", raising=False)
-    assert resolve_execution_backend_name() == "tt_transformers"
+    assert resolve_execution_backend_name() == "tt_transformers_single"

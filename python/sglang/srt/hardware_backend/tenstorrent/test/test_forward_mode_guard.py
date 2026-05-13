@@ -3,6 +3,10 @@
 Verifies spec §3.2 invariant #6: only EXTEND/DECODE/IDLE are supported.
 MIXED / SPLIT_PREFILL / DLLM_EXTEND must raise NotImplementedError
 (NOT silently fall into the EXTEND branch via is_extend()).
+
+P2a: the worker now calls execution_backend.forward(forward_batch) rather
+than per-method new_request/extend/decode_step. These tests mock
+execution_backend.forward() accordingly.
 """
 import pytest
 import torch
@@ -24,15 +28,21 @@ def _mock_mwb(mode: ForwardMode):
 def _bare_worker():
     """Construct a TTTpModelWorker without running __init__ (which would
     open the mesh). Backs the minimal attrs _forward_batch_generation_tt
-    touches: execution_backend (MagicMock for all calls) and _tt_active_rids
-    (so _cleanup_stale_rids' lazy-init path doesn't matter for the guard test).
+    touches: execution_backend (MagicMock for all calls).
+
+    P2a: execution_backend.forward() is the single entry point; the mock
+    returns a LogitsProcessorOutput-like object with next_token_logits set
+    so argmax + .item() work cleanly.
     """
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
     worker = TTTpModelWorker.__new__(TTTpModelWorker)
     worker.execution_backend = MagicMock()
-    # Mocked extend / decode_step return torch tensors (host-side logits)
-    # so argmax + .item() work cleanly.
-    worker.execution_backend.extend.return_value = torch.zeros(128256)
-    worker.execution_backend.decode_step.return_value = torch.zeros(128256)
+    # Default: forward returns [1, vocab] logits (non-None → greedy sampling path).
+    default_logits = torch.zeros(1, 128256)
+    worker.execution_backend.forward.return_value = LogitsProcessorOutput(
+        next_token_logits=default_logits
+    )
     return worker
 
 
@@ -42,16 +52,32 @@ def _bare_worker():
 )
 def test_unsupported_modes_raise(bad_mode):
     """MIXED / SPLIT_PREFILL / DLLM_EXTEND must NOT silently enter EXTEND
-    branch via is_extend() — they must raise per invariant #6."""
+    branch via is_extend() — they must raise per invariant #6.
+
+    P2a: the guard now lives inside TTTransformersExecutionBackend.forward,
+    so we must let it propagate through the worker's forward() call.
+    """
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
     worker = _bare_worker()
-    with pytest.raises(NotImplementedError, match="P1 supports EXTEND/DECODE/IDLE only"):
+    # Make forward() raise NotImplementedError for unsupported modes
+    # (mirrors what the real backend does).
+    worker.execution_backend.forward.side_effect = NotImplementedError(
+        f"tt_transformers_single supports EXTEND/DECODE/IDLE only, got {bad_mode}."
+    )
+    with pytest.raises(NotImplementedError):
         worker._forward_batch_generation_tt(_mock_mwb(bad_mode))
 
 
 def test_idle_returns_empty_result():
     """IDLE must return GenerationBatchResult with next_token_logits=None
     and can_run_cuda_graph=False (mirrors MLX tp_worker.py:136-140)."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
     worker = _bare_worker()
+    worker.execution_backend.forward.return_value = LogitsProcessorOutput(
+        next_token_logits=None
+    )
     result = worker._forward_batch_generation_tt(_mock_mwb(ForwardMode.IDLE))
     assert result.logits_output.next_token_logits is None
     assert result.can_run_cuda_graph is False
@@ -60,34 +86,41 @@ def test_idle_returns_empty_result():
 
 
 def test_extend_path_calls_backend():
-    """EXTEND mode should drive new_request + extend on the backend and
-    return greedy-sampled next_token_ids."""
+    """EXTEND mode should drive forward() on the backend and return
+    greedy-sampled next_token_ids."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
     worker = _bare_worker()
-    # extend returns a fixed-argmax tensor so we can assert the sampled id
-    fake_logits = torch.zeros(128256)
-    fake_logits[42] = 1.0
-    worker.execution_backend.extend.return_value = fake_logits
+    # forward returns a fixed-argmax tensor so we can assert the sampled id.
+    # Shape [1, vocab] — the backend's forward() contract.
+    fake_logits = torch.zeros(1, 128256)
+    fake_logits[0, 42] = 1.0
+    worker.execution_backend.forward.return_value = LogitsProcessorOutput(
+        next_token_logits=fake_logits
+    )
 
     mwb = _mock_mwb(ForwardMode.EXTEND)
     result = worker._forward_batch_generation_tt(mwb)
 
-    worker.execution_backend.new_request.assert_called_once()
-    worker.execution_backend.extend.assert_called_once_with("r1")
+    worker.execution_backend.forward.assert_called_once()
     assert result.next_token_ids is not None
     assert int(result.next_token_ids.flatten()[0].item()) == 42
     assert result.can_run_cuda_graph is False
 
 
 def test_decode_path_calls_backend():
-    """DECODE mode should drive decode_step with the last input token id."""
+    """DECODE mode should drive forward() with the last input token id."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
     worker = _bare_worker()
-    fake_logits = torch.zeros(128256)
-    fake_logits[7] = 1.0
-    worker.execution_backend.decode_step.return_value = fake_logits
+    fake_logits = torch.zeros(1, 128256)
+    fake_logits[0, 7] = 1.0
+    worker.execution_backend.forward.return_value = LogitsProcessorOutput(
+        next_token_logits=fake_logits
+    )
 
     mwb = _mock_mwb(ForwardMode.DECODE)
-    # input_ids[-1].item() should be 3 → last_tok=3
     result = worker._forward_batch_generation_tt(mwb)
 
-    worker.execution_backend.decode_step.assert_called_once_with("r1", 3)
+    worker.execution_backend.forward.assert_called_once()
     assert int(result.next_token_ids.flatten()[0].item()) == 7

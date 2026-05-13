@@ -1,4 +1,15 @@
-"""TTTransformersExecutionBackend — thin adapter between SGLang's worker and tt_transformers.
+"""tt_transformers single-user backend (P1 simple, ported to P2a ABC).
+
+P1 sized this as a 5-method per-request wrapper. P2a wraps that same
+single-user semantics under one model-level `forward(forward_batch)` that
+internally branches on ForwardMode.EXTEND/DECODE/IDLE. B=1 enforced.
+
+When SGLANG_TT_EXECUTION_BACKEND=tt_transformers_single is selected:
+- max_running_requests is force-clamped to 1 in apply_server_args_defaults
+- RadixAttention is force-disabled
+- token_to_kv_pool is NOT consulted (no paged allocator wired)
+
+This is the rollback path per spec §5.3c.
 
 Captured tt_transformers API surface (Phase 0.2 evidence) the wrapper drives:
 
@@ -27,9 +38,6 @@ The model picks weights from the LLAMA_DIR env var inside ModelArgs.__init__
 — our wrapper sets LLAMA_DIR from the constructor's model_path argument
 before calling create_tt_model so the tt_transformers code finds the right
 checkpoint without leaking docker-mount semantics into upper layers.
-
-F.2 (this revision) fills in the 5 lifecycle methods. Integration smoke
-on real hardware lands in F.4.
 """
 
 from __future__ import annotations
@@ -129,15 +137,16 @@ def _suggestion_for_not_implemented(detail: str) -> str:
     )
 
 
-@register_tt_execution_backend("tt_transformers")
+@register_tt_execution_backend("tt_transformers_single")
 class TTTransformersExecutionBackend(TTExecutionBackend):
     """Black-box wrapper around a tt_transformers Generator for SGLang.
 
-    P1 contract: caller (TTTpModelWorker) drives the wrapper through
-    `new_request → extend → decode_step → free` while `MeshDeviceCtx` owns
-    the underlying mesh device lifecycle. The wrapper holds no mesh state
-    itself — it borrows the mesh_device from the worker and only manages
-    per-request KV handles in `self._req_state`.
+    P2a contract: caller (TTTpModelWorker) drives the wrapper through the
+    model-level `forward(forward_batch)` method which internally branches on
+    ForwardMode. `MeshDeviceCtx` owns the underlying mesh device lifecycle.
+    The wrapper holds no mesh state itself — it borrows the mesh_device from
+    the worker and only manages per-request KV handles in `self._req_state`.
+    B=1 is enforced; pass max_batch_size != 1 to get NotImplementedError.
     """
 
     def __init__(
@@ -148,8 +157,14 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         max_seq_len: int,
         dtype: str = "bf16",
         max_batch_size: int = 1,
+        token_to_kv_pool=None,  # TTPagedKVAdapter (paged) or None (simple/B=1)
         instruct: bool = True,
     ):
+        if max_batch_size != 1:
+            raise NotImplementedError(
+                "tt_transformers_single supports B=1 only. "
+                "Use SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged for B>1."
+            )
         if not os.path.isdir(model_path):
             # F.3 asserts match="mount" on this message — keep the keyword.
             raise FileNotFoundError(
@@ -221,6 +236,8 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         self._max_seq_len = max_seq_len
         self._dtype = dtype
         self._req_state: dict[str, Any] = {}
+        self._active_req_id = None
+        self._active_prompt_tokens = None
 
         # SGLANG_TT_PREFILL_PAD_STEP — empty string = "use default 128".
         # The tt_transformers prefill kernel hard-asserts seq_len % 128 == 0,
@@ -243,7 +260,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
         logger.info(
             "tt_execution_backend_init",
             extra={
-                "backend": "tt_transformers",
+                "backend": "tt_transformers_single",
                 "model_path": model_path,
                 "max_seq_len": max_seq_len,
                 "dtype": dtype,
@@ -253,16 +270,56 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
             },
         )
 
-    # ----- Per-request lifecycle (Phase F.2) -----
+    # ----- P2a model-level forward contract -----
 
-    def new_request(self, req_id: str, prompt_tokens: Any) -> None:
+    def forward(self, forward_batch):
+        """Run one prefill or decode step (P2a ABC contract).
+
+        Branches on forward_batch.forward_mode:
+          IDLE   → return LogitsProcessorOutput(next_token_logits=None)
+          EXTEND → _do_new_request + _do_extend; return [1, vocab] logits
+          DECODE → _do_decode_step; return [1, vocab] logits
+          other  → NotImplementedError (invariant #6)
+        """
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        if forward_batch.forward_mode.is_idle():
+            return LogitsProcessorOutput(next_token_logits=None)
+
+        if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
+            raise NotImplementedError(
+                f"tt_transformers_single supports EXTEND/DECODE/IDLE only, "
+                f"got {forward_batch.forward_mode}."
+            )
+
+        assert forward_batch.batch_size == 1, "B=1 enforced"
+        rid = forward_batch.reqs[0].rid if hasattr(forward_batch, "reqs") and forward_batch.reqs else "single"
+
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            prompt_tokens = forward_batch.input_ids.tolist()
+            self._do_new_request(rid, prompt_tokens)
+            logits = self._do_extend(rid)
+        else:  # DECODE
+            last_tok = int(forward_batch.input_ids[-1].item())
+            logits = self._do_decode_step(rid, last_tok)
+
+        return LogitsProcessorOutput(next_token_logits=logits.unsqueeze(0))  # [1, vocab]
+
+    def shutdown(self) -> None:
+        """Release all device state. Called from MeshDeviceCtx teardown."""
+        self._do_reset_all()
+
+    # ----- Internal per-request lifecycle helpers (P1 methods, renamed) -----
+
+    def _do_new_request(self, req_id: str, prompt_tokens: Any) -> None:
         """Allocate per-request bookkeeping.
 
         tt_transformers (with ``paged_attention_config=None``) manages KV
         state internally and binds it to a user slot. We don't touch ttnn
-        here — actual KV writes happen on the first ``extend`` call. This
+        here — actual KV writes happen on the first ``_do_extend`` call. This
         method just records the prompt + position counter the worker uses
-        to drive subsequent ``decode_step`` calls.
+        to drive subsequent ``_do_decode_step`` calls.
         """
         if req_id in self._req_state:
             raise ValueError(f"req_id {req_id!r} already active")
@@ -287,7 +344,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
             extra={"req_id": req_id, "prompt_len": len(tokens)},
         )
 
-    def extend(self, req_id: str):
+    def _do_extend(self, req_id: str):
         """Run prefill on the request's prompt; return last-token logits.
 
         Drives ``Generator.prefill_forward_single_user_text`` (the
@@ -393,7 +450,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
 
         return last_logits
 
-    def decode_step(self, req_id: str, last_token: int):
+    def _do_decode_step(self, req_id: str, last_token: int):
         """Advance by one token; return next-token logits.
 
         Drives ``Generator.decode_forward_text`` and pulls logits to host
@@ -452,12 +509,12 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
 
         return next_logits
 
-    def free(self, req_id: str) -> None:
+    def _do_free(self, req_id: str) -> None:
         """Release per-request bookkeeping.
 
         The non-paged tt_transformers KV cache is bound to a fixed user
         slot; with batch=1 and ``user_id=0`` the slot is implicitly
-        overwritten by the next ``extend``. There is no explicit per-
+        overwritten by the next ``_do_extend``. There is no explicit per-
         request KV free call in the captured Phase 0.2 surface, so this
         method only drops host-side state and the active-requests gauge.
         Idempotent: an unknown req_id logs a WARN and returns.
@@ -471,7 +528,7 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
 
         logger.debug("req.free", extra={"req_id": req_id})
 
-    def reset_all(self) -> None:
+    def _do_reset_all(self) -> None:
         """Drop all per-request state (e.g. on scheduler shutdown / restart)."""
         cleared = len(self._req_state)
         self._req_state.clear()

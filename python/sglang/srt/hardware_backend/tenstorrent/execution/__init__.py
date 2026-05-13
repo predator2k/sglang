@@ -1,8 +1,10 @@
 """Registry + factory for TT execution backends.
 
-Mirror of SGLang's attention_registry.py pattern. P1 ships exactly one real
-backend (tt_transformers); tt_xla is a registered placeholder so the
-post-P1 add-a-backend path is a swap rather than a Phase-F rewrite.
+Mirror of SGLang's attention_registry.py pattern. P2a ships two real
+backend keys: tt_transformers_single (simple B=1, ported from P1) and a
+placeholder for tt_transformers_paged (Phase 4). tt_xla is a registered
+placeholder so the post-P1 add-a-backend path is a swap rather than a
+Phase-F rewrite.
 
 IMPORTANT: the registry dict MUST be declared before the backend modules
 are imported — their @register_tt_execution_backend(...) decorators fire
@@ -45,10 +47,14 @@ from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402, F
 
 
 def resolve_execution_backend_name(requested: str | None = None) -> str:
-    """Resolve "auto" / "" / None to the P1 default."""
+    """Resolve "auto" / "" / None to the P2a default.
+
+    Phase 0: auto → tt_transformers_single (paged backend not yet registered)
+    Phase 4 Task 4.10: flip auto → tt_transformers_paged
+    """
     name = (requested or envs.SGLANG_TT_EXECUTION_BACKEND.get() or "auto").lower()
     if name == "auto":
-        return "tt_transformers"
+        return "tt_transformers_single"
     return name
 
 
