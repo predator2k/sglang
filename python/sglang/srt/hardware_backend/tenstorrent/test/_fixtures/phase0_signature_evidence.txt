@@ -121,10 +121,5 @@ Evidence: python/sglang/srt/managers/schedule_batch.py:1341-1351
   Comment at scheduler.py:3578 confirms the design explicitly:
       "The request will still run one prefill forward pass."
 
-Implication for §3.7 error recovery:
-  - If NO (confirmed): the sampler consumes the errored req's logits row in the same
-    forward step that set_finish_with_abort was called. The TTBackendError handler must
-    return a valid LogitsProcessorOutput so the sampler can emit a discarded token.
-    Recommended: return LogitsProcessorOutput(next_token_logits=torch.zeros([B, vocab]))
-    (zero-logits, not None), as None would crash the sampler before check_finished()
-    transfers to_finish -> finished_reason and the abort is acknowledged.
+§3.7 implication: the sampler consumes the row in the same forward step, so the
+handler must return a valid (non-None) LogitsProcessorOutput for that step.
