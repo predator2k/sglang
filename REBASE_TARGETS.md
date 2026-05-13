@@ -38,3 +38,13 @@ Upstream PR reference: none (fork-only, per N9 constraint).
 _Monthly rebase reminder: run `git rebase upstream/main` and verify each patch
 site above still applies cleanly. Update this file if patch files or line
 numbers change._
+
+## tt-metal upstream-bug patches (P2a.1 hardware-smoke discoveries, 2026-05-13)
+
+| Path | Issue | Submit upstream? |
+|---|---|---|
+| `tt-metal/models/tt_transformers/tt/generator_sglang.py` (lines 155, 198, 241, 305) | `super().decode_forward_text()` doesn't exist; correct method is `decode_forward`. Affects every SGLang user of the plugin path. | **YES** — file Tenstorrent issue + PR |
+| `tt-metal/models/common/llama_models.py` (line 12) | Hard import of `AutoModelForVision2Seq` (removed in transformers 5.x). | Yes — soft-import |
+| `tt-metal/models/tt_transformers/tt/model_config.py` (lines 2693, 2967) | Same hard-import issue; also `rope_theta` lost from `LlamaConfig.to_dict()` in transformers 5.x. | Yes — `rope_theta` resolution via getattr |
+
+Local patch files at `python/sglang/srt/hardware_backend/tenstorrent/scripts/tt_metal_patches/`.

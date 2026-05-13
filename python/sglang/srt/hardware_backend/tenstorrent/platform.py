@@ -156,12 +156,32 @@ class TTSRTPlatform(SRTPlatform):
             os.environ.setdefault("MAX_PREFILL_CHUNK_SIZE", "8")
 
     def get_mha_kv_pool_cls(self):
-        # TTModelRunner (Phase D) constructs _DummyKVCache directly;
-        # this factory should never be invoked. Raise loudly if it is.
+        # Simple/P1 path: TTModelRunner constructs _DummyKVCache directly,
+        # so this factory should never be invoked. Paged/P2a path: SGLang's
+        # standard ModelRunner calls this to construct its slot-index tracker
+        # (KV bytes themselves live on TT device, owned by tt_transformers).
+        # Return SGLang's default MHATokenToKVPool — it allocates CPU phantom
+        # tensors keyed by slot index. Plugin's _build_page_table converts
+        # those indices to block IDs (// block_size) before sending to ttnn.
+        import os
+        if os.environ.get("SGLANG_TT_EXECUTION_BACKEND") == "tt_transformers_paged":
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            return MHATokenToKVPool
         raise NotImplementedError(
-            "TT backend constructs _DummyKVCache inside "
+            "TT backend (simple path) constructs _DummyKVCache inside "
             "TTModelRunner.initialize(); the factory should not be called."
         )
+
+    def get_paged_allocator_cls(self):
+        """Paged path needs SGLang's PagedTokenToKVPoolAllocator (slot-index
+        tracker). KV bytes themselves live on TT device via plugin's
+        allocate_kv_cache; this allocator only manages indices.
+        """
+        import os
+        if os.environ.get("SGLANG_TT_EXECUTION_BACKEND") == "tt_transformers_paged":
+            from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+            return PagedTokenToKVPoolAllocator
+        raise NotImplementedError("Paged allocator not used in simple path")
 
     def get_mla_kv_pool_cls(self):
         raise NotImplementedError("MLA not in P1")
