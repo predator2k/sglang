@@ -83,6 +83,37 @@ class TTModels(nn.Module):
             self.device_runner = BaseMetalDeviceRunner(device_id=str(rank))
             self.mesh_device = self.device_runner.set_device()
 
+    def on_chunked_prefill_failure(
+        self, req, out_cache_loc_this_chunk, allocator, req_to_token_pool
+    ):
+        """5-step chunked-prefill failure recovery (spec §3.7).
+
+        Called when the TT backend raises during a chunked-prefill extend.
+        Returns True so the caller wraps GenerationBatchResult(bypass_chunked_req=True).
+
+        Step a: return slots from failed chunk back to allocator.
+        Step b: zero the req_to_token_pool entries written for this chunk.
+        Step c: prevent partial-prefix insertion into RadixCache.
+        Step d: mark the request as aborted so the scheduler tears it down cleanly.
+        Step e: signal the caller via return value (sentinel set by forward wrapper).
+        """
+        # Step a: return slots from failed chunk
+        allocator.free(out_cache_loc_this_chunk)
+
+        # Step b: revert req_to_token writes for this chunk
+        start = len(req.prefix_indices) + len(req.fill_ids) - len(out_cache_loc_this_chunk)
+        end = len(req.prefix_indices) + len(req.fill_ids)
+        req_to_token_pool.req_to_token[req.req_pool_idx, start:end] = 0
+
+        # Step c: prevent partial-prefix insertion into RadixCache
+        req.skip_radix_cache_insert = True
+
+        # Step d: mark abort
+        req.set_finish_with_abort("tt_backend_chunked_prefill_failure")
+
+        # Step e: signal scheduler (sentinel is set by the forward() wrapper)
+        return True
+
     def forward(  # function running on either prefil or decode mode
         self,
         input_ids: torch.Tensor,
@@ -92,67 +123,87 @@ class TTModels(nn.Module):
     ):  # -> LogitsProcessorOutput — lazy import
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        page_table = self._build_page_table(
-            forward_batch
-        )  # returns block IDs for every user in current batch
+        self._last_chunked_failure = False  # reset per-call
 
-        if forward_batch.forward_mode.is_extend():  # prefill mode
-            padded_tokens = self._flatten_to_padded(input_ids, forward_batch)
+        try:
+            page_table = self._build_page_table(
+                forward_batch
+            )  # returns block IDs for every user in current batch
 
-            # Use extend_seq_lens (NEW token lengths) for prompt_lens, not seq_lens (TOTAL length)
-            # seq_lens includes cached prefix tokens, but padded_tokens only contains NEW tokens
-            prompt_lens_tensor = (
-                forward_batch.extend_seq_lens
-                if forward_batch.extend_seq_lens is not None
-                else forward_batch.seq_lens
-            )
+            if forward_batch.forward_mode.is_extend():  # prefill mode
+                padded_tokens = self._flatten_to_padded(input_ids, forward_batch)
 
-            prompt_lens = prompt_lens_tensor.tolist()
+                # Use extend_seq_lens (NEW token lengths) for prompt_lens, not seq_lens (TOTAL length)
+                # seq_lens includes cached prefix tokens, but padded_tokens only contains NEW tokens
+                prompt_lens_tensor = (
+                    forward_batch.extend_seq_lens
+                    if forward_batch.extend_seq_lens is not None
+                    else forward_batch.seq_lens
+                )
 
-            logits = self.tt_model.prefill_forward(
-                tokens=padded_tokens.to(torch.int32),
-                page_table=page_table,
-                kv_cache=self.kv_caches,
-                prompt_lens=prompt_lens,
-            )
-            logger.debug("tt_model.prefill_forward executed")
-            # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
-            return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
+                prompt_lens = prompt_lens_tensor.tolist()
 
-        elif forward_batch.forward_mode.is_decode():  # decode mode
-            tokens = input_ids.unsqueeze(
-                1
-            ).to(
-                torch.int32
-            )  # make it batch_size x seq_len dimensions (in decode mode seq_len = 1 ), cast to int32
-            start_pos = positions.to(
-                torch.int32
-            )  # at which position is each request starting, cast to int32
-            actual_bsz = tokens.shape[
-                0
-            ]  # number of requests in current batch (needed later to slice output)
-            tokens, start_pos, page_table = self._pad_decode_batch(
-                tokens, start_pos, page_table
-            )  # pad batch to required size for TT-Metal
-
-            decode_output = (
-                self.tt_model.decode_forward(  # call TT-Metal decode forward
-                    tokens=tokens,
-                    start_pos=start_pos,
+                logits = self.tt_model.prefill_forward(
+                    tokens=padded_tokens.to(torch.int32),
                     page_table=page_table,
                     kv_cache=self.kv_caches,
-                    enable_trace=True,
-                    read_from_device=True,
+                    prompt_lens=prompt_lens,
                 )
-            )
-            logger.debug("tt_model.decode_forward executed")
-            # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
-            logits = decode_output[0]
-            logits = logits[:actual_bsz]  # ignore output of padded requests
-            return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
+                logger.debug("tt_model.prefill_forward executed")
+                # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
+                return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
 
-        else:
-            raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
+            elif forward_batch.forward_mode.is_decode():  # decode mode
+                tokens = input_ids.unsqueeze(
+                    1
+                ).to(
+                    torch.int32
+                )  # make it batch_size x seq_len dimensions (in decode mode seq_len = 1 ), cast to int32
+                start_pos = positions.to(
+                    torch.int32
+                )  # at which position is each request starting, cast to int32
+                actual_bsz = tokens.shape[
+                    0
+                ]  # number of requests in current batch (needed later to slice output)
+                tokens, start_pos, page_table = self._pad_decode_batch(
+                    tokens, start_pos, page_table
+                )  # pad batch to required size for TT-Metal
+
+                decode_output = (
+                    self.tt_model.decode_forward(  # call TT-Metal decode forward
+                        tokens=tokens,
+                        start_pos=start_pos,
+                        page_table=page_table,
+                        kv_cache=self.kv_caches,
+                        enable_trace=True,
+                        read_from_device=True,
+                    )
+                )
+                logger.debug("tt_model.decode_forward executed")
+                # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
+                logits = decode_output[0]
+                logits = logits[:actual_bsz]  # ignore output of padded requests
+                return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
+
+            else:
+                raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
+
+        except Exception as exc:
+            if (
+                forward_batch.forward_mode.is_extend()
+                and getattr(forward_batch, "chunked_req", None) is not None
+            ):
+                # B=1 chunked-prefill assumption: the chunked request is the only req in batch
+                failed_req = forward_batch.reqs[0]
+                self.on_chunked_prefill_failure(
+                    req=failed_req,
+                    out_cache_loc_this_chunk=forward_batch.out_cache_loc,
+                    allocator=forward_batch.token_to_kv_pool_allocator,
+                    req_to_token_pool=forward_batch.req_to_token_pool,
+                )
+                self._last_chunked_failure = True
+                return LogitsProcessorOutput(next_token_logits=None)
+            raise
 
     def allocate_on_device(self):  # function aloocating kv cache
         """
