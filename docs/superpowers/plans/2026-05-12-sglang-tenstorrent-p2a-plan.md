@@ -688,18 +688,33 @@ The wrapping site is in our worker's `_forward_batch_generation_tt`-equivalent o
 ```python
 def forward(self, input_ids, positions, forward_batch, input_embeds=None):
     try:
-        return super().forward(...)  # plugin's existing forward
+        return super().forward(input_ids, positions, forward_batch, input_embeds)
     except Exception as exc:
         # Only handle mid-chunk failures during EXTEND when chunked-prefill is active
         if (forward_batch.forward_mode.is_extend()
             and getattr(forward_batch, "chunked_req", None) is not None):
-            self.on_chunked_prefill_failure(...)
-            # Return zero-logits + signal bypass
+            # NOTE: allocator + req_to_token_pool live on forward_batch:
+            #   forward_batch.token_to_kv_pool_allocator
+            #   forward_batch.req_to_token_pool
+            #   forward_batch.out_cache_loc (slot indices for the failed chunk)
+            failed_req = forward_batch.reqs[0]  # B=1 chunked-prefill assumption
+            self.on_chunked_prefill_failure(
+                req=failed_req,
+                out_cache_loc_this_chunk=forward_batch.out_cache_loc,
+                allocator=forward_batch.token_to_kv_pool_allocator,
+                req_to_token_pool=forward_batch.req_to_token_pool,
+            )
+            # Return zero-logits sentinel — the worker layer must detect this and
+            # set GenerationBatchResult(bypass_chunked_req=True) per the upstream
+            # patch in T2.1. (Don't pass _chunked_failure to LogitsProcessorOutput
+            # — that dataclass doesn't accept arbitrary kwargs.)
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-            return LogitsProcessorOutput(next_token_logits=None,
-                                          _chunked_failure=True)
+            self._last_chunked_failure = True  # worker reads this flag
+            return LogitsProcessorOutput(next_token_logits=None)
         raise  # non-chunked failure: let scheduler handle abort normally
 ```
+
+The worker (`tp_worker.py` or platform hook) then reads `model._last_chunked_failure` and assembles `GenerationBatchResult(bypass_chunked_req=True)` accordingly.
 
 - [ ] **Step 2 (test)**: Write `test/test_chunked_failure_recovery.py` covering all 5 sub-gates:
   - §9.12.a: `allocator.free` called with exact failed-chunk slot list
@@ -1022,4 +1037,4 @@ Once P2b closes, the next step is **`superpowers:brainstorming` for P3** with th
 
 P2 was plumbing-verification. P3 is where we push the envelope.
 
-**End of plan v2.** Total tasks: 22 (was 46 in v1). Total estimated weeks: P2a 2-3w + P2b 0.5-1w = ~3 weeks (was 9w in v1). Plugin absorption saved ~2 weeks; what remains is verification + dual-track + RadixAttention probe + multi-model smoke.
+**End of plan v2.** Total tasks: 23 (was 46 in v1; T1.3b added post round-1 review for INV-3/G2a coverage). Total estimated weeks: P2a 2-3w + P2b 0.5-1w = ~3 weeks (was 9w in v1). Plugin absorption saved ~2 weeks; what remains is verification + dual-track + RadixAttention probe + multi-model smoke.
