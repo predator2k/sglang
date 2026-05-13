@@ -1,23 +1,34 @@
 """Tenstorrent-specific TpModelWorker subclass.
 
-Inherits from TpModelWorker for scheduler integration. Overrides
-_init_model_runner to wire up MeshDeviceCtx + execution-backend registry +
-warmup + TTModelRunner stub. forward_batch_generation lands in Phase G.2.
+Inherits from TpModelWorker for scheduler integration. In *simple* mode
+(``tt_transformers_single``) overrides ``_init_model_runner`` to wire up
+MeshDeviceCtx + execution-backend registry + warmup + TTModelRunner stub.
+In *paged* mode (``tt_transformers_paged``) delegates entirely to the
+standard ``TpModelWorker`` init so SGLang's ModelRunner loads
+``TenstorrentLlamaForCausalLM`` via ModelRegistry; ``forward_batch_generation``
+likewise delegates to ``super()`` for paged mode.
 
 The worker MUST NOT import ttnn directly (spec §3.2 invariant #7) — all
-device interaction goes through the resolved TTExecutionBackend instance.
+device interaction goes through the resolved TTExecutionBackend instance
+(simple path) or through TenstorrentLlamaForCausalLM / BaseMetalDeviceRunner
+(paged path).
+
+Mesh-device ownership in paged mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``MeshDeviceCtx`` opens the mesh with fabric + ROW dispatch (the simple-path
+approach). In paged mode the plugin's ``BaseMetalDeviceRunner.set_device()``
+(called from ``TTModels.__init__``) handles mesh opening instead.  Having both
+open the same physical devices would conflict, so in paged mode we skip
+``MeshDeviceCtx`` entirely and let the plugin own device lifecycle.
 """
 
 from __future__ import annotations
 
 import logging
 
-from sglang.srt.hardware_backend.tenstorrent import warmup
 from sglang.srt.hardware_backend.tenstorrent.execution import (
-    get_tt_execution_backend,
+    resolve_execution_backend_name,
 )
-from sglang.srt.hardware_backend.tenstorrent.model_runner import TTModelRunner
-from sglang.srt.hardware_backend.tenstorrent.platform import MeshDeviceCtx
 from sglang.srt.managers.tp_worker import TpModelWorker
 
 logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
@@ -30,31 +41,76 @@ DEFAULT_TT_MAX_SEQ_LEN = 4096
 
 
 class TTTpModelWorker(TpModelWorker):
-    """TpModelWorker subclass that routes inference through a TT execution backend.
+    """TpModelWorker subclass that dispatches between simple and paged TT paths.
 
-    The worker holds three TT-specific attributes:
+    Simple mode (SGLANG_TT_EXECUTION_BACKEND=tt_transformers_single or auto
+    resolves to single):
       - self._mesh_ctx: MeshDeviceCtx (owns the 1x2 mesh device lifecycle)
-      - self.execution_backend: a TTExecutionBackend impl (e.g.
-        TTTransformersExecutionBackend), resolved via the registry factory
-        so SGLANG_TT_EXECUTION_BACKEND can swap in tt_xla post-P1
-      - self._model_runner: TTModelRunner stub (bookkeeping only; no real
-        forward — that lives in execution_backend)
+      - self.execution_backend: TTTransformersExecutionBackend
+      - self._model_runner: TTModelRunner stub (bookkeeping only)
+      - forward_batch_generation: custom greedy-sampling path
 
-    Greedy sampling and tensor bridging happen on host inside G.2's
-    forward_batch_generation; nothing here calls into ttnn.
+    Paged mode (SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged):
+      - No MeshDeviceCtx (BaseMetalDeviceRunner inside TTModels owns the mesh)
+      - self._model_runner: standard SGLang ModelRunner loading
+        TenstorrentLlamaForCausalLM from ModelRegistry
+      - forward_batch_generation: delegates to super() (standard SGLang path)
     """
 
+    def __init__(self, **kwargs):
+        # Resolve mode BEFORE super().__init__ so that our _init_model_runner
+        # override knows which path to take.  super().__init__ calls
+        # self._init_model_runner() via Python's MRO, so the flag must be set
+        # before the super().__init__ call.
+        self._paged_mode = resolve_execution_backend_name() == "tt_transformers_paged"
+        logger.info(
+            "tt_worker_dispatch",
+            extra={"paged_mode": self._paged_mode},
+        )
+        super().__init__(**kwargs)
+
     def _init_model_runner(self):
-        # MeshDeviceCtx must be constructed from inside the Scheduler
-        # subprocess (spec §7.3) — that's exactly this function's
-        # call-site, because TpModelWorker.__init__ runs _init_model_runner
-        # from the scheduler's subprocess.
+        if self._paged_mode:
+            self._init_model_runner_paged()
+        else:
+            self._init_model_runner_simple()
+
+    def _init_model_runner_paged(self):
+        """Paged path: standard SGLang ModelRunner loads TenstorrentLlamaForCausalLM.
+
+        MeshDeviceCtx is NOT opened here — device lifecycle belongs to
+        BaseMetalDeviceRunner inside TTModels.__init__ (the plugin-absorbed
+        architecture). Opening a second mesh on the same physical devices would
+        cause a ttnn double-open conflict.
+        """
+        logger.info("tt_worker_init_paged_start")
+        super()._init_model_runner()
+        logger.info(
+            "tt_worker_init_paged_done",
+            extra={"model_runner": type(self._model_runner).__name__},
+        )
+
+    def _init_model_runner_simple(self):
+        """Simple/P1 path: MeshDeviceCtx + TTExecutionBackend + TTModelRunner stub.
+
+        MeshDeviceCtx must be constructed from inside the Scheduler subprocess
+        (spec §7.3) — that's exactly this function's call-site, because
+        TpModelWorker.__init__ runs _init_model_runner from the scheduler's
+        subprocess.
+        """
+        from sglang.srt.hardware_backend.tenstorrent import warmup
+        from sglang.srt.hardware_backend.tenstorrent.execution import (
+            get_tt_execution_backend,
+        )
+        from sglang.srt.hardware_backend.tenstorrent.model_runner import TTModelRunner
+        from sglang.srt.hardware_backend.tenstorrent.platform import MeshDeviceCtx
+
         logger.info("tt_worker_init_start")
         self._mesh_ctx = MeshDeviceCtx()
 
         try:
             # Resolve the execution backend via the registry. Reads
-            # SGLANG_TT_EXECUTION_BACKEND env var; "auto"/"" → "tt_transformers".
+            # SGLANG_TT_EXECUTION_BACKEND env var; "auto"/"" → "tt_transformers_single".
             # NEVER import TTTransformersExecutionBackend directly here —
             # spec §3.2 invariant #7 forbids it (worker depends only on
             # the ABC + registry).
@@ -123,11 +179,15 @@ class TTTpModelWorker(TpModelWorker):
         )
 
     def get_pad_input_ids_func(self):
-        """Override since the stub ModelRunner has no real tokenizer-pad.
+        """Override for simple path: stub ModelRunner has no real tokenizer-pad.
 
         P1 doesn't batch (max_running_requests=1), so padding is trivial.
-        MLX returns None here (mlx/tp_worker.py:85-86); we do the same.
+        MLX returns None here (mlx/tp_worker.py:85-86); we do the same for
+        simple mode.  Paged mode delegates to the standard ModelRunner which
+        has the real model's pad_input_ids method if it exists.
         """
+        if self._paged_mode:
+            return super().get_pad_input_ids_func()
         return None
 
     def forward_batch_generation(
@@ -138,10 +198,24 @@ class TTTpModelWorker(TpModelWorker):
         is_verify=False,
         skip_attn_backend_init=False,
     ) -> "GenerationBatchResult":
-        """Polarity mirrors MLX (mlx/tp_worker.py:103-114): if mwb is not
-        None, take our path; else fall back to parent (None → speculative
-        decoding scratch path; never reached in P1).
+        """Dispatch between paged (standard SGLang) and simple (custom TT) paths.
+
+        Paged mode: delegates entirely to super() — SGLang's ModelRunner calls
+        TenstorrentLlamaForCausalLM.forward(input_ids, positions, forward_batch).
+
+        Simple mode: mirrors MLX (mlx/tp_worker.py:103-114) — if mwb is not
+        None, take our custom greedy path; else fall back to parent (None →
+        speculative decoding scratch path; never reached in P1).
         """
+        if self._paged_mode:
+            return super().forward_batch_generation(
+                model_worker_batch,
+                forward_batch,
+                pp_proxy_tensors,
+                is_verify,
+                skip_attn_backend_init,
+            )
+        # Simple path
         if model_worker_batch is not None:
             return self._forward_batch_generation_tt(model_worker_batch)
         return super().forward_batch_generation(

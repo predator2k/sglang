@@ -68,11 +68,28 @@ class TTSRTPlatform(SRTPlatform):
         # registry, so this string is never actually looked up in P1.
         return "tenstorrent"
 
+    def _is_paged_mode(self) -> bool:
+        """Return True when SGLANG_TT_EXECUTION_BACKEND resolves to paged."""
+        from sglang.srt.hardware_backend.tenstorrent.execution import (
+            resolve_execution_backend_name,
+        )
+        return resolve_execution_backend_name() == "tt_transformers_paged"
+
     def apply_server_args_defaults(self, server_args):
-        # P1 hard constraints
-        server_args.max_running_requests = 1
-        server_args.chunked_prefill_size = -1  # -1 disables chunked prefill
-        server_args.disable_radix_cache = True
+        import os
+
+        paged = self._is_paged_mode()
+
+        # Simple (P1) path hard constraints — relaxed for paged.
+        if not paged:
+            # Simple path: B=1 enforced; chunked prefill disabled; no radix
+            # cache (tt_transformers manages KV internally without page tables).
+            server_args.max_running_requests = 1
+            server_args.chunked_prefill_size = -1  # -1 disables chunked prefill
+            server_args.disable_radix_cache = True
+        # Paged mode: max_running_requests and chunked_prefill_size come from
+        # CLI args (the plugin's BaseMetalDeviceRunner uses max_running_requests
+        # to size the decode batch).  Radix cache is left to user preference.
 
         # CRITICAL: overlap scheduler creates FutureMap + copy streams that
         # the synchronous ttnn forward path cannot satisfy. Without this,
@@ -115,28 +132,28 @@ class TTSRTPlatform(SRTPlatform):
         # No NCCL / disaggregation
         server_args.enable_dp_attention = False
 
-        # Disable grammar backend — P1 does completion-only, no JSON / regex /
-        # tool-call constraints. The bundled xgrammar in tt-metal docker is
-        # older than current sglang expects (missing StructuralTag), so
+        # Disable grammar backend — P1/P2a does completion-only, no JSON /
+        # regex / tool-call constraints. The bundled xgrammar in tt-metal docker
+        # is older than current sglang expects (missing StructuralTag), so
         # picking "none" avoids an ImportError at scheduler init.
         server_args.grammar_backend = "none"
 
-        # tt_transformers' MAX_PREFILL_CHUNK_SIZES_DIV1024 table has no
-        # "P300" (2x p150a) entry, so it falls back to 4 (= 4*1024 = 4096
-        # tokens) — any prompt longer than that triggers tt_transformers'
-        # chunked-prefill path, which REQUIRES paged attention
-        # (Generator.prefill_forward_single_user_text:164 asserts
-        # `page_table is not None`). P1 runs non-paged, so chunking is
-        # off-limits.
-        #
-        # Lift the single-chunk ceiling to 8K tokens (well above the 5K
-        # workloads we want to support) by setting the env var the table
-        # consults. p150a L1 is large enough for an 8K-token prefill of
-        # Llama-3.1-8B in BFP8/BF16 — anything bigger may OOM L1, hence
-        # the conservative 8 (not 16/32). Override on the command line
-        # if needed.
-        import os
-        os.environ.setdefault("MAX_PREFILL_CHUNK_SIZE", "8")
+        if not paged:
+            # tt_transformers' MAX_PREFILL_CHUNK_SIZES_DIV1024 table has no
+            # "P300" (2x p150a) entry, so it falls back to 4 (= 4*1024 = 4096
+            # tokens) — any prompt longer than that triggers tt_transformers'
+            # chunked-prefill path, which REQUIRES paged attention
+            # (Generator.prefill_forward_single_user_text:164 asserts
+            # `page_table is not None`). Simple path runs non-paged, so
+            # chunking is off-limits.
+            #
+            # Lift the single-chunk ceiling to 8K tokens (well above the 5K
+            # workloads we want to support) by setting the env var the table
+            # consults. p150a L1 is large enough for an 8K-token prefill of
+            # Llama-3.1-8B in BFP8/BF16 — anything bigger may OOM L1, hence
+            # the conservative 8 (not 16/32). Override on the command line
+            # if needed.
+            os.environ.setdefault("MAX_PREFILL_CHUNK_SIZE", "8")
 
     def get_mha_kv_pool_cls(self):
         # TTModelRunner (Phase D) constructs _DummyKVCache directly;
