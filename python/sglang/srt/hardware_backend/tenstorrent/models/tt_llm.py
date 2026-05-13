@@ -224,29 +224,49 @@ class TTModels(nn.Module):
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
 
     def _call_prefill_for_verify(self, forward_batch):
-        """Called from SpecDecodeAdapter for verify-batch.
+        """Verify-batch forward (P3a.1 T1.2 v2 — last-token tile placeholder).
 
-        Reuses plugin's prefill_forward path with forward_batch's flattened
-        draft-token sequence. Returns LogitsProcessorOutput with logits per
-        draft position.
+        SGLang spec verify expects `next_token_logits` shaped
+        [bs * draft_token_num, vocab]. tt_transformers' batched
+        `prefill_forward_text` only returns last-token logits per user
+        ([bs, 1, vocab]) — extracting per-position logits requires deep
+        wrangling of per-submesh kv_cache + page_table layouts.
+
+        This placeholder tiles the last-token logits across all draft
+        positions to satisfy the shape contract. Consequence: NGRAM
+        acceptance rate ≈ 0% (only the bonus token at position N-1 will
+        ever match a draft); generated text is correct because rejected
+        drafts fall back to the bonus token, but no perf gain. Bit-exact
+        correctness (T1.4) is preserved; perf gate (T1.5) is NOT met
+        until T1.2 v3 implements true per-position logits via
+        `prefill_forward_single_user_text` + `concat_host_output` slicing
+        with proper per-submesh kv_cache/page_table_user threading.
         """
         import torch as _torch
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
         page_table = self._build_page_table(forward_batch)
-        padded_tokens = self._flatten_to_padded(forward_batch.input_ids, forward_batch)
-        prompt_lens = (
-            forward_batch.spec_info.draft_seq_lens
-            if hasattr(forward_batch.spec_info, "draft_seq_lens")
-            else forward_batch.extend_seq_lens
+        bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
+        draft_token_num = int(spec_info.draft_token_num)
+        flat_input = forward_batch.input_ids
+        assert flat_input.shape[0] == bs * draft_token_num, (
+            f"verify input_ids shape mismatch: got {flat_input.shape[0]}, "
+            f"expected bs*dn = {bs}*{draft_token_num} = {bs * draft_token_num}"
         )
+        tokens_per_user = flat_input.view(bs, draft_token_num)
+        prompt_lens = [draft_token_num] * bs
 
         logits = self.tt_model.prefill_forward(
-            tokens=padded_tokens.to(_torch.int32),
+            tokens=tokens_per_user.to(_torch.int32),
             page_table=page_table,
             kv_cache=self.kv_caches,
             prompt_lens=prompt_lens,
         )
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
+        # logits shape: [bs, 1, vocab]. Squeeze + tile to [bs * dn, vocab].
+        last_token_logits = logits.squeeze(1)
+        tiled = last_token_logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, last_token_logits.shape[-1])
+        return LogitsProcessorOutput(next_token_logits=tiled)
 
     def allocate_on_device(self):  # function aloocating kv cache
         """

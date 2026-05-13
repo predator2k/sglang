@@ -45,6 +45,56 @@ if is_cuda() or is_musa():
     )
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
+else:
+    # Tenstorrent / CPU fallback — pure-Python port of
+    # `sgl-kernel/csrc/speculative/eagle_utils.cu::VerifyTreeGreedy`.
+    # Drives NGRAM greedy verify; the sampling-based path
+    # (`tree_speculative_sampling_target_only`, `top_k_renorm_prob`,
+    # `top_p_renorm_prob`) is only used at temperature > 0 and is left
+    # unimplemented here — sampling NGRAM on Tenstorrent is a P3a.3 item.
+    def verify_tree_greedy(
+        predicts: torch.Tensor,           # [tot_num_draft_tokens], int32, mutable
+        accept_index: torch.Tensor,       # [bs, num_spec_step], int32, mutable
+        accept_token_num: torch.Tensor,   # [bs], int32, mutable
+        candidates: torch.Tensor,         # [bs, num_draft_tokens], int64
+        retrive_index: torch.Tensor,      # [bs, num_draft_tokens], int64
+        retrive_next_token: torch.Tensor, # [bs, num_draft_tokens], int64
+        retrive_next_sibling: torch.Tensor,  # [bs, num_draft_tokens], int64
+        target_predict: torch.Tensor,     # [bs, num_draft_tokens] or flat, int64
+    ) -> None:
+        bs = candidates.shape[0]
+        num_spec_step = accept_index.shape[1]
+        num_draft_tokens = candidates.shape[1]
+        ri = retrive_index.view(-1)
+        rnt = retrive_next_token.view(-1)
+        rns = retrive_next_sibling.view(-1)
+        tp = target_predict.view(-1)
+        cands = candidates.view(-1)
+        preds = predicts.view(-1)
+        for bx in range(bs):
+            last_accepted = int(ri[bx * num_draft_tokens].item())
+            accept_index[bx, 0] = last_accepted
+            num_accepted = 0
+            cur_index = 0
+            for _ in range(1, num_spec_step):
+                cur_index = int(rnt[bx * num_draft_tokens + cur_index].item())
+                accepted_this_step = False
+                while cur_index != -1:
+                    draft_index = int(ri[bx * num_draft_tokens + cur_index].item())
+                    draft_token_id = int(cands[bx * num_draft_tokens + cur_index].item())
+                    target_token_id = int(tp[last_accepted].item())
+                    if draft_token_id == target_token_id:
+                        preds[last_accepted] = target_token_id
+                        num_accepted += 1
+                        accept_index[bx, num_accepted] = draft_index
+                        last_accepted = draft_index
+                        accepted_this_step = True
+                        break
+                    cur_index = int(rns[bx * num_draft_tokens + cur_index].item())
+                if cur_index == -1 or not accepted_this_step:
+                    break
+            accept_token_num[bx] = num_accepted
+            preds[last_accepted] = int(tp[last_accepted].item())
 
 
 @dataclass

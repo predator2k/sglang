@@ -420,6 +420,9 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                 )
         elif (
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
