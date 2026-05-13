@@ -175,7 +175,7 @@ class TTTpModelWorker(TpModelWorker):
         # model_runner.sampler is None per spec §3.2 invariant #2. Backend
         # already returns host torch tensors — no ttnn import here.
         next_token_ids = torch.argmax(
-            logits_output.next_token_logits.float(), dim=-1, keepdim=True
+            logits_output.next_token_logits.float(), dim=-1
         ).long()
 
         return GenerationBatchResult(
