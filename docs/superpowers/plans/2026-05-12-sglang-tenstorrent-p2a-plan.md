@@ -1056,6 +1056,145 @@ git add python/sglang/srt/hardware_backend/tenstorrent/test/test_free_list_invar
 git commit -m "test(tenstorrent): §9.15 free-list invariant (R5 mitigation)"
 ```
 
+### Task 1.4b: Q7 unit test — read-through invariant after `cache_finished_req(canceled=True)`
+
+**Why**: Plan-review reviewer flagged Q7 (spec §5.2) as having no dedicated assertion task — §9.6 abort and §9.11 eviction-replay are end-to-end; neither directly verifies the read-through invariant declared in spec §3.4 ("RadixCache's view of KV state = adapter's free list state"). This task fills the gap with a CPU-only unit test.
+
+- [ ] **Step 1:** Write the test:
+
+```python
+"""Q7 read-through invariant — after RadixCache.cache_finished_req(req, canceled=True),
+TTPagedKVAdapter free-list state must match RadixCache's view (no orphan KV slots,
+no double-free).
+
+Spec §3.4 invariant: "RadixCache's view of KV state = adapter's free list state.
+No cache sync — adapter is a read-through layer."
+
+CPU-only — uses real PagedTokenToKVPoolAllocator + RadixCache with a stub
+TTBackedKVCache (no ttnn). Validates the contract between SGLang's cache
+machinery and our adapter's free-list semantics.
+"""
+import pytest
+import torch
+from sglang.srt.hardware_backend.tenstorrent.kv_pool.paged import (
+    TTPagedKVAdapter, TTBackedKVCache,
+)
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.managers.schedule_batch import Req
+# NOTE: exact import paths may shift slightly during Phase 0-1; align at impl time.
+
+def _make_adapter(capacity=256, page_size=32):
+    kvcache = TTBackedKVCache(num_layers=2, num_kv_heads=8, head_dim=128,
+                              num_pages=capacity // page_size,
+                              page_size=page_size, mock=True)
+    return TTPagedKVAdapter(size=capacity, page_size=page_size,
+                            dtype=torch.bfloat16, kvcache=kvcache)
+
+def _make_radix(adapter):
+    # RadixCache constructor signature varies slightly across SGLang versions;
+    # consult radix_cache.py at impl time. Minimal init: pass adapter + req_to_token_pool.
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    req_pool = ReqToTokenPool(size=8, max_context_len=256, device="cpu")
+    return RadixCache(req_to_token_pool=req_pool,
+                      token_to_kv_pool_allocator=adapter,
+                      page_size=32,
+                      disable=False)
+
+def test_read_through_after_canceled():
+    adapter = _make_adapter()
+    radix = _make_radix(adapter)
+    initial_free = adapter.available_size()
+    # Synthesize a request: simulate alloc then mark canceled then call cache_finished_req
+    fake_req = _build_fake_req(token_ids=list(range(50)),  # 50-token prompt
+                               extend_prefix_lens=0, extend_seq_lens=50)
+    # Allocate via adapter (mirrors what alloc_extend would do during forward)
+    out_indices = adapter.alloc_extend(
+        prefix_lens=torch.tensor([0]),
+        prefix_lens_cpu=torch.tensor([0]),
+        seq_lens=torch.tensor([50]),
+        seq_lens_cpu=torch.tensor([50]),
+        last_loc=torch.tensor([-1]),
+        extend_num_tokens=50,
+        num_new_pages=2,
+    )
+    assert out_indices is not None, "alloc_extend should succeed"
+    fake_req.req_pool_idx = 0
+    # write into req_to_token (mirrors model_runner.forward_batch fill)
+    radix.req_to_token_pool.req_to_token[0, :50] = out_indices
+    fake_req.fill_ids = list(range(50))
+    fake_req.prefix_indices = torch.tensor([], dtype=torch.long)
+    # mark canceled and finish
+    fake_req.canceled = True
+    fake_req.set_finish_with_abort("test_cancel")
+    radix.cache_finished_req(fake_req)  # canceled path → evict via allocator.free
+    # invariant: free-list should be back to initial state
+    final_free = adapter.available_size()
+    assert final_free == initial_free, (
+        f"read-through violated: initial={initial_free} final={final_free}; "
+        f"RadixCache and adapter disagree on KV state after canceled req"
+    )
+    # Also: free_pages + allocated == capacity (no orphans)
+    assert len(adapter.free_pages) + len(adapter.allocated_pages) == adapter.capacity_pages, (
+        f"orphan pages detected after canceled req"
+    )
+
+def test_read_through_after_uncanceled_finish_with_eviction():
+    """Variant: finished_req without cancel, but RadixCache decides to evict (no cache node retained)."""
+    adapter = _make_adapter()
+    radix = _make_radix(adapter)
+    initial_free = adapter.available_size()
+    fake_req = _build_fake_req(token_ids=list(range(40)),
+                               extend_prefix_lens=0, extend_seq_lens=40)
+    out_indices = adapter.alloc_extend(
+        prefix_lens=torch.tensor([0]), prefix_lens_cpu=torch.tensor([0]),
+        seq_lens=torch.tensor([40]), seq_lens_cpu=torch.tensor([40]),
+        last_loc=torch.tensor([-1]),
+        extend_num_tokens=40, num_new_pages=2,
+    )
+    fake_req.req_pool_idx = 0
+    radix.req_to_token_pool.req_to_token[0, :40] = out_indices
+    fake_req.fill_ids = list(range(40))
+    fake_req.prefix_indices = torch.tensor([], dtype=torch.long)
+    fake_req.canceled = False
+    fake_req.finished_reason = type("FinishReason", (), {"is_finished": True})()
+    radix.cache_finished_req(fake_req)
+    # If the cache decides to insert as a node (no evict), pages stay allocated; this is also a
+    # valid read-through state (radix tree owns them). Force evict to validate the round-trip:
+    radix.evict(num_tokens=64)  # forces evict at least the 40 we just allocated
+    final_free = adapter.available_size()
+    assert final_free >= initial_free, "evict didn't return slots to free list"
+    assert len(adapter.free_pages) + len(adapter.allocated_pages) == adapter.capacity_pages
+
+def _build_fake_req(token_ids, extend_prefix_lens, extend_seq_lens):
+    """Builds a minimal Req object for RadixCache.cache_finished_req. Exact fields
+    align with schedule_batch.Req at impl time — this stub captures the contract."""
+    req = Req.__new__(Req)
+    req.origin_input_ids = token_ids
+    req.fill_ids = token_ids
+    req.skip_radix_cache_insert = False
+    req.canceled = False
+    return req
+```
+
+- [ ] **Step 2:** Run:
+
+```bash
+pytest python/sglang/srt/hardware_backend/tenstorrent/test/test_read_through_invariant.py -v
+# Expect 2/2 PASS on the canceled and uncanceled-with-evict paths.
+```
+
+- [ ] **Step 3:** Commit:
+
+```bash
+git add python/sglang/srt/hardware_backend/tenstorrent/test/test_read_through_invariant.py
+git commit -m "test(tenstorrent): Q7 read-through invariant after cache_finished_req"
+```
+
+**Acceptance criteria**:
+- 2 test cases pass (canceled + uncanceled-with-forced-evict)
+- After each `cache_finished_req` path, `adapter.available_size()` and `len(free_pages) + len(allocated_pages) == capacity` are consistent
+- If either invariant fails, surface the violation via `set_finish_with_abort` is the cause — see Q7 best-guess "Yes (read-through)" in §5.2 — and trigger §5.2b escape hatch (INV-2 violation)
+
 ### Task 1.5: Unit test — `test_token_pool_overflow.py` (§9.14)
 
 - [ ] **Step 1:** Write the test:
@@ -2961,18 +3100,128 @@ git commit -m "test(tenstorrent): §9.9 mesh-shape — 1x2 hw + 1x4 static-lint"
 ```python
 """§9.10 perf log — batched tok/s @ B={1,2,4}, prefix-hit/miss latency, KV util.
 
-Sanity floors:
+Records (per spec §4.5):
+  - Batched decode tok/s @ B={1, 2, 4}
+  - Prefix-cache hit/miss latency split (warm vs cold path)
+  - KV-pool utilization time series (sampled every 5s for 60s)
+  - Per-mode timing breakdown: init_forward_metadata / forward / sample
+
+Sanity floors (FAIL on regression):
   - batched B=4 decode tok/s ≥ 1.2× B=1 decode tok/s
   - prefix-hit lookup latency < 10ms
   - KV-pool steady-state utilization < 95%
 """
+import json, os, statistics, time
+import pytest, requests
+from contextlib import contextmanager
 
-# ... (see test_perf_log.py in P1 for the JSON-log writer pattern; extend
-#      with the new dimensions). Body omitted for brevity but the spec
-#      §4.5 enumerates the fields verbatim.
+REQUIRES_TT = pytest.mark.skipif(
+    os.environ.get("SGLANG_PLATFORM") != "tenstorrent",
+    reason="Requires Tenstorrent hardware and a live sglang server on :30000",
+)
+SERVER = "http://localhost:30000"
+PERF_LOG = "/tmp/tt_p2a_perf_log.json"
+
+def _decode_only_tok_s(B: int, n_decode_tokens: int = 100) -> float:
+    """Issue B concurrent requests, each generating n_decode_tokens; return aggregate decode tok/s."""
+    prompt = "The history of computing began with"  # short warm prompt
+    payloads = [{"model": "llama", "prompt": prompt, "max_tokens": n_decode_tokens,
+                 "temperature": 0, "stream": False} for _ in range(B)]
+    t0 = time.perf_counter()
+    # Concurrent fire — use threads or asyncio; here a simple ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=B) as ex:
+        responses = list(ex.map(lambda p: requests.post(f"{SERVER}/v1/completions", json=p, timeout=120).json(), payloads))
+    elapsed = time.perf_counter() - t0
+    total_decode_tokens = sum(r["usage"]["completion_tokens"] for r in responses)
+    # subtract ~50ms of warm prefill amortization per req
+    decode_only_s = max(elapsed - 0.05 * B, 1e-6)
+    return total_decode_tokens / decode_only_s
+
+def _prefix_lookup_latency_ms() -> tuple[float, float]:
+    """Returns (hit_latency_ms, miss_latency_ms) for a 1K-token shared prefix."""
+    shared = "Computing has evolved " * 50   # ~1K tokens
+    # warm cache
+    requests.post(f"{SERVER}/v1/completions", json={
+        "model": "llama", "prompt": shared + " Q1: what is X?",
+        "max_tokens": 1, "temperature": 0}, timeout=60)
+    # hit
+    t0 = time.perf_counter()
+    requests.post(f"{SERVER}/v1/completions", json={
+        "model": "llama", "prompt": shared + " Q2: what is Y?",
+        "max_tokens": 1, "temperature": 0}, timeout=60)
+    hit_ms = (time.perf_counter() - t0) * 1000
+    # miss (random prefix)
+    rand_shared = "Random " + "x" * 4000     # disrupts prefix
+    t0 = time.perf_counter()
+    requests.post(f"{SERVER}/v1/completions", json={
+        "model": "llama", "prompt": rand_shared + " Q3: what is Z?",
+        "max_tokens": 1, "temperature": 0}, timeout=60)
+    miss_ms = (time.perf_counter() - t0) * 1000
+    return hit_ms, miss_ms
+
+def _kv_util_sample(duration_s: int = 60, step_s: int = 5) -> list[float]:
+    """Sample KV-pool utilization from /get_internal_state during a B=4 background load."""
+    samples = []
+    # background load (fire-and-poll)
+    from concurrent.futures import ThreadPoolExecutor
+    def _bg_load():
+        for _ in range(20):
+            requests.post(f"{SERVER}/v1/completions", json={
+                "model": "llama", "prompt": "Tell me about " + "x"*200,
+                "max_tokens": 200, "temperature": 0}, timeout=120)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_bg_load) for _ in range(4)]
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < duration_s:
+            try:
+                s = requests.get(f"{SERVER}/get_internal_state", timeout=2).json()
+                avail = s["token_pool"]["available_size"]
+                cap = s["token_pool"]["capacity"]
+                samples.append(1.0 - avail / cap)
+            except Exception:
+                pass
+            time.sleep(step_s)
+        # let bg finish
+        for f in futures:
+            try: f.result(timeout=30)
+            except Exception: pass
+    return samples
+
+@REQUIRES_TT
+def test_perf_log_paged():
+    results = {}
+    # 1. Batched tok/s
+    for B in (1, 2, 4):
+        results[f"decode_tok_s_B{B}"] = _decode_only_tok_s(B)
+        print(f"  decode tok/s @ B={B}: {results[f'decode_tok_s_B{B}']:.2f}", flush=True)
+    # 2. Prefix-cache latency
+    hit_ms, miss_ms = _prefix_lookup_latency_ms()
+    results["prefix_hit_ms"] = hit_ms
+    results["prefix_miss_ms"] = miss_ms
+    print(f"  prefix hit={hit_ms:.1f}ms miss={miss_ms:.1f}ms", flush=True)
+    # 3. KV utilization series
+    util = _kv_util_sample(duration_s=60, step_s=5)
+    results["kv_util_p99"] = statistics.quantiles(util, n=100)[98] if len(util) >= 10 else max(util)
+    results["kv_util_series"] = util
+    print(f"  kv util p99={results['kv_util_p99']:.3f} (n={len(util)})", flush=True)
+    # 4. Per-mode timing (read from server's /metrics Prometheus endpoint or internal counters)
+    metrics = requests.get(f"{SERVER}/metrics", timeout=5).text
+    # Look for tt-specific histograms if exposed; else skip with a note.
+    results["per_mode_timing_note"] = "captured from /metrics if instrumented in T2.2-T2.3"
+    # Write log
+    with open(PERF_LOG, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"--- wrote {PERF_LOG} ---", flush=True)
+    # 5. Sanity floors (per spec §4.3 §9.10)
+    assert results["decode_tok_s_B4"] >= 1.2 * results["decode_tok_s_B1"], (
+        f"batched B=4 ({results['decode_tok_s_B4']:.1f}) < 1.2× B=1 ({results['decode_tok_s_B1']:.1f})"
+    )
+    assert hit_ms < 10.0, f"prefix-hit lookup {hit_ms:.1f}ms ≥ 10ms"
+    assert results["kv_util_p99"] < 0.95, f"KV util p99 {results['kv_util_p99']:.3f} ≥ 0.95"
 ```
 
-The full body mirrors the P1 `test_perf_log.py` shape — generate a `perf_log.json` with the required dimensions, then run the three sanity-floor assertions. Re-use the P1 measurement harness directly.
+The body extends P1's `test_perf_log.py` measurement harness (cold/warm prefill, decode tok/s) with paged-specific dimensions. The 3 sanity floors map 1:1 to spec §4.3 §9.10. `per_mode_timing` requires backend-side instrumentation in T2.2/T2.3 (`init_forward_metadata` / `forward` time logging); if not wired by Phase 4, leave as a NOTE field in the JSON (don't gate).
 
 - [ ] **Step 2:** Run + commit:
 
@@ -3181,7 +3430,7 @@ git commit -m "docs(tenstorrent): P2a acceptance evidence — §9.1-§9.16 all g
 W6 is reserved for catch-up and the §5.3b P2a→P2b decision gate evaluation. **No implementation tasks here.** Instead, walk through the §5.3b checklist:
 
 - [ ] **§5.3b condition 1:** §9.1-§9.14 all pass (collected in Task 4.13).
-- [ ] **§5.3b condition 2:** ≥ 7 of Q1-Q9 have explicit answers (Phase 0 + Phase 1 should give 6; Q3 added in Phase 3; Q7 covered by §9.11; Q8 deferred to P2b W0).
+- [ ] **§5.3b condition 2:** ≥ 7 of Q1-Q9 have explicit answers (Phase 0 + Phase 1 give Q1/Q2/Q4/Q5/Q6/Q7/Q9 = 7; Q3 added in Phase 3; Q8 deferred to P2b W0). Q7 now has a dedicated unit-test deliverable in T1.4b (read-through invariant after `cache_finished_req(canceled=True)`).
 - [ ] **§5.3b condition 3:** R5 (RadixAttention deadlock) shows no reproduction in §9.7 compressed-15-min stability run.
 - [ ] **§5.3b condition 4:** No §9 gate has failed ≥ 2 times.
 - [ ] **§5.3b condition 5:** Q8 (GptOss coupling) status determines P2b W0 scope.
@@ -3262,10 +3511,14 @@ Map each spec § to a Task:
 | Q4 (CPU alloc_extend p99 at B=4) | Phase 1 Task 1.8 | `bench_alloc_extend.py` output |
 | Q5 (`paged_attention_config` to `create_tt_model`?) | Phase 0 Task 0.2 | Same file; if YES, §5.2b INV-4 violation |
 | Q6 (`req_to_token` dtype) | Phase 0 Task 0.4 | Same file |
-| Q7 (RadixCache canceled-req consistency) | Phase 4 Task 4.5+4.10 | §9.6 abort + §9.11 eviction-replay |
+| Q7 (RadixCache canceled-req consistency) | **Phase 1 Task 1.4b** (dedicated unit test) + Phase 4 Task 4.5+4.10 (end-to-end coverage) | T1.4b read-through invariant assertion + §9.6 abort + §9.11 eviction-replay |
 | Q8 (GptOss coupling depth) | **NOT in P2a** — deferred to P2b W0 | Out of P2a scope (per §5.3b condition 5) |
 | Q9 (KV call-site CSV) | Phase 0 Task 0.5 | `q9_call_site_inventory.csv` |
 
 ---
 
-**End of plan.** Total tasks: 45 across 5 phases (Phase 0: 9, Phase 1: 9, Phase 2: 8, Phase 3: 6, Phase 4: 13) plus the W6 §5.3b decision-gate checklist (5 conditions). Estimated 4 weeks core + 1 week buffer per spec §5.3 W2-W6, sequential gating throughout.
+**End of plan.** Total tasks: **46** across 5 phases (Phase 0: 9, Phase 1: **10** [includes T1.4b Q7 dedicated test], Phase 2: 8, Phase 3: 6, Phase 4: 13) plus the W6 §5.3b decision-gate checklist (5 conditions). Estimated 4 weeks core + 1 week buffer per spec §5.3 W2-W6, sequential gating throughout.
+
+**Plan-review polish applied** (post-review #10):
+- T4.9 §9.10 perf-log: full test body fleshed out from "body omitted for brevity" — now includes batched tok/s, prefix-hit/miss latency, KV-util sampling, per-mode timing dimensions, and 3 sanity-floor asserts per spec §4.3
+- T1.4b Q7: new CPU unit test for read-through invariant after `cache_finished_req(canceled=True)` — closes the gap the reviewer flagged (Q7 previously covered only by end-to-end §9.6 + §9.11)
