@@ -8,7 +8,7 @@ during P2a.1 §9.1 smoke validation on 2× Tenstorrent Blackhole p150a:
 | # | File | Fix | Why |
 |---|---|---|---|
 | 01 | `models/common/llama_models.py` | Soft-import `AutoModelForVision2Seq` etc. | Removed in `transformers` 5.x; not needed for text-only Llama path |
-| 02 | `models/tt_transformers/tt/model_config.py` | Same soft-import + fallback `rope_theta=500000.0` for Llama-3.x | `transformers` 5.x `LlamaConfig.to_dict()` drops `rope_theta` from the top-level config; Llama-3 standard value is 500000.0 |
+| 02 | `models/tt_transformers/tt/model_config.py` | Soft-import + `rope_theta` fallback for Llama-3.x + nested-dict handling for Qwen3 `rope_parameters` | (a) `transformers` 5.x `LlamaConfig.to_dict()` drops `rope_theta` from top-level; Llama-3 standard value is 500000.0. (b) `Qwen3ForCausalLM` stores `rope_theta` inside a nested `rope_parameters` dict — `text_config.get("rope_theta")` returns `None`; must read `text_config["rope_parameters"]["rope_theta"]` instead. Discovered in P2b T4.2 Qwen3-8B smoke. |
 | 03 | `models/tt_transformers/tt/generator_sglang.py` | Fix `super().decode_forward_text()` → `super().decode_forward()` (4 sites) | `decode_forward_text` does not exist on `Generator`; the correct text-decode entry point is `decode_forward`. Verified empirically in P2a.0 Q1/Q2 evidence (`phase0_signature_evidence.txt`). This is an **upstream tt-metal bug** that we report separately. |
 
 ## How to apply
