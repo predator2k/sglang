@@ -314,7 +314,7 @@ except Exception as exc:
         req.set_finish_with_abort(f"tt_backend_error: {exc!r}")
     return LogitsProcessorOutput(next_token_logits=None)
 # NOTE: req.set_finish_with_abort does NOT short-circuit the CURRENT step's
-# sampling (Q2 — verify in implementation Phase 1). If it doesn't, return
+# sampling (Q2 — verify in implementation P2a.1). If it doesn't, return
 # zero-logits instead so sampler produces a valid (if meaningless) next_token
 # that's immediately discarded by the abort path on the next iter.
 ```
@@ -345,7 +345,7 @@ def on_chunked_prefill_failure(req, out_cache_loc_this_chunk):
 
 ### 3.8 Implementation-discovery items (Q1-Q9)
 
-Eight signatures and semantics are best verified during implementation Phase 0–4, not pre-baked into the spec. See §5.2.
+Eight signatures and semantics are best verified during implementation P2a.0–P2a.3, not pre-baked into the spec. See §5.2.
 
 ---
 
@@ -451,7 +451,7 @@ Beyond P1 (cold/warm prefill, warm decode):
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
 | R2 | CPU-torch `alloc_extend` latency > 1ms @ B=4 | MEDIUM | **2-step ladder**: (1) vectorize CPU torch implementation, (2) accept latency and force `B≤4` cap (G3a measured-floor still met; design-ceiling suspended pending P3). Triton-CPU port / C++ extension explicitly OUT of P2 scope. |
-| R9 | 8 implementation-discovery items (Q1-Q9) surprise | MEDIUM | spec labels items explicitly; Plan reserves dedicated Phase 0 "signature lock" tasks |
+| R9 | 8 implementation-discovery items (Q1-Q9) surprise | MEDIUM | spec labels items explicitly; Plan reserves dedicated P2a.0 "signature lock" tasks |
 
 #### Category B — Cache coherence / paged-evict
 
@@ -471,7 +471,7 @@ Beyond P1 (cold/warm prefill, warm decode):
 
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
-| R1 | `generator_sglang.py` signature drift on tt-metal upgrade | HIGH | Phase 0 signature lock + adapter version check + **pin tt-metal docker image SHA** (not just upstream commit) at implementation start |
+| R1 | `generator_sglang.py` signature drift on tt-metal upgrade | HIGH | P2a.0 signature lock + adapter version check + **pin tt-metal docker image SHA** (not just upstream commit) at implementation start |
 | R6 | `GenerationBatchResult.bypass_chunked_req` upstream-class patch | MEDIUM | Monthly rebase task (quarterly is contingency floor). If conflict on SGLang bump: temporarily disable chunked-prefill, rewrite patch. |
 | R13 | tt-metal docker image drift | NOTE | Pin docker image SHA + version comment in Dockerfile / launch script |
 | R14 | Model registry collision on SGLang upgrade | NOTE | §9.b6 registration-conflict unit test |
@@ -489,15 +489,15 @@ Beyond P1 (cold/warm prefill, warm decode):
 
 | # | Question | Best guess | When verified |
 |---|---|---|---|
-| Q1 | `prefill_forward_text` real batch tokens shape — `[32, max_pad]` or `[B, per_user_pad]`? | `[max_batch_size, max_pad]` | P2a Phase 0 |
-| Q2 | `req.set_finish_with_abort` short-circuits same-iter sampling? | No (next iter only) | Phase 1 |
-| Q3 | `empty_slots` is identity at B=4 (no retract)? | Yes | Phase 2 (batched test) |
-| Q4 | CPU-torch `alloc_extend` p99 latency at B=4? | < 500us | Phase 3 (micro-benchmark) |
-| Q5 | `paged_attention_config` must be passed to `create_tt_model`? | No (page table fed externally per INV-4) | Phase 0 |
-| Q6 | `req_to_token[:slice]` dtype requires `.to(int32)` for ttnn? | Yes | Phase 1 |
-| Q7 | RadixCache `cache_finished_req(canceled=True)` ↔ adapter free-list consistent? | Yes (read-through) | Phase 4 (abort-flow test) |
-| Q8 | GptOss separate-loader coupling depth with paged path? | Unknown | P2b Phase 0 |
-| Q9 | `TTBackedKVCache` shim covers all SGLang KV call-sites in {attention-backend, allocator, radix_cache} modules? | Yes — to verify | P2a Phase 0 (Plan deliverable: call-site CSV) |
+| Q1 | `prefill_forward_text` real batch tokens shape — `[32, max_pad]` or `[B, per_user_pad]`? | `[max_batch_size, max_pad]` | P2a.0 |
+| Q2 | `req.set_finish_with_abort` short-circuits same-iter sampling? | No (next iter only) | P2a.1 |
+| Q3 | `empty_slots` is identity at B=4 (no retract)? | Yes | P2a.2 (batched test) |
+| Q4 | CPU-torch `alloc_extend` p99 latency at B=4? | < 500us | P2a.3 (micro-benchmark) |
+| Q5 | `paged_attention_config` must be passed to `create_tt_model`? | No (page table fed externally per INV-4) | P2a.0 |
+| Q6 | `req_to_token[:slice]` dtype requires `.to(int32)` for ttnn? | Yes | P2a.1 |
+| Q7 | RadixCache `cache_finished_req(canceled=True)` ↔ adapter free-list consistent? | Yes (read-through) | P2b (abort-flow test) |
+| Q8 | GptOss separate-loader coupling depth with paged path? | Unknown | P2b W0 |
+| Q9 | `TTBackedKVCache` shim covers all SGLang KV call-sites in {attention-backend, allocator, radix_cache} modules? | Yes — to verify | P2a.0 (Plan deliverable: call-site CSV) |
 
 #### 5.2b Implementation-discovery escape hatch
 
@@ -518,14 +518,14 @@ P2b   :              ████      (~1 week: per-model max_seq_len matrix + 
 P3    :                    ████ (P3 starts here — see §A2 for scope)
 ```
 
-> **Acceleration rationale**: plugin absorption removed ~1900 LoC of planned implementation work (entire Phase 1 of original plan deleted: TTPagedKVAdapter, TTBackedKVCache, TTPagedMetadataBackend). Plugin also pre-solves multi-model (G1b/G2b) and mesh-shape parametric (G6a). What's left in P2 is verification + dual-track + RadixAttention probe — work that fits in ~3 weeks total (P2a + P2b).
+> **Acceleration rationale**: plugin absorption removed ~1900 LoC of planned implementation work (entire Stage-1 of original plan deleted: TTPagedKVAdapter, TTBackedKVCache, TTPagedMetadataBackend). Plugin also pre-solves multi-model (G1b/G2b) and mesh-shape parametric (G6a). What's left in P2 is verification + dual-track + RadixAttention probe — work that fits in ~3 weeks total (P2a + P2b).
 
 > **Banner assumes Blackhole + plugin work**: if plugin's untested Blackhole branches in `tt_utils.py` need patching, P2a slips by 1 week (still under 5w original budget). If RadixAttention is dead-on-arrival with plugin's KV layout, G4a downgrades to "documented infeasibility, deferred to P3" rather than blocking P2a.
 
 **P1.5 merge order**: P1.5 must be **fully merged** (all 4 logical changes landed on `main`, regardless of squash topology) before P2a branches off the post-merge SHA. P2a MUST NOT start while any P1.5 change is in-flight (avoids 4-way rebase race).
 
 **P2a (W2-W6)**:
-- W2: Phase 0 — Q1, Q5, Q6, Q2, Q9 signature lock + Q9 call-site CSV deliverable. ABC rewrite. P1 simple backend port.
+- W2: P2a.1 plugin port — Q1, Q5, Q6, Q2, Q9 signature lock + Q9 call-site CSV deliverable. ABC rewrite. P1 simple backend port.
 - W3: `TTPagedKVAdapter` + `TTBackedKVCache` + page-table translation.
 - W4: RadixAttention integration + batched forward + admission + abort.
 - W5: Test suite + §9.1-§9.14 gates.
@@ -609,8 +609,8 @@ Spec went through 4 rounds of subagent-driven review during brainstorming:
 - `superpowers:subagent-driven-development` skill — executes the plan
 - Git remote: `predator2k/sglang` (`origin`). NEVER push to `sgl-project/sglang` per N9
 - tt-metal docker images (two pins per R1/R13):
-  - **Phase 0 / P1-simple-path** (UMD-compatible with host KMD 2.8.0; no `generator_sglang.py`): `ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e` (sha256:`d4116d2a7b20383ec42c990b08f9c6159462f9f2b84f9a25448db678f17e41aa`)
-  - **Phase 2+ / paged path** (has `generator_sglang.py`; UMD mismatch with current host — must resolve before Phase 2 starts): `ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-models-amd64:latest-rc` (sha256:`40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c`)
+  - **P2a.0 / P1-simple-path** (UMD-compatible with host KMD 2.8.0; no `generator_sglang.py`): `ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e` (sha256:`d4116d2a7b20383ec42c990b08f9c6159462f9f2b84f9a25448db678f17e41aa`)
+  - **P2a.1+ / paged path** (has `generator_sglang.py`; UMD mismatch with current host — must resolve before P2a.1 starts): `ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-models-amd64:latest-rc` (sha256:`40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c`)
 
 **Upstream code (tt-metal, read-only)**
 - `tt_transformers` (bundled in tt-metal docker image): `models/tt_transformers/tt/generator_sglang.py`, `common.py`, `attention.py`, `model.py`, `decoder.py`, `generator.py`

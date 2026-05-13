@@ -6,9 +6,9 @@
 
 **Spec**: [`../specs/2026-05-12-sglang-tenstorrent-p2-design.md`](../specs/2026-05-12-sglang-tenstorrent-p2-design.md) (amended 2026-05-13). All §N.M / G-item / INV-N / Q-N / R-N / §9.X references resolve there.
 
-**Predecessor**: P1 shipped (47 commits) + P2a Phase 0 shipped + 2 hardware-fix follow-ups (14 commits, `21f38ac9a..44b281ebc`) + spec amendment (`23e9d5cba`).
+**Predecessor**: P1 shipped (47 commits) + P2a.0 shipped + 2 hardware-fix follow-ups (14 commits, `21f38ac9a..44b281ebc`) + spec amendment (`23e9d5cba`).
 
-**Supersedes**: The pre-2026-05-13 P2a plan (3524 lines, 46 tasks). Original at `git show 5028c6b6a:docs/superpowers/plans/2026-05-12-sglang-tenstorrent-p2a-plan.md`. **Phase 1 of v1 (TTPagedKVAdapter / TTBackedKVCache / TTPagedMetadataBackend) is DELETED — plugin replaces it.**
+**Supersedes**: The pre-2026-05-13 P2a plan (3524 lines, 46 tasks). Original at `git show 5028c6b6a:docs/superpowers/plans/2026-05-12-sglang-tenstorrent-p2a-plan.md`. **Stage-1 of v1 (TTPagedKVAdapter / TTBackedKVCache / TTPagedMetadataBackend) is DELETED — plugin replaces it.**
 
 **Branch**: `tenstorrent-p1` on `origin` (`predator2k/sglang`). NO upstream PRs (spec N9).
 
@@ -20,7 +20,7 @@
 
 ## How to use this plan
 
-1. Phases run **strictly top-to-bottom**: Phase 0 (done) → 1 → 2 → 3 → 4 (P2b, optional).
+1. Sub-stages run **strictly top-to-bottom**: P2a.0 (done) → P2a.1 → P2a.2 → P2a.3 → P2b (optional).
 2. Each phase has a verification gate at its end. Do NOT proceed past a failing gate.
 3. **Commit per task** with the exact message shown.
 4. **INV-1..INV-7 from spec §2.4 are non-negotiable.** Plugin path may violate INV-1's old phrasing — that's fine, the amended INV-1 scopes the strict form to the simple-fallback path only. Any other invariant violation → STOP, escape via spec §5.2b.
@@ -44,15 +44,15 @@ Paths relative to repo root `/home/mhnie/sglang/`. Module root: `python/sglang/s
 | `models/worker_setup.py` | adapted from `tt-sglang-plugin/sglang_tt_plugin/worker_setup/worker_setup.py` | Keep `_DP\d+` parsing + `TT_VISIBLE_DEVICES` + cache-dir setup |
 | `models/registry.py` | adapted from `tt-sglang-plugin/sglang_tt_plugin/patching/patching_model_registry.py` | Patches `ModelRegistry.models` with our `Tenstorrent*ForCausalLM` |
 
-### Preserved from P2a Phase 0 (dual-track fallback)
+### Preserved from P2a.0 (dual-track fallback)
 
 | Path | Status |
 |---|---|
 | `execution/base.py` | Shipped — INV-1 (now scoped to simple fallback) |
 | `execution/tt_transformers_backend.py` | Shipped — P1 simple backend on new ABC |
-| `execution/__init__.py` | Shipped — registry: `tt_transformers_single` / `tt_transformers_paged` (the latter to be wired in Phase 1) |
+| `execution/__init__.py` | Shipped — registry: `tt_transformers_single` / `tt_transformers_paged` (the latter to be wired in P2a.1) |
 | `tp_worker.py` | Shipped — `_forward_batch_generation_tt` calls simple backend's `forward()` |
-| `platform.py` | Shipped — extended in Phase 1 to call `models.registry.register_tt_models()` |
+| `platform.py` | Shipped — extended in P2a.1 to call `models.registry.register_tt_models()` |
 | `warmup.py` | Shipped — fixed in T0.7 follow-up `dcdd23a2e` |
 
 ### Cross-module patch (still required, in our fork only per N9)
@@ -62,7 +62,7 @@ Paths relative to repo root `/home/mhnie/sglang/`. Module root: `python/sglang/s
 | `python/sglang/srt/managers/utils.py` | Add `bypass_chunked_req: bool = False` field to `GenerationBatchResult` | R6 — monthly rebase, see `REBASE_TARGETS.md` |
 | `python/sglang/srt/managers/scheduler.py` | One read site post-forward: clear `self.chunked_req` if `bypass_chunked_req` | R6 |
 
-### Tests (new in Phase 1 + 3, ~600 LoC)
+### Tests (new in P2a.1 + P2a.3, ~600 LoC)
 
 | Path | Spec ref | Hardware? |
 |---|---|---|
@@ -85,23 +85,23 @@ Paths relative to repo root `/home/mhnie/sglang/`. Module root: `python/sglang/s
 
 ---
 
-## Phase 0 — SHIPPED (historical reference)
+## P2a.0 — SHIPPED (historical reference)
 
-14 commits `21f38ac9a..44b281ebc` (already pushed; also includes spec amendment `23e9d5cba`). Phase 0 delivered:
+14 commits `21f38ac9a..44b281ebc` (already pushed; also includes spec amendment `23e9d5cba`). P2a.0 delivered:
 
 - **T0.1** `21f38ac9a` — pin tt-metal docker image SHA (two-pin layout post-amendment: three-pin)
 - **T0.2-T0.5** evidence file + Q9 CSV (`_fixtures/phase0_signature_evidence.txt`, `_fixtures/q9_call_site_inventory.csv`)
 - **T0.6** `857d2cdf6` — model-level ABC (now scoped to simple-fallback only per amended INV-1)
 - **T0.7** `c5f8774ec` — P1 simple backend ported to ABC; `_do_*` private methods preserved verbatim
 - **T0.8** `b605f9519` — pytest markers (`@pytest.mark.simple_backend` / `@pytest.mark.paged_backend` / `@pytest.mark.hardware`)
-- **T0.9** `26f2356cb` — Phase 0 verification report (5/5 PASS, hardware-deferred)
+- **T0.9** `26f2356cb` — P2a.0 verification report (5/5 PASS, hardware-deferred)
 - **Hardware-fix follow-ups** `dcdd23a2e` + `44b281ebc` — `warmup.py` uses `_do_*` + `keepdim=False`
 
-**Phase 0 acceptance**: All 5 deliverables PASS in `_fixtures/phase0_verification.md`. Hardware mesh-open verification was blocked at the time by firmware mismatch; **resolved 2026-05-13** by building `local-tt-metal:dev` from tt-metal commit `89686ee7`. Smoke test now unblocks Phase 1.
+**P2a.0 acceptance**: All 5 deliverables PASS in `_fixtures/phase0_verification.md`. Hardware mesh-open verification was blocked at the time by firmware mismatch; **resolved 2026-05-13** by building `local-tt-metal:dev` from tt-metal commit `89686ee7`. Smoke test now unblocks P2a.1.
 
 ---
 
-## Phase 1 — Plugin Port + Blackhole Boot (W2, ~1 week)
+## P2a.1 — Plugin Port + Blackhole Boot (W2, ~1 week)
 
 **Goal**: Adapt the 5 plugin source files into our `python/sglang/srt/hardware_backend/tenstorrent/models/` namespace, register the `Tenstorrent*ForCausalLM` model classes with SGLang, and verify Llama-3.1-8B boots on 2× Blackhole p150a end-to-end via the plugin path. Dual-track simple path must remain working in parallel.
 
@@ -210,11 +210,11 @@ def activate(cls):
 def resolve_execution_backend_name(requested: str | None = None) -> str:
     """Resolve to P2a default: tt_transformers_paged (plugin path).
 
-    Phase 0 default was tt_transformers_single; Phase 1 flips to paged.
+    P2a.0 default was tt_transformers_single; P2a.1 flips to paged.
     """
     name = (requested or envs.SGLANG_TT_EXECUTION_BACKEND.get() or "auto").lower()
     if name == "auto":
-        return "tt_transformers_paged"  # was tt_transformers_single in Phase 0
+        return "tt_transformers_paged"  # was tt_transformers_single in P2a.0
     return name
 ```
 
@@ -231,7 +231,7 @@ git commit -m "feat(tenstorrent): wire plugin model registration on platform act
 
 ```python
 # SPDX-License-Identifier: Apache-2.0
-"""Phase 1 §9.b6 model-registry namespace test (INV-6 + plugin port verification).
+"""P2a.1 §9.b6 model-registry namespace test (INV-6 + plugin port verification).
 
 CPU-only — no hardware needed. Imports plugin classes and confirms they're
 registered under the Tenstorrent* namespace in SGLang's ModelRegistry.
@@ -411,9 +411,9 @@ git add python/sglang/srt/hardware_backend/tenstorrent/test/test_greedy_correctn
 git commit -m "test(tenstorrent): §9.2 paged greedy correctness on Blackhole"
 ```
 
-### Task 1.6: Phase 1 verification gate
+### Task 1.6: P2a.1 verification gate
 
-- [ ] **Step 1**: Run all of Phase 1 acceptance:
+- [ ] **Step 1**: Run all of P2a.1 acceptance:
 
 ```bash
 # CPU unit tests (host or container — both work):
@@ -437,18 +437,18 @@ SGLANG_PLATFORM=tenstorrent SGLANG_TT_EXECUTION_BACKEND=tt_transformers_single \
 
 Expected: P1's smoke still PASS (T0.7 simple backend port unaffected).
 
-- [ ] **Step 3**: Update Phase 0 verification report (`_fixtures/phase0_verification.md`) — append a "Phase 1 verification" section confirming the smoke went green. Commit:
+- [ ] **Step 3**: Update P2a.0 verification report (`_fixtures/phase0_verification.md`) — append a "P2a.1 verification" section confirming the smoke went green. Commit:
 
 ```bash
 git add python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/phase0_verification.md
-git commit -m "docs(tenstorrent): Phase 1 hardware-smoke verification report"
+git commit -m "docs(tenstorrent): P2a.1 hardware-smoke verification report"
 ```
 
-**Phase 1 acceptance**: §9.1 + §9.2 pass on Blackhole + simple-fallback also passes. Decision: **proceed to Phase 2**.
+**P2a.1 acceptance**: §9.1 + §9.2 pass on Blackhole + simple-fallback also passes. Decision: **proceed to P2a.2**.
 
 ---
 
-## Phase 2 — Production Hardening (W3, ~3 days)
+## P2a.2 — Production Hardening (W3, ~3 days)
 
 **Goal**: Wire the upstream-class `bypass_chunked_req` patch (R6), validate abort/cancel/admission flows work through the plugin path, add the 5-step chunked-prefill failure recovery test.
 
@@ -491,8 +491,8 @@ This file tracks SGLang upstream-class patches that we maintain in our fork only
 
 | File | Line range (approx) | Purpose | First landed |
 |---|---|---|---|
-| `python/sglang/srt/managers/utils.py` | `GenerationBatchResult` dataclass | Add `bypass_chunked_req: bool = False` for tenstorrent chunked-prefill failure recovery | 2026-05-13 (P2a Phase 2) |
-| `python/sglang/srt/managers/scheduler.py` | post-forward result handler (~L2498) | Read `bypass_chunked_req`, clear `self.chunked_req` if set | 2026-05-13 (P2a Phase 2) |
+| `python/sglang/srt/managers/utils.py` | `GenerationBatchResult` dataclass | Add `bypass_chunked_req: bool = False` for tenstorrent chunked-prefill failure recovery | 2026-05-13 (P2a.2) |
+| `python/sglang/srt/managers/scheduler.py` | post-forward result handler (~L2498) | Read `bypass_chunked_req`, clear `self.chunked_req` if set | 2026-05-13 (P2a.2) |
 
 ## Rebase procedure
 
@@ -561,9 +561,9 @@ git add python/sglang/srt/hardware_backend/tenstorrent/test/test_queue_full_admi
 git commit -m "test(tenstorrent): §9.5 queue-full admission + §9.6 abort (endpoint + disconnect)"
 ```
 
-### Task 2.4: Phase 2 verification gate
+### Task 2.4: P2a.2 verification gate
 
-- [ ] **Step 1**: Run all Phase 2 tests + Phase 1 regression:
+- [ ] **Step 1**: Run all P2a.2 tests + P2a.1 regression:
 
 ```bash
 SGLANG_PLATFORM=tenstorrent pytest \
@@ -578,11 +578,11 @@ SGLANG_PLATFORM=tenstorrent pytest \
 
 Expected: 100% PASS.
 
-**Phase 2 acceptance**: §9.5, §9.6 (×2), §9.12.a-e all pass. Decision: **proceed to Phase 3**.
+**P2a.2 acceptance**: §9.5, §9.6 (×2), §9.12.a-e all pass. Decision: **proceed to P2a.3**.
 
 ---
 
-## Phase 3 — Acceptance Suite + RadixAttention Probe (W4, ~3-4 days)
+## P2a.3 — Acceptance Suite + RadixAttention Probe (W4, ~3-4 days)
 
 **Goal**: Run the full set of §9 acceptance gates remaining (§9.3, §9.4, §9.7-§9.11, §9.13, §9.14). G4a (RadixAttention) is the headline measurement — this is our independent contribution that the plugin upstream has not done.
 
@@ -679,17 +679,17 @@ git commit -m "test(tenstorrent): §9.4 RadixAttention probe — G4a first measu
 - [ ] Update `docs/superpowers/specs/2026-05-12-sglang-tenstorrent-p2-design.md` §5.3a user-visible transitions to reflect actual measurements (max_running_requests post-flip, perf delta). **This is the second allowed spec edit during P2a** — only the §5.3a fact-update, not architecture.
 - [ ] Commit `chore(tenstorrent): confirm default-flip; record post-flip user-visible transition deltas`.
 
-### Task 3.11: Phase 3 W4 decision gate (§5.3b conditions, amended)
+### Task 3.11: P2a.3 W4 decision gate (§5.3b conditions, amended)
 
 - [ ] Verify all of:
   1. §9.1, §9.2, §9.3, §9.4, §9.5, §9.6, §9.7, §9.8, §9.9, §9.10, §9.11, §9.12.a-e, §9.13, §9.14 pass — **§9.15 / §9.16 dropped per amendment**
-  2. Q3 verified (empty_slots identity at B=4), Q7 verified (RadixCache canceled-req consistency via §9.6 abort + §9.11 eviction-replay end-to-end); other Q's already answered in Phase 0
+  2. Q3 verified (empty_slots identity at B=4), Q7 verified (RadixCache canceled-req consistency via §9.6 abort + §9.11 eviction-replay end-to-end); other Q's already answered in P2a.0
   3. R5 no reproduction in §9.7 stability run (no KV pool free-list inconsistency warnings)
   4. **G4a outcome documented** — either PASS (≥0.5 hit rate, ≥1.5× tok/s) or PASS-as-infeasibility (G4a downgrades to a P3 task; document in `_fixtures/radixattn_probe_result.md`)
   5. G8a Blackhole validation complete
 
 - [ ] Decision:
-  - All pass → **P2a accepted, proceed to P2b** (Phase 4)
+  - All pass → **P2a accepted, proceed to P2b** (P2b)
   - Any §9 fail → **2-week fix loop** then retest; second fail → P2b → best-effort
   - G4a infeasibility-documented → still proceed to P2b (infeasibility doesn't block multi-model)
 
@@ -697,16 +697,16 @@ git commit -m "test(tenstorrent): §9.4 RadixAttention probe — G4a first measu
 
 ```bash
 git add python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/phase3_acceptance_report.md
-git commit -m "docs(tenstorrent): P2a Phase 3 acceptance report — §9 gates pass, P2b approved"
+git commit -m "docs(tenstorrent): P2a.3 acceptance report — §9 gates pass, P2b approved"
 ```
 
-**Phase 3 acceptance**: P2a complete. **P2a → P2b decision gate satisfied.** Total elapsed: ~W2-W4 (or W2-W5 if buffer used).
+**P2a.3 acceptance**: P2a complete. **P2a → P2b decision gate satisfied.** Total elapsed: ~W2-W4 (or W2-W5 if buffer used).
 
 ---
 
-## Phase 4 (P2b) — Multi-Model Smoke (W5, ~3-5 days)
+## P2b — Multi-Model Smoke (W5, ~3-5 days)
 
-**Goal**: Validate Qwen / Mistral / GptOss model arches boot and produce coherent output. Plugin already registers all 4 model classes in Phase 1; this phase verifies each one works end-to-end on Blackhole and documents the per-model max_seq_len matrix.
+**Goal**: Validate Qwen / Mistral / GptOss model arches boot and produce coherent output. Plugin already registers all 4 model classes in P2a.1; this stage verifies each one works end-to-end on Blackhole and documents the per-model max_seq_len matrix.
 
 **Files touched**: 1-3 new test files (per-model smoke).
 
@@ -753,7 +753,7 @@ git commit -m "test(tenstorrent): §9.b1 multi-model smoke (Qwen/Mistral/GptOss)
 - [ ] Verify:
   1. §9.b1 all in-scope models pass smoke
   2. §9.b2 max_seq_len matrix documented
-  3. No regression in Phase 1-3 acceptance (rerun the full §9 suite once more)
+  3. No regression in P2a.1-P2a.3 acceptance (rerun the full §9 suite once more)
 
 - [ ] **Decision: P2 → P3 transition**:
   - P2 acceptance achieved → close P2a-plan as DONE
@@ -767,7 +767,7 @@ git add python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/per_model_
 git commit -m "docs(tenstorrent): P2 acceptance complete (P2a §9 + P2b §9.b); P3 brainstorm next"
 ```
 
-**Phase 4 acceptance**: P2 complete. **Transition to P3 brainstorming.**
+**P2b acceptance**: P2 complete. **Transition to P3 brainstorming.**
 
 ---
 
@@ -780,11 +780,11 @@ git commit -m "docs(tenstorrent): P2 acceptance complete (P2a §9 + P2b §9.b); 
 | 1.3 | 1 | Unit test plugin registration + namespace | INV-6 | No |
 | 1.4 | 1 | §9.1 paged smoke on Blackhole (**G8a first BH validation**) | §9.1, G8a | **Yes** |
 | 1.5 | 1 | §9.2 greedy correctness on Blackhole | §9.2 | Yes |
-| 1.6 | 1 | Phase 1 verification gate | — | — |
+| 1.6 | 1 | P2a.1 verification gate | — | — |
 | 2.1 | 2 | bypass_chunked_req upstream patch + REBASE_TARGETS.md | §3.7, R6 | No |
 | 2.2 | 2 | §9.12.a-e chunked-failure 5-step | §9.12, R5+R12 | No (mock) |
 | 2.3 | 2 | §9.5 queue-full + §9.6 abort (×2) | §9.5, §9.6 | Yes |
-| 2.4 | 2 | Phase 2 verification gate | — | — |
+| 2.4 | 2 | P2a.2 verification gate | — | — |
 | 3.1 | 3 | §9.3 batched correctness B=4 | §9.3 | Yes |
 | 3.2 | 3 | §9.4 RadixAttention probe (**G4a headline**) | §9.4, G4a | Yes |
 | 3.3 | 3 | §9.7 stability 15-min | §9.7 | Yes |
@@ -795,13 +795,13 @@ git commit -m "docs(tenstorrent): P2 acceptance complete (P2a §9 + P2b §9.b); 
 | 3.8 | 3 | §9.13 teardown leak check | §9.13 | Yes |
 | 3.9 | 3 | §9.14 token-pool overflow lint | §9.14 | No |
 | 3.10 | 3 | Auto-flip default; record user-visible transition | §5.3a, G5a | — |
-| 3.11 | 3 | Phase 3 / P2a decision gate | — | — |
+| 3.11 | 3 | P2a.3 / P2a decision gate | — | — |
 | 4.1 | 4 | P2b W0 model availability checklist | R10 | — |
 | 4.2 | 4 | §9.b1 multi-model smoke | §9.b1, G1b/G2b | Yes |
 | 4.3 | 4 | §9.b2 max_seq_len matrix | §9.b2, G3b | Yes |
 | 4.4 | 4 | P2b acceptance gate → P3 | — | — |
 
-**Total**: 22 tasks across 4 phases. Estimated 2-3 weeks if hardware cooperates (P2a 1-2w + P2b 0.5-1w).
+**Total**: 22 tasks across 4 stages. Estimated 2-3 weeks if hardware cooperates (P2a 1-2w + P2b 0.5-1w).
 
 ---
 
@@ -818,7 +818,7 @@ git commit -m "docs(tenstorrent): P2 acceptance complete (P2a §9 + P2b §9.b); 
 
 ## Closing — P2 → P3 transition
 
-Once Phase 4 closes, the next step is **`superpowers:brainstorming` for P3** with the expanded scope from spec §A2.5. P3 is the **innovation phase**: speculative decoding, LoRA, BF16-throughout precision, multimodal, HiRadixCache, disaggregation, tt-xla backend, kernel-level perf tuning, 4× p150a validation, Galaxy mesh, 24h+ stability, production observability.
+Once P2b closes, the next step is **`superpowers:brainstorming` for P3** with the expanded scope from spec §A2.5. P3 is the **innovation phase**: speculative decoding, LoRA, BF16-throughout precision, multimodal, HiRadixCache, disaggregation, tt-xla backend, kernel-level perf tuning, 4× p150a validation, Galaxy mesh, 24h+ stability, production observability.
 
 P2 was plumbing-verification. P3 is where we push the envelope.
 
