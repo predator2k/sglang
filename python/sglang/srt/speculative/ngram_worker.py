@@ -6,6 +6,7 @@ import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+from sglang.srt.platforms import current_platform
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -45,7 +46,12 @@ class NGRAMWorker:
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
         self.max_batch_size = target_worker.max_running_requests
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        if current_platform.device_name == "tenstorrent":
+            self.device = "cpu"  # NGRAM table is host-side
+        elif gpu_id >= 0:
+            self.device = f"cuda:{gpu_id}"
+        else:
+            self.device = "cuda"
 
         self._init_preallocated_tensors()
 
@@ -226,9 +232,11 @@ class NGRAMWorker:
             )
             for i, req in enumerate(batch.reqs):
                 seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
+                req_mask = torch.ones(
+                    (self.draft_token_num, seq_len - 1), device=self.device
+                )
                 req_mask = torch.cat(
-                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
+                    (req_mask, torch.from_numpy(mask[i]).to(self.device)), dim=1
                 ).to(torch.bool)
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
