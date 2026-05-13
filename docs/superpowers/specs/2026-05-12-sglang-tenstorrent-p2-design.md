@@ -1,25 +1,33 @@
 # SGLang on Tenstorrent — Phase 2 Implementation Spec
 
-> **Date**: 2026-05-12
-> **Status**: Draft (brainstorming output, pre-implementation)
+> **Date**: 2026-05-12 (amended 2026-05-13)
+> **Status**: Draft amended after Tenstorrent plugin discovery; pre-paged-implementation.
 > **Scope**: Phase 2 (P2a + P2b sub-phases). Phase 1.5 hygiene patches are a parallel deliverable, included by reference.
 > **Predecessor**: [`2026-05-11-sglang-tenstorrent-p1-design.md`](2026-05-11-sglang-tenstorrent-p1-design.md). P1 has shipped (47 commits on `tenstorrent-p1` branch in `predator2k/sglang`; all §9 acceptance gates passed).
 > **Anchored on**: [`../brainstorming/2026-05-12-sglang-tenstorrent-p2-brainstorm.md`](../brainstorming/2026-05-12-sglang-tenstorrent-p2-brainstorm.md). The brainstorm framed two directions (P2-paged vs P2-coverage); this spec collapses them into one path after the `generator_sglang.py` discovery.
 > **Target hardware**: 2× Tenstorrent Blackhole p150a (validated), mesh-shape parametric to 4× p150a (design-only, not validated in P2).
+>
+> **2026-05-13 amendment** — Tenstorrent's `tt-inference-server/tt-sglang-plugin` (`tt_llm.py` / `tt_utils.py` / `worker_setup.py` / `patching_model_registry.py`) was discovered. It implements the model-registration pattern in ~500 LoC, already covers 4 model families (Llama / Qwen / Mistral / GptOss) and uses `generator_sglang.py`'s SGLang-flavored API. **This spec amends to ABSORB the plugin's architecture (model-registry path, not custom TTExecutionBackend ABC) and concentrate our independent contribution on RadixAttention + Blackhole + dual-track + §9 acceptance.** Net effect: ~1900 LoC scope cut, ~2 weeks saved, P2a re-estimates to 3 weeks. See §A2 Amendment notes at the end of this document for INV-level deltas. P1 simple backend port (T0.7 already shipped) remains as the dual-track fallback path per G5a / §5.3c.
 
 ---
 
 ## 0. Executive Summary
 
-Phase 2 transforms P1's single-user contiguous-KV path into a **paged KV + RadixAttention + batched** path, leveraging upstream `tt_transformers/tt/generator_sglang.py` (Tenstorrent already ships SGLang-flavored adapters for Llama, Qwen, Mistral, GptOss). The key discovery: P2 is one integration, not two. P2-coverage via tt-xla (P1 spec §11 alternate direction) is **dropped** — `tt_transformers` covers the target model families.
+Phase 2 transforms P1's single-user contiguous-KV path into a **paged KV + RadixAttention + batched + multi-model** path. The implementation approach is to **absorb Tenstorrent's upstream `tt-sglang-plugin`** (which already integrates `generator_sglang.py`'s SGLang-flavored API) and concentrate our independent value on three areas the plugin has not delivered:
+
+1. **RadixAttention validation** — plugin admits ("Potential improvements (3)") it has not examined SGLang prefix caching; our G4a is the first measurement
+2. **Blackhole (p150a) validation** — plugin tested only on Wormhole (n150/n300/t3k); our P2 target is 2× Blackhole p150a
+3. **Dual-track + production discipline** — preserving P1 simple-user backend as fallback (G5a / §5.3c), §9 acceptance gates, INV-level documentation, hardware-issue runbooks
 
 P2 is split into two sub-phases:
-- **P2a — Paged Baseline** (~5 weeks): paged KV adapter, RadixAttention prefix cache, batching ≤4 measured, Llama-3.1-8B only, 8K context, ABC redesign, dual-track preserved.
-- **P2b — Multi-Model + Long-Context** (~4 weeks, gated on P2a §9 pass): register Qwen / Mistral / GptOss, per-model max_seq_len matrix, 128K chunked-prefill on Llama, P300 chunk-size table.
+- **P2a — Plugin Absorption + Paged Baseline** (~3 weeks, was 5 before amendment): port plugin into our namespace (`Tenstorrent*ForCausalLM` per INV-6); wire dual-track switch (env var) preserving simple path; validate RadixAttention; verify Blackhole; full §9 acceptance.
+- **P2b — Multi-Model + Long-Context** (~4 weeks, gated on P2a §9 pass): per-model max_seq_len matrix, 128K chunked-prefill on Llama, P300 chunk-size table. (Models register out-of-box from plugin; per-model verification is the work.)
 
 **P1.5 hygiene patches** (SIGQUIT handler, mesh watchdog, persistent cache path doc, P300 chunk-size patch sketch) ship as **4 independent commits in week 1**, all merged before P2a starts.
 
-P2 estimate: 10 weeks total (P1.5 W1 + P2a W2-W6 + P2b W7-W10), sequential gating. Decision gate at end of P2a determines whether and how P2b proceeds.
+P2 estimate: 8 weeks total (P1.5 W1 + P2a W2-W4 + P2b W5-W8), sequential gating. Decision gate at end of P2a determines whether and how P2b proceeds.
+
+> **Implementation discovery (2026-05-13)**: fresh tt-metal main (commit `89686ee7`, UMD-bump 2026-05-12) compiled from source resolves the host firmware-19.6.0 ↔ image-UMD-18.10.0 mismatch that blocked earlier hardware verification. Image `localhost/local-tt-metal:dev` (sha256:`973e972bddf5`) — mesh open + tt_transformers import + `generator_sglang.LlamaForCausalLM` import all confirmed working. This is the **third image pin** added to §7 cross-references.
 
 ---
 
@@ -29,13 +37,14 @@ P2 estimate: 10 weeks total (P1.5 W1 + P2a W2-W6 + P2b W7-W10), sequential gatin
 
 | # | Goal | Verification |
 |---|---|---|
-| G1a | ABC redesigned to **model-level** `forward(forward_batch) → LogitsProcessorOutput`. P1 simple backend rewritten to match. | Unit tests on new ABC contract; P1 hardware tests rerun against rewritten simple backend |
-| G2a | `TTPagedKVAdapter` subclasses `PagedTokenToKVPoolAllocator` (device="cpu", custom kvcache wrapper); `TTPagedMetadataBackend` translates SGLang batch metadata to ttnn page-table. | Unit tests on alloc/free/page-table math |
+| G1a | **(AMENDED 2026-05-13)** Adopt Tenstorrent plugin's model-registration architecture (`Tenstorrent*ForCausalLM(nn.Module)` registered via SGLang `ModelRegistry`; standard `model_runner.forward(input_ids, positions, forward_batch)` path). P1 simple backend (T0.7 shipped via `_do_*` private pattern) preserved as `tt_transformers_single` fallback for G5a dual-track. | Unit test: importing `TenstorrentLlamaForCausalLM` succeeds + `ModelRegistry.models["LlamaForCausalLM"]` resolves to ours; existing P1 hardware tests still pass against `tt_transformers_single`. |
+| G2a | **(AMENDED 2026-05-13)** Plugin's KV-cache flow: `tt_transformers` owns KV bytes via `allocate_kv_cache(num_blocks, num_kv_heads, block_size, head_size)`; SGLang's default allocator owns slot indices; mapping is `block_id = token_index // block_size` (INV-3 preserved). No custom `PagedTokenToKVPoolAllocator` subclass needed. | Confirm: SGLang allocator + plugin page-table math co-index consistently under stress (§9.16 replaced by §9.16r: round-trip slot→block_id→KV-write→read-back consistency). |
 | G3a | Paged Llama-3.1-8B inference at **B ≥ 4 concurrent measured, ≤ 32 design ceiling**, 8K context. | Hardware test (§9.3 batched correctness) |
-| G4a | SGLang RadixAttention enabled on paged path. With shared 1K-token system prompt across 4 user questions, hit-rate ≥ 50% AND effective tok/s ≥ 1.5× the no-prefix baseline. | Hardware test (§9.4) |
-| G5a | Dual-track: `SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged` (default) / `tt_transformers_single` (P1 fallback). Switch requires server restart, not hot-swap. | §9.8 |
-| G6a | Mesh-shape parametric via `SGLANG_TT_MESH_SHAPE` env (`1x2`, `1x4`). P2a validates `1x2` on real hardware; `1x4` is static-lint only. | §9.9 |
-| G7a | OOM admission (queue-full → in-stream `AbortReq`, NOT HTTP 503), request cancellation (via `/abort_request` AND client disconnect), paged-block utilization metrics. | §9.5, §9.6, §9.10 |
+| G4a | **SGLang RadixAttention enabled** with `--enable-radix-cache`. With shared 1K-token system prompt across 4 user questions, hit-rate ≥ 50% AND effective tok/s ≥ 1.5× no-prefix baseline. Plugin upstream has NOT validated this — our G4a is the first measurement. | Hardware test (§9.4) |
+| G5a | Dual-track: `SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged` (plugin path, default) / `tt_transformers_single` (P1 fallback, T0.7 simple backend). Switch requires server restart, not hot-swap. | §9.8 |
+| G6a | Mesh-shape parametric via `SGLANG_TT_MESH_SHAPE` env (`1x2`, `1x4`). P2a validates `1x2` on real Blackhole hardware; `1x4` is static-lint only. Plugin's `_configure_fabric` already handles `FABRIC_1D` for ≥2 devices. | §9.9 |
+| G7a | OOM admission (queue-full → in-stream `AbortReq`, NOT HTTP 503), request cancellation (via `/abort_request` AND client disconnect), paged-block utilization metrics. SGLang scheduler handles admission/cancel out-of-box once plugin is wired; we verify. | §9.5, §9.6, §9.10 |
+| G8a | **(NEW 2026-05-13)** **Blackhole p150a validation**: confirm plugin's `tt_utils._configure_fabric` + `ttnn.device.is_blackhole()` branches work on 2× p150a + KMD 2.8.0 + FW 19.6.0. Plugin's tested hardware matrix is Wormhole-only (n150/n300/t3k); P2a is the first Blackhole validation. | §9.1 smoke + §9.3 batched both run on actual Blackhole hardware. |
 
 ### 1.2 P2b Goals (gated on P2a §9 pass)
 
@@ -71,9 +80,9 @@ P2 estimate: 10 weeks total (P1.5 W1 + P2a W2-W6 + P2b W7-W10), sequential gatin
 
 ---
 
-## 2. Architecture
+## 2. Architecture (AMENDED 2026-05-13)
 
-### 2.1 Incremental map P1 → P2
+### 2.1 Incremental map P1 → P2 (plugin-based)
 
 ```
                       [ apply_server_args_defaults ]
@@ -85,45 +94,53 @@ P2 estimate: 10 weeks total (P1.5 W1 + P2a W2-W6 + P2b W7-W10), sequential gatin
        [ MeshDeviceCtx(shape=env or (1,2)) ]   ← P1.5: SIGQUIT handler
                                 |              ← P2:   mesh-shape parametric
                                 v
-          [ TTTpModelWorker(TpModelWorker) ]   ← P2: batched forward
-              |             |              |
-              v             v              v
-     [TTExecBackend]  [TTPagedKVAdapter]  [TTPagedMetadataBackend]
-       (registry)     ↓ P2a new ↓          ↓ P2a new ↓
-              |
-      ┌───────┴────────────────────┐
-      │                            │
-[tt_transformers_single (P1)]  [tt_transformers_paged (P2 default)]
-      │                            │
-      │                ┌───────────┴─────────────────┐
-      │                │                             │
-      │        [TenstorrentLlamaForCausalLM]   [TenstorrentQwenForCausalLM]
-      │        [TenstorrentMistralForCausalLM] [TenstorrentGptOssForCausalLM]
-      │                │                             │     (P2b)
-      │                v                             v
-      v        [ generator_sglang.py + page table fed externally ]
-[ Generator.prefill_         (upstream tt_transformers, read-only)
-   forward_single_user ]
+        ┌───────────────────────┴───────────────────────┐
+        │                                               │
+        │ SGLANG_TT_EXECUTION_BACKEND=                  │
+        │   tt_transformers_single                       │   tt_transformers_paged (default)
+        │                                               │
+        v                                               v
+[ TTTpModelWorker (P1, B=1) ]              [ Standard SGLang ModelRunner ]
+        │                                               │
+        v                                               v
+[ TTExecutionBackend ABC                  [ ModelRunner.model = TenstorrentLlamaForCausalLM ]
+   _do_new_request / _do_extend /            (registered via SGLang ModelRegistry; INV-6)
+   _do_decode_step / _do_reset_all ]         │
+        │                                    │   forward(input_ids, positions, forward_batch)
+        v                                    v
+[ Generator.prefill_forward_text /        [ tt_model.prefill_forward / decode_forward
+   decode_forward ]                          (LlamaForCausalLM from generator_sglang.py) ]
+        │                                    │
+        v                                    v
+[ tt_transformers (B=1, no RadixAttn) ]  [ tt_transformers (paged + Radix-capable) ]
 ```
 
-### 2.2 New modules in P2a (≈ 1900 lines added + ≈ 250 lines rewritten)
+**Two paths co-exist** via env var (G5a, INV-5). Left = P1 simple (T0.7 shipped). Right = plugin-based paged. **Plugin path is the default; simple path is the fallback** per §5.3c.
 
-All paths are relative to `python/sglang/srt/hardware_backend/tenstorrent/` (the P1 module root).
+### 2.2 New modules in P2a (AMENDED 2026-05-13 — ~500 LoC, down from ~1900)
+
+All paths are relative to `python/sglang/srt/hardware_backend/tenstorrent/`.
 
 | Path | Responsibility | Size |
 |---|---|---|
-| `execution/tt_transformers_paged_backend.py` | Concrete paged backend implementing the new ABC | ~400 |
-| `kv_pool/paged.py` | `TTPagedKVAdapter(PagedTokenToKVPoolAllocator)` + `TTBackedKVCache` wrapper | ~400 |
-| `attn_meta/tt_paged.py` | `TTPagedMetadataBackend` — translates SGLang batch metadata to ttnn page-table tensor (NOT a SGLang `AttentionBackend` subclass; see INV-1) | ~400 |
-| `models/llama_tt.py` | `TenstorrentLlamaForCausalLM` registered with SGLang model registry (separate arch namespace; see INV-6) | ~150 |
-| `execution/base.py` ABC + docstring | New `forward(forward_batch)` contract; INV-1..INV-7 invariants documented | +80 |
-| `platform.py` extension | Mesh-shape parametric, SIGQUIT handler (lands in P1.5) | +80 |
-| `tp_worker.py` extension | Batched forward + admission hook + cancel hook | +200 |
-| `execution/tt_transformers_backend.py` rewrite | P1 simple backend ported to new ABC; same single-user semantics, new signature | ~250 (rewrite) |
-| **P2a total** | | **~1900 new + ~250 rewrite** |
+| `models/__init__.py` | Plugin registration hook (calls SGLang `ModelRegistry.models.update(TT_MODEL_REGISTRY)` on import); namespace marker for INV-6. | ~30 |
+| `models/tt_llm.py` | **Adapted from Tenstorrent's `tt-sglang-plugin/sglang_tt_plugin/models/tt_llm.py`**. `TenstorrentLlamaForCausalLM` etc. (4 model families). Same forward logic (`_build_page_table`, `_flatten_to_padded`, `_pad_decode_batch`) and `allocate_on_device`. Class renamed per INV-6. | ~300 |
+| `models/worker_setup.py` | **Adapted from plugin's `worker_setup/worker_setup.py`**. Worker process env setup (`TT_METAL_CACHE`, `TT_CACHE_PATH`, `_DP\d+` parsing). | ~80 |
+| `models/tt_utils.py` | **Adapted from plugin's `utils/tt_utils.py`**. `BaseMetalDeviceRunner` for mesh device open + fabric config. Includes Blackhole branch (`ttnn.device.is_blackhole()`). | ~150 |
+| `platform.py` extension | Wire `TenstorrentLlamaForCausalLM` model registration on platform activate; mesh-shape parametric. | +30 |
+| **Preserved from T0.6/T0.7** (P1 simple path, dual-track fallback): | |
+| `execution/base.py` | TTExecutionBackend ABC (`_do_*` private methods); now scoped to `tt_transformers_single` only. INV-1 amended to scope to simple path. | (shipped) |
+| `execution/tt_transformers_backend.py` | P1 simple backend + new ABC wiring (T0.7 shipped). Used only when env var = `tt_transformers_single`. | (shipped) |
+| **P2a NEW total** | | **~590 LoC new + 4 files preserved as simple fallback** |
 
-**Cross-module patches (in our fork only, per N9 — not upstream PRs)**:
-- `python/sglang/srt/managers/scheduler.py` (and/or `python/sglang/srt/managers/utils.py` where `GenerationBatchResult` is defined) — add `bypass_chunked_req: bool = False` field; scheduler reads it post-forward to clear `self.chunked_req`. See §3.7. Risk R6 tracks rebase cost.
+**Cancelled from pre-amendment plan**:
+- ~~`execution/tt_transformers_paged_backend.py`~~ — plugin's `TTModels.forward()` replaces this
+- ~~`kv_pool/paged.py` `TTPagedKVAdapter` + `TTBackedKVCache`~~ — plugin uses tt_transformers' own `allocate_kv_cache`, SGLang's default allocator owns indices (INV-2 amended)
+- ~~`attn_meta/tt_paged.py` `TTPagedMetadataBackend`~~ — page-table math inlined in plugin's `_build_page_table`
+- ~~`tp_worker.py` paged extensions~~ — plugin uses standard `ModelRunner.forward()`; only the simple-backend worker remains specialized
+
+**Cross-module patches (still in our fork only, per N9)**:
+- `python/sglang/srt/managers/scheduler.py` / `utils.py` for `GenerationBatchResult.bypass_chunked_req` — still required for chunked-prefill failure recovery (§3.7). Plugin doesn't address chunked-prefill failure; this is OUR contribution on top.
 
 ### 2.3 New modules in P2b (≈ 1500 lines)
 
@@ -491,16 +508,19 @@ If any Q1-Q9 answer **violates** an INV-1 through INV-7 invariant from §2.4, im
 
 Implementation MUST NOT silently mutate §2 architecture to accommodate a discovery — that's spec-level, not plan-level.
 
-### 5.3 Migration timeline
+### 5.3 Migration timeline (AMENDED 2026-05-13 — was 10 weeks, now 4)
 
 ```
-Week  : 1   2   3   4   5   6   7   8   9   10
+Week  : 1   2   3   4
 P1.5  : ████
-P2a   :     ████████████████████              (5 weeks = 4 + 1 buffer, W2-W6)
-P2b   :                         ████████████   (W7-W10)
+P2a   :     ████████          (~2 weeks: plugin port + Blackhole verify + RadixAttention probe + §9-min acceptance)
+P2b   :              ████      (~1 week: per-model max_seq_len matrix + Llama 32K stress; NO 128K chunked-prefill — pushed to P3)
+P3    :                    ████ (P3 starts here — see §A2 for scope)
 ```
 
-> **Banner assumes W6 decision-gate pass (§5.3b).** If first-fail at W6, W7-W8 convert to fix loop and P2b shifts right by 2 weeks. If second-fail at W9, P2b downgrades to best-effort (no §9.b acceptance), §1 G1b-G5b drop out of acceptance.
+> **Acceleration rationale**: plugin absorption removed ~1900 LoC of planned implementation work (entire Phase 1 of original plan deleted: TTPagedKVAdapter, TTBackedKVCache, TTPagedMetadataBackend). Plugin also pre-solves multi-model (G1b/G2b) and mesh-shape parametric (G6a). What's left in P2 is verification + dual-track + RadixAttention probe — work that fits in ~3 weeks total (P2a + P2b).
+
+> **Banner assumes Blackhole + plugin work**: if plugin's untested Blackhole branches in `tt_utils.py` need patching, P2a slips by 1 week (still under 5w original budget). If RadixAttention is dead-on-arrival with plugin's KV layout, G4a downgrades to "documented infeasibility, deferred to P3" rather than blocking P2a.
 
 **P1.5 merge order**: P1.5 must be **fully merged** (all 4 logical changes landed on `main`, regardless of squash topology) before P2a branches off the post-merge SHA. P2a MUST NOT start while any P1.5 change is in-flight (avoids 4-way rebase race).
 
@@ -605,3 +625,74 @@ Spec went through 4 rounds of subagent-driven review during brainstorming:
 
 **P1 module root for new files in this spec**
 - All `tenstorrent/...` paths in §2.2/§2.3/§5.3c are relative to `python/sglang/srt/hardware_backend/tenstorrent/` (P1 convention)
+
+**Tenstorrent plugin source (P2a absorption base, 2026-05-13)**
+- Upstream: [`tenstorrent/tt-inference-server`](https://github.com/tenstorrent/tt-inference-server) — repo cloned at `/home/mhnie/tt-inference-server/`
+- Plugin subdir: `tt-sglang-plugin/` (~500 LoC across 5 files)
+- License: SPDX `Apache-2.0`, © 2026 Tenstorrent USA, Inc. — our adapted copy MUST preserve SPDX header per N9 fork-only policy.
+
+**Built tt-metal image (P2a runtime, 2026-05-13)**
+- Tag: `localhost/local-tt-metal:dev` — image ID sha256:`973e972bddf5` (built from tt-metal commit `89686ee7`, "UMD Bump 2026-05-12", verified mesh-open + tt_transformers import + `generator_sglang.LlamaForCausalLM` import working against host KMD 2.8.0 / FW 19.6.0).
+- Build context: `/home/mhnie/tt-metal/` (~547 MB clone) with `dockerfile/Dockerfile --target release-models --build-arg GIT_REF=89686ee7`. ~30 min build on AMD Ryzen 9 9900X 24-thread.
+- Replaces both earlier image pins (which had UMD < FW mismatch).
+
+---
+
+## A2. Amendment Notes — 2026-05-13 (plugin pivot + P2 minimization)
+
+### A2.1 What changed and why
+
+After ~14 commits of P2a Phase-0 work landing the new TTExecutionBackend ABC, P1 simple-backend port, and Phase-0 signature/Q-answer evidence, we discovered Tenstorrent's `tt-inference-server/tt-sglang-plugin` (~500 LoC) which implements the **same integration objective via SGLang's standard model-registration pattern** rather than our planned custom ABC. The plugin already uses `generator_sglang.py`'s SGLang-flavored wrapper (`LlamaForCausalLM.initialize_sglang_model` + `prefill_forward` + `decode_forward` + `allocate_kv_cache`) and covers all 4 target model families (Llama / Qwen / Mistral / GptOss).
+
+### A2.2 INV deltas
+
+| Invariant | Pre-amendment | Post-amendment | Reason |
+|---|---|---|---|
+| INV-1 | `TTExecutionBackend.forward(forward_batch) → LogitsProcessorOutput` is model-level | **Scoped to `tt_transformers_single` fallback only.** Plugin path uses `TenstorrentLlamaForCausalLM(nn.Module).forward(input_ids, positions, forward_batch)` (standard SGLang model signature). | Plugin uses ModelRegistry path, not a custom ABC. T0.6 ABC retained as simple-path contract. |
+| INV-2 | `TTPagedKVAdapter` subclasses `PagedTokenToKVPoolAllocator` with `device=cpu` | **Removed.** SGLang's default allocator owns slot indices; `tt_transformers.allocate_kv_cache(num_blocks,...)` owns KV bytes on device; mapping is `block_id = index // block_size`. | Plugin's simpler "co-indexed" model. Drops ~600 LoC of planned adapter work. |
+| INV-3 | `page_table` int32, block IDs from `// block_size` | **Preserved verbatim** — plugin's `_build_page_table` does exactly this. | No change. |
+| INV-4 | SGLang owns page table | **Amended.** SGLang owns the slot-index space → page-table block IDs derived; tt_transformers receives `page_table` + `kv_cache` externally per forward call. | Spirit preserved; ownership boundary clarified. |
+| INV-5 / INV-6 / INV-7 | Backend switch via env var / `Tenstorrent*` namespace / mesh-shape parametric | **All preserved.** Plugin uses model-registry namespace patching which is compatible with INV-6. | No change. |
+
+### A2.3 Scope cut from P2 (moved to P3 or dropped)
+
+The following items, originally planned for P2a, are **moved to P3**:
+
+- **128K chunked-prefill on Llama** (was G4b) — P2b drops to "8K-32K baseline" only; long-context is a P3 stress goal
+- **P300 chunk-size table** (was G5b) — plugin's `_get_max_tokens_for_hardware` is a starting point; per-model empirical tuning is P3
+- **HiRadixCache** — P3
+- **Disaggregation** — P3
+- **Speculative decoding** — P3
+- **LoRA / multi-LoRA** — P3
+- **BF16-throughout precision** — P3 (plugin defaults to BFP8)
+- **Multimodal** — P3 (plugin doesn't address; would need `generator_vllm.py`-style vision path)
+- **tt-xla backend** — P3 (fallback for models outside `tt_transformers` coverage)
+- **Performance kernel-level tuning** — P3 (plugin is functional baseline; P3 optimizes)
+
+### A2.4 What stays in P2 (the minimum that justifies a Phase 2 at all)
+
+1. **Plugin port + Blackhole validation** — G1a, G2a, G3a, G8a. The plugin has never run on Blackhole; we are the first.
+2. **Dual-track preservation** — G5a. P1 simple backend remains live as `tt_transformers_single`. No production should ever lose its fallback.
+3. **RadixAttention probe** — G4a. Plugin admits non-validation; our measurement establishes whether SGLang prefix caching meaningfully accelerates TT inference. Result either way is valuable input to P3.
+4. **§9 acceptance gates (minimum set)** — §9.1, §9.2, §9.3, §9.4, §9.5, §9.6, §9.7 (stability), §9.8 (dual-track), §9.10 (perf log baseline). §9.9 mesh-shape, §9.11 eviction-replay, §9.12.a-e chunked-failure, §9.13 teardown, §9.14 token-pool overflow lint — **all KEPT** as they validate plugin behavior we depend on. §9.15 / §9.16 — **dropped** (no `TTPagedKVAdapter` to validate).
+5. **Per-model smoke** (P2b) — G1b, G2b registration of Qwen / Mistral / GptOss; verify each one boots and emits coherent output. No 128K stress.
+
+### A2.5 P3 scope (greatly expanded)
+
+P3 inherits everything cut from P2 plus its original scope:
+
+- 128K chunked-prefill on Llama (was P2b G4b)
+- P300 chunk-size empirical table (was P2b G5b)
+- Speculative decoding integration with SGLang
+- LoRA + Multi-LoRA serving
+- BF16-throughout precision (vs BFP8 default)
+- Multimodal inference (vision text models)
+- HiRadixCache + disaggregation explorations
+- tt-xla backend (model-coverage extension beyond `tt_transformers`)
+- Performance kernel-level tuning (overlap, fuse, batched parallelism)
+- 4× p150a hardware validation (plugin code has stubs, untested)
+- Galaxy mesh shape (`8,4`) — plugin claims support but untested
+- Long-running stability (24h+) under sustained load
+- Production observability (Prometheus dashboards, alerting, queue depth tracking)
+
+P3 is now the **innovation phase** rather than P2 being it. P2 is plumbing-verification.
