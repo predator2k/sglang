@@ -1,0 +1,102 @@
+P3a.1 T1.3 — NGRAM smoke launch attempt + design gap surfaced
+Captured: 2026-05-13
+Hardware: 2× Tenstorrent Blackhole p150a
+Image: localhost/local-tt-metal:dev (sha256:973e972bddf5), tt-metal commit 89686ee7
+Model: /models/Llama-3.1-8B-Instruct
+Branch: tenstorrent-p1
+
+================================================================
+Server-side patches landed in this attempt
+================================================================
+
+1. `python/sglang/srt/server_args.py:3753-3762` — NGRAM CUDA-gate widened
+   to allow `current_platform.device_name == "tenstorrent"`. SGLang main
+   hard-raised `ValueError("Ngram speculative decoding only supports CUDA
+   device.")` before this. Tracked in REBASE_TARGETS.md (P3a.1 T1.3).
+
+2. `python/sglang/srt/speculative/ngram_worker.py:6` — `sgl_kernel.speculative
+   .reconstruct_indices_from_tree_mask` import made soft with a pure-Python
+   CPU fallback. The CUDA kernel is in `sgl-kernel/csrc/speculative/
+   ngram_utils.cu`; our fallback is a direct line-by-line port. Flattens
+   the `[bs, draft_token_num]`-shaped `retrieve_index` / `retrieve_next_*`
+   tensors via `.view(-1)` so the linear-offset writes from the CUDA
+   kernel match. Tracked in REBASE_TARGETS.md.
+
+3. `/tmp/launch_paged.py` (in-container wrapper) — gained an explicit
+   `if __name__ == "__main__":` guard around `run_server(...)`. SGLang's
+   `engine.py:1244` does `mp.set_start_method("spawn", force=True)`
+   regardless of the parent's choice; under spawn-mode children re-import
+   the entry script, and without the guard recurse infinitely. NGRAM's
+   extra spec-worker subprocess hit this; the SGLang base server alone
+   did not.
+
+4. Launched server flags relaxed for non-flashinfer paged path:
+   `--speculative-ngram-max-bfs-breadth 1`. Default 10 trips the
+   `speculative_eagle_topk > 1 with page_size > 1` flashinfer-only gate
+   (server_args.py:3744). breadth=1 bypasses it.
+
+================================================================
+Crash signature: NGRAM verify shape mismatch (DESIGN GAP)
+================================================================
+After all the above patches land and the SGLang server boots through
+tt_transformers warmup successfully, the first speculative-verify batch
+crashes with:
+
+  File "/sglang/python/sglang/srt/speculative/ngram_info.py", line 292
+      target_predict = target_predict.reshape(bs, self.draft_token_num)
+  RuntimeError: shape '[1, 12]' is invalid for input of size 1
+
+Root cause: `TenstorrentLlamaForCausalLM._call_prefill_for_verify`
+(models/tt_llm.py:226) currently returns `LogitsProcessorOutput(
+next_token_logits=logits.squeeze(1))` where `logits` has shape `[bs, 1,
+vocab]` — i.e. one logit row per request (the last-token-only output
+that tt_transformers `prefill_forward` produces). NGRAM verify expects
+`[bs * draft_token_num, vocab]` — one logit row per *draft token*.
+
+This is a real implementation gap in the plugin path's verify flow that
+the P3a.1 T1.2 SpecDecodeAdapter skeleton sketched but did not fully
+implement.
+
+================================================================
+What's needed for proper NGRAM verify on tt_transformers
+================================================================
+`_call_prefill_for_verify` must return per-draft-position logits. The
+options:
+
+A. **Use Generator.prefill_forward_single_user_text directly**, pass
+   `get_last_token_idx = (draft_seq_len - 1)` (snapped to the last
+   32-token block boundary, which already covers the full 12 draft
+   tokens since 12 ≤ 32). The kernel returns a 32-token-block of
+   logits; we slice positions `[0, draft_seq_len)` from it and stack
+   into `[bs, draft_token_num, vocab]`.
+
+B. **Call decode_forward 12 times sequentially per draft.** Simpler
+   API but ~12× slower than option A.
+
+C. **A custom forward branch in tt_transformers** that returns
+   per-position logits. Cleaner but requires upstream changes.
+
+Option A is the right design target for P3a.1 T1.2 v2.
+
+================================================================
+P3a.1 status
+================================================================
+- T1.1 — SpecDecodeAdapter skeleton + routing tests: DONE (commit
+  a9fa85be1).
+- T1.2 — tt_llm.py forward() spec_info branch + _call_prefill_for_verify
+  STUB: DONE (commit 8d8542f3e). Needs **T1.2 v2** to return per-draft
+  logits via option A above.
+- T1.3 — NGRAM smoke: BLOCKED on T1.2 v2. All server-side patches
+  landed; integration not yet runnable on hardware.
+- T1.4/T1.5/T1.6 — pending T1.3.
+
+R-P3-3 status: server-side device-agnosticism patches all landed
+(ngram_worker.py, eagle_info.py, multi_layer_eagle_worker_v2.py,
+spec_utils.py, server_args.py, sgl_kernel cpu fallback).
+
+================================================================
+Operational note
+================================================================
+Each NGRAM scheduler crash leaves the tt-metal mesh in a recoverable
+state (no ETH wedge observed today after the KMD reload). The crashes
+were all clean Python tracebacks → SIGQUIT, not C++ aborts.

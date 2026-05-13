@@ -69,3 +69,4 @@ Local patch files at `python/sglang/srt/hardware_backend/tenstorrent/scripts/tt_
 | `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` | 325 | multi-layer EAGLE device dispatch | 2026-05-13 (P3a.0 T0.2) |
 | `python/sglang/srt/speculative/spec_utils.py` | 587 | sim_accept_index device dispatch | 2026-05-13 (P3a.0 T0.2) |
 | `python/sglang/srt/server_args.py` | 3753-3762 | NGRAM CUDA-gate widened to allow `current_platform.device_name == "tenstorrent"` | 2026-05-13 (P3a.1 T1.3) |
+| `python/sglang/srt/speculative/ngram_worker.py` | 6 | `sgl_kernel.speculative.reconstruct_indices_from_tree_mask` import made soft with pure-Python CPU fallback (port of `csrc/speculative/ngram_utils.cu`) | 2026-05-13 (P3a.1 T1.3) |

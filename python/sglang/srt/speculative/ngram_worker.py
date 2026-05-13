@@ -3,7 +3,67 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+try:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+except (ImportError, ModuleNotFoundError):
+    # CPU/Tenstorrent fallback — port of csrc/speculative/ngram_utils.cu
+    def reconstruct_indices_from_tree_mask(
+        tree_mask: torch.Tensor,
+        verified_seq_len: torch.Tensor,
+        positions: torch.Tensor,
+        retrive_index: torch.Tensor,
+        retrive_next_token: torch.Tensor,
+        retrive_next_sibling: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+    ) -> None:
+        # CUDA kernel addresses these via linear offsets into the underlying
+        # buffer; flatten the (bs, dn)-shaped views so [.] indexing matches.
+        base_offset = draft_token_num * draft_token_num
+        tm = tree_mask.view(-1).to(torch.bool)
+        vsl = verified_seq_len.view(-1).to(torch.int64)
+        ri = retrive_index.view(-1)
+        rnt = retrive_next_token.view(-1)
+        rns = retrive_next_sibling.view(-1)
+        pos = positions.view(-1)
+        for bid in range(batch_size):
+            token_idx = bid * draft_token_num
+            tm_off = bid * base_offset
+            vsl_bid = int(vsl[bid].item())
+            for tid in range(draft_token_num):
+                depth = 0
+                parent_idx = -1
+                row_start = tm_off + tid * draft_token_num
+                for i in range(tid - 1, -1, -1):
+                    if bool(tm[row_start + i].item()):
+                        depth += 1
+                        if parent_idx == -1:
+                            parent_idx = i
+                ri[token_idx + tid] = token_idx + tid
+                pos[token_idx + tid] = depth + vsl_bid
+                next_token_idx = -1
+                for i in range(tid + 1, draft_token_num):
+                    if bool(tm[tm_off + i * draft_token_num + tid].item()):
+                        next_token_idx = i
+                        break
+                rnt[token_idx + tid] = next_token_idx
+                next_sibling_idx = -1
+                if parent_idx != -1:
+                    for i in range(tid + 1, draft_token_num):
+                        i_row_start = tm_off + i * draft_token_num
+                        if not bool(tm[i_row_start + parent_idx].item()):
+                            continue
+                        is_sibling = True
+                        end_idx = i_row_start + i
+                        for j in range(i_row_start + parent_idx + 1, end_idx):
+                            if bool(tm[j].item()):
+                                is_sibling = False
+                                break
+                        if is_sibling:
+                            next_sibling_idx = i
+                            break
+                rns[token_idx + tid] = next_sibling_idx
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.platforms import current_platform
