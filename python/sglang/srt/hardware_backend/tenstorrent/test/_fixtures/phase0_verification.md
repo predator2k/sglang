@@ -183,3 +183,77 @@ CPU unit tests deferred (host env, same constraint as Phase 0; AST-confirmed val
 Dual-track code integrity confirmed by inspection.
 
 → **P2a.1 ACCEPTED — proceed to P2a.2**
+
+---
+
+# P2a.2 Verification Report
+
+Date: 2026-05-12
+Branch: tenstorrent-p1 (commits 96592b7c2..4271b4d25 — T2.1, T2.2, T2.3)
+Container: `p2a-smoke` (same image as P2a.1 — `local-tt-metal:dev`, sha256:`973e972bddf5`)
+Hardware: 2× Tenstorrent Blackhole p150a (mesh active, server at http://localhost:30000)
+
+## T2.1: bypass_chunked_req upstream-class patch — PASS (code-level)
+
+**Commit:** `96592b7c2`
+**Deliverable:** `bypass_chunked_req` patch applied to the upstream `Scheduler` class so that chunked-prefill state is cleared after a backend failure.  The patch wraps the scheduler's `_handle_chunked_req` call site with a guard that resets `self.chunked_req = None` when `req._last_chunked_failure` is set.
+
+Verified by code inspection and end-to-end server run (5 K + 5 K translation prompt pair completing without hang on the paged path).
+
+## T2.2: §9.12.a-e chunked-failure 5-step handler + 5 unit tests — PASS (CPU-only)
+
+**Commit:** `295f40c67`
+**Deliverable:** `TTModels.on_chunked_prefill_failure()` implements all five recovery steps from §9.12:
+
+| Sub-step | Assertion | Result |
+|---|---|---|
+| §9.12.a | `allocator.free(out_cache_loc_this_chunk)` called with exact slot list | PASS |
+| §9.12.b | `req_to_token[pool_idx, start:end]` zeroed in failed-chunk range | PASS |
+| §9.12.c | `req.skip_radix_cache_insert` set to `True` | PASS |
+| §9.12.d | `req.set_finish_with_abort("tt_backend_chunked_prefill_failure")` called | PASS |
+| §9.12.e | `self._last_chunked_failure` sentinel set to `True` after `forward()` catches exception | PASS |
+
+All 5 tests in `test_chunked_failure_recovery.py` passed inside the container (CPU-only, no hardware required).
+
+**Note:** Tests use `types.ModuleType` stubs injected at module-import time.  A cross-test isolation bug was discovered and fixed in this verification run: when `test_chunked_failure_recovery.py` and `test_plugin_registration.py` are collected in the same pytest process, the stub modules installed by the former would shadow the real `sglang.srt.hardware_backend.tenstorrent.models` package, causing `ImportError` in the latter.
+
+**Fix applied (two-file):**
+- `test_chunked_failure_recovery.py`: added `_ensure_real_parent_packages()` (called before `_install_stubs()`) to pre-populate `sglang`, `sglang.srt`, `sglang.srt.hardware_backend`, `sglang.srt.hardware_backend.tenstorrent` in `sys.modules` with real-path module objects, preventing `_make_pkg` from inserting `__path__=[]` stubs for those parents.  Also added `_remove_stubs_after_module` autouse module fixture for post-test cleanup.
+- `test_plugin_registration.py`: added `_evict_stubs` autouse fixture that removes any `__spec__ is None` stub modules from `_CHUNKED_RECOVERY_STUBS` before each test, ensuring the real package is resolved from disk.
+
+## T2.3: §9.6 abort (endpoint + disconnect) + §9.5 queue-full — PASS/SKIP (hardware-verified)
+
+**Commit:** `4271b4d25`
+
+| Test | File | Result |
+|---|---|---|
+| §9.6 abort via endpoint | `test_abort_via_endpoint.py::test_abort_via_endpoint_reclaims_kv` | **PASS** |
+| §9.6 abort via disconnect | `test_abort_via_disconnect.py::test_abort_via_disconnect_reclaims_kv` | **PASS** |
+| §9.5 queue-full admission | `test_queue_full_admission.py::test_queue_full_returns_abort` | **SKIP** (fixture deferred) |
+
+Both abort tests hit the live server on Blackhole hardware and verify that KV-pool tokens are reclaimed after request abort.  Queue-full (`§9.5`) is skipped awaiting a saturating-load fixture; deferral is by design per plan.
+
+## P2a.1 Regression — PASS (all prior tests still green)
+
+Full regression run covering all 7 test files in a single pytest invocation:
+
+```
+pytest test_plugin_registration.py test_chunked_failure_recovery.py \
+       test_smoke_paged.py test_greedy_correctness_paged.py \
+       test_queue_full_admission.py test_abort_via_endpoint.py \
+       test_abort_via_disconnect.py -v
+```
+
+Result: **11 passed, 1 skipped, 0 failed** (1 skip = §9.5 queue-full, as expected).
+
+P2a.1 tests (`test_plugin_registration`, `test_smoke_paged`, `test_greedy_correctness_paged`) all remain green; no regression introduced by T2.1–T2.3 changes.
+
+## Decision
+
+- §9.5 (queue-full): SKIPPED — deferred, fixture not yet available. Not a blocking failure.
+- §9.6 (abort endpoint + disconnect): PASS on Blackhole hardware.
+- §9.12.a-e (chunked-failure recovery): PASS (CPU unit tests, 5/5).
+- P2a.1 regression: PASS (no regressions).
+- Cross-test isolation bug fixed and verified in this run.
+
+→ **P2a.2 ACCEPTED — proceed to P2a.3**
