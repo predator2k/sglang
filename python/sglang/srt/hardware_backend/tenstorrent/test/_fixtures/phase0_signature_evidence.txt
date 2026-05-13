@@ -1,4 +1,4 @@
-P2a Phase 0 — Signature Evidence (locked at commit 37f00f020e298e0a956f09b0ead74986527f6ddb)
+P2a Phase 0 — Signature Evidence (tenstorrent-p1 branch HEAD at lock time: 37f00f020e298e0a956f09b0ead74986527f6ddb)
 Image SHA: sha256:40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c
 Captured: 2026-05-12
 
@@ -57,7 +57,7 @@ paged_attention_config in create_tt_model source: True
         tokens: torch.Tensor,  # All tokens, including the cached ones
         page_table=None,
         kv_cache=None,
-        ...
+        ...  # trimmed for length
     ):
         ...
         batch_size, batch_seq_len = tokens.shape
@@ -89,9 +89,5 @@ Q5: paged_attention_config in create_tt_model? = True
       paged_attention_config: models.tt_transformers.tt.common.PagedAttentionConfig = None
 
     INV-4 status: SATISFIED
-      Rationale: paged_attention_config defaults to None and can be omitted.
-      Both prefill_forward_text and decode_forward accept page_table= and kv_cache=
-      as external keyword arguments (also defaulting to None), meaning SGLang can
-      supply externally-managed page tables without forcing internal paged_attention_config
-      allocation. The escape hatch (pass page_table from our pool, skip
-      paged_attention_config) is live and confirmed working at the API surface.
+      paged_attention_config defaults to None (omittable); prefill_forward_text and
+      decode_forward each expose page_table= and kv_cache= kwargs also defaulting to None.
