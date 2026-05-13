@@ -3751,7 +3751,12 @@ class ServerArgs:
                 )
 
         if self.speculative_algorithm == "NGRAM":
-            if not self.device.startswith("cuda"):
+            from sglang.srt.platforms import current_platform
+
+            if not (
+                self.device.startswith("cuda")
+                or current_platform.device_name == "tenstorrent"
+            ):
                 raise ValueError(
                     "Ngram speculative decoding only supports CUDA device."
                 )
