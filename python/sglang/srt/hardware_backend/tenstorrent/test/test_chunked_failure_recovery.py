@@ -149,6 +149,22 @@ def _install_stubs():
         "models",
     )
 
+    # spec_decode — P3a.1 T1.2: TTModels.__init__ now imports SpecDecodeAdapter.
+    # Load the real module directly from its file so the real class is available
+    # both here (for the stub import path) and in test_spec_decode_routing.py.
+    # spec_decode.py has only TYPE_CHECKING imports so it is safe to load on CPU.
+    sd_path = "sglang.srt.hardware_backend.tenstorrent.models.spec_decode"
+    if sd_path not in sys.modules:
+        import importlib.util as _ilu
+        import pathlib as _pl
+        _sd_file = _pl.Path(__file__).parent.parent / "models" / "spec_decode.py"
+        _sd_spec = _ilu.spec_from_file_location(sd_path, str(_sd_file))
+        _sd_mod = _ilu.module_from_spec(_sd_spec)
+        _sd_mod.__package__ = "sglang.srt.hardware_backend.tenstorrent.models"
+        sys.modules[sd_path] = _sd_mod
+        _sd_spec.loader.exec_module(_sd_mod)
+        added_keys.add(sd_path)
+
     return added_keys
 
 
@@ -170,6 +186,33 @@ def _remove_stubs_after_module():
     # Also evict the dynamically loaded tt_llm stub so it doesn't shadow the
     # real module in later tests.
     sys.modules.pop("sglang.srt.hardware_backend.tenstorrent.models.tt_llm", None)
+
+
+@pytest.fixture(autouse=True)
+def _ensure_logits_processor_stub():
+    """Re-install the logits_processor stub before each test if it was evicted.
+
+    test_plugin_registration.py's _evict_stubs fixture removes the lightweight
+    sglang.srt.layers.logits_processor stub so it can load the real module.
+    If that file runs before this one (in the same process), the real (broken or
+    absent) module ends up in sys.modules.  Reinstall our stub unconditionally
+    before each test here so TTModels.forward()'s lazy import always resolves.
+
+    We only skip reinstall when the stub we installed earlier is already in place
+    (identified by __spec__ = None, the fingerprint of a bare types.ModuleType).
+    """
+    lp_key = "sglang.srt.layers.logits_processor"
+    existing = sys.modules.get(lp_key)
+    is_our_stub = existing is not None and getattr(existing, "__spec__", "sentinel") is None
+    if not is_our_stub:
+        class _LogitsProcessorOutput:
+            def __init__(self, next_token_logits=None, **kw):
+                self.next_token_logits = next_token_logits
+        stub = types.ModuleType(lp_key)
+        stub.__spec__ = None
+        stub.LogitsProcessorOutput = _LogitsProcessorOutput
+        sys.modules[lp_key] = stub
+    yield
 
 # Now we can safely import TTModels from tt_llm via importlib.
 # Because tt_llm.py uses relative imports (from .tt_utils import …) we must
@@ -229,6 +272,10 @@ def _make_req(*, prefix_len: int = 4, fill_len: int = 6, pool_idx: int = 2):
 def _make_forward_batch(*, req, chunk_len: int = 3, is_extend: bool = True):
     """Build a minimal mock ForwardBatch for a chunked-prefill scenario."""
     fb = MagicMock()
+
+    # P3a.1 T1.2: spec_info=None marks a standard (non-verify) batch so forward()
+    # takes the normal EXTEND/DECODE path instead of the spec_info early-exit branch.
+    fb.spec_info = None
 
     # forward_mode
     fb.forward_mode.is_extend.return_value = is_extend

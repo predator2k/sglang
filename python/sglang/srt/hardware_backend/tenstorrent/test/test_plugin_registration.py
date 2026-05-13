@@ -18,6 +18,7 @@ _CHUNKED_RECOVERY_STUBS = [
     "sglang.srt.hardware_backend.tenstorrent.models.tt_llm",
     "sglang.srt.hardware_backend.tenstorrent.models.tt_utils",
     "sglang.srt.hardware_backend.tenstorrent.models.worker_setup",
+    "sglang.srt.hardware_backend.tenstorrent.models.spec_decode",  # P3a.1 T1.2
     "sglang.srt.hardware_backend.tenstorrent",
     "sglang.srt.hardware_backend",
     "sglang.srt",
