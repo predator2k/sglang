@@ -41,10 +41,10 @@ def warm_decode_shape(
         extra={"shape": (1, 1), "prompt_len": prompt_len},
     )
     t0 = time.time()
-    wrapper.new_request(_WARMUP_REQ_ID, prompt_tokens=[dummy_token] * prompt_len)
+    wrapper._do_new_request(_WARMUP_REQ_ID, prompt_tokens=[dummy_token] * prompt_len)
     try:
-        wrapper.extend(_WARMUP_REQ_ID)
-        wrapper.decode_step(_WARMUP_REQ_ID, dummy_token)
+        wrapper._do_extend(_WARMUP_REQ_ID)
+        wrapper._do_decode_step(_WARMUP_REQ_ID, dummy_token)
     finally:
-        wrapper.free(_WARMUP_REQ_ID)
+        wrapper._do_free(_WARMUP_REQ_ID)
     logger.info("warmup_done", extra={"elapsed_s": time.time() - t0})
