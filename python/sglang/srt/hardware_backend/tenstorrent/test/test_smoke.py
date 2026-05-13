@@ -27,6 +27,8 @@ REQUIRES_TT = pytest.mark.skipif(
     reason="Requires Tenstorrent hardware and a live sglang server on :30000",
 )
 
+pytestmark = [pytest.mark.simple_backend, pytest.mark.hardware]
+
 
 def _post(path: str, payload: dict, timeout: int = 60) -> dict:
     req = urllib.request.Request(

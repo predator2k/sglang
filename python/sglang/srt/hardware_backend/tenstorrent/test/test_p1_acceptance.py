@@ -23,6 +23,8 @@ import subprocess
 
 import pytest
 
+pytestmark = [pytest.mark.simple_backend, pytest.mark.hardware]
+
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

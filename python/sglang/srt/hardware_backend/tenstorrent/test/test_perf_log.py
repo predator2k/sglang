@@ -30,6 +30,8 @@ REQUIRES_TT = pytest.mark.skipif(
     reason="Requires Tenstorrent hardware and a live sglang server on :30000",
 )
 
+pytestmark = [pytest.mark.simple_backend, pytest.mark.hardware]
+
 
 def _build_prompt(target_tokens: int) -> str:
     """Build a prompt of approximately `target_tokens` tokens by repeating

@@ -40,6 +40,8 @@ REQUIRES_TT = pytest.mark.skipif(
     reason="Requires Tenstorrent hardware and a live sglang server on :30000",
 )
 
+pytestmark = [pytest.mark.simple_backend, pytest.mark.hardware]
+
 # Default to 15 minutes; override with TT_STABILITY_DURATION_S=3600 for
 # spec-exact 1 hour. Below 600 seconds the windows overlap and metrics
 # become noisy.

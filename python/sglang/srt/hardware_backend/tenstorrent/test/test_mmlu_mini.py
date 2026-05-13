@@ -28,6 +28,8 @@ REQUIRES_TT = pytest.mark.skipif(
     reason="Requires Tenstorrent hardware and a live sglang server on :30000",
 )
 
+pytestmark = [pytest.mark.simple_backend, pytest.mark.hardware]
+
 
 # 10 MMLU-style questions, mix of STEM + humanities + reasoning.
 # Each tuple: (subject, question, choices A-D, correct_letter)

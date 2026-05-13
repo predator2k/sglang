@@ -39,6 +39,8 @@ REQUIRES_TT = pytest.mark.skipif(
     reason="Requires Tenstorrent hardware and a live sglang server on :30000",
 )
 
+pytestmark = [pytest.mark.simple_backend, pytest.mark.hardware]
+
 _FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "_fixtures", "llama31_greedy_50tok.json"
 )
