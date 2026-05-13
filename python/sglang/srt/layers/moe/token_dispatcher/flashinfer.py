@@ -33,7 +33,9 @@ try:
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
-except ImportError:
+except (ImportError, AssertionError):
+    # AssertionError is raised by flashinfer.comm.cuda_ipc.CudaRTLibrary() when
+    # libcudart is not loaded (non-CUDA hosts such as Tenstorrent targets).
     use_flashinfer = False
 
 logger = logging.getLogger(__name__)
