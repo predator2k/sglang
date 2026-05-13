@@ -133,3 +133,5 @@ Evidence: memory_pool.py:148-149 — `self.req_to_token = torch.zeros(..., dtype
   generator.py prefill_forward_text line 17: `assert isinstance(page_table, torch.Tensor)` — no upstream dtype assertion; no `.to(int32)` in decode_forward either.
 
 Implication: TTPagedMetadataBackend MUST call `.to(torch.int32)` if upstream is int64.
+
+Q9 answer: 15 unique call sites in {attention-backend, allocator, radix_cache}; TODO list of 7 shim methods in q9_call_site_inventory.csv

@@ -1,0 +1,58 @@
+file,line,expression,kind,hits_TTBackedKVCache,mitigation_if_N
+python/sglang/srt/mem_cache/allocator.py,171,self._kvcache.get_cpu_copy(indices),read,Y,
+python/sglang/srt/mem_cache/allocator.py,175,self._kvcache.load_cpu_copy(kv_cache_cpu, indices),write,Y,
+python/sglang/srt/mem_cache/radix_cache.py,286,self.token_to_kv_pool_allocator.device,read,Y,
+python/sglang/srt/mem_cache/radix_cache.py,449,self.token_to_kv_pool_allocator.free(kv_indices),write,Y,
+python/sglang/srt/mem_cache/radix_cache.py,470,self.token_to_kv_pool_allocator.free(kv_indices[...prefix_len]),write,Y,
+python/sglang/srt/mem_cache/radix_cache.py,474,self.token_to_kv_pool_allocator.free(kv_indices[...key_len]),write,Y,
+python/sglang/srt/mem_cache/radix_cache.py,479,self.token_to_kv_pool_allocator.free(kv_indices[key_len:]),write,Y,
+python/sglang/srt/mem_cache/radix_cache.py,511,self.token_to_kv_pool_allocator.free(kv_indices[...new_prefix_len]),write,Y,
+python/sglang/srt/mem_cache/radix_cache.py,574,self.token_to_kv_pool_allocator.free(x.value),write,Y,
+python/sglang/srt/layers/attention/torch_native_backend.py,212,forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v),write,Y,
+python/sglang/srt/layers/attention/torch_native_backend.py,226,forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),read,N,"ttnn tensors; override forward_extend in TTTorchNativeBackend to bypass buffer fetch"
+python/sglang/srt/layers/attention/torch_native_backend.py,227,forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),read,N,"ttnn tensors; override forward_extend in TTTorchNativeBackend to bypass buffer fetch"
+python/sglang/srt/layers/attention/torch_native_backend.py,263,forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v),write,Y,
+python/sglang/srt/layers/attention/torch_native_backend.py,273,forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),read,N,"ttnn tensors; override forward_decode in TTTorchNativeBackend to bypass buffer fetch"
+python/sglang/srt/layers/attention/torch_native_backend.py,274,forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),read,N,"ttnn tensors; override forward_decode in TTTorchNativeBackend to bypass buffer fetch"
+
+# out-of-scope: managers/scheduler.py (P2a scope = 3 core modules only)
+# out-of-scope: python/sglang/srt/managers/scheduler.py:1226,self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),read
+# out-of-scope: python/sglang/srt/managers/scheduler.py:1285,self.token_to_kv_pool_allocator.get_kvcache(),read
+# out-of-scope: python/sglang/srt/managers/scheduler.py:2911,self.token_to_kv_pool_allocator.available_size(),read
+# out-of-scope: python/sglang/srt/managers/scheduler.py:2920,self.token_to_kv_pool_allocator.available_size(),read
+# out-of-scope: python/sglang/srt/managers/scheduler.py:3433,self.token_to_kv_pool_allocator.clear(),write
+# out-of-scope: python/sglang/srt/managers/scheduler.py:3459,self.token_to_kv_pool_allocator.get_kvcache().mem_usage,read
+
+# out-of-scope: managers/schedule_batch.py (P2a scope = 3 core modules only)
+# out-of-scope: python/sglang/srt/managers/schedule_batch.py:1288,token_to_kv_pool_allocator.get_cpu_copy(...),read
+# out-of-scope: python/sglang/srt/managers/schedule_batch.py:1297,token_to_kv_pool_allocator.load_cpu_copy(...),write
+# out-of-scope: python/sglang/srt/managers/schedule_batch.py:2107,self.token_to_kv_pool_allocator.page_size,read
+# out-of-scope: python/sglang/srt/managers/schedule_batch.py:2154,self.token_to_kv_pool_allocator.available_size(),read
+
+# out-of-scope: model_executor/ (P2a scope = 3 core modules only)
+# out-of-scope: python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:766,self.token_to_kv_pool.full_to_swa_index_mapping=...,write
+# out-of-scope: python/sglang/srt/model_executor/model_runner.py:3367,self.token_to_kv_pool.set_swa_loc(...),write
+
+# out-of-scope: layers/attention/ backends not used by TT path (triton, flashinfer, trtllm, etc.)
+# out-of-scope: python/sglang/srt/layers/attention/triton_backend.py — CUDA Triton; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/flashinfer_backend.py — CUDA FlashInfer; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/trtllm_mha_backend.py — CUDA TRT-LLM; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/flashattention_backend.py — CUDA FlashAttention; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/flashmla_backend.py — CUDA MLA; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/trtllm_mla_backend.py — CUDA TRT-LLM MLA; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/cutlass_mla_backend.py — CUDA CUTLASS; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/wave_backend.py — AMD ROCm; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/xpu_backend.py — Intel XPU; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/torch_flex_backend.py — not in TT P1 plan
+# out-of-scope: python/sglang/srt/layers/attention/aiter_backend.py — AMD; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/deepseek_v4_backend.py — not in TT P1 plan
+# out-of-scope: python/sglang/srt/layers/attention/intel_amx_backend.py — Intel; not on TT path
+# out-of-scope: python/sglang/srt/layers/attention/nsa_backend.py — not in TT P1 plan
+
+# TODO: implement get_cpu_copy on TTBackedKVCache; called by allocator.py:171
+# TODO: implement load_cpu_copy on TTBackedKVCache; called by allocator.py:175
+# TODO: expose .device attribute on TTBackedKVCache; called by radix_cache.py:286
+# TODO: implement free(kv_indices) on allocator wrapping TTBackedKVCache; called by radix_cache.py:449,470,474,479,511,574
+# TODO: implement set_kv_buffer(layer, loc, k, v) on TTBackedKVCache; called by torch_native_backend.py:212,263
+# TODO: implement get_key_buffer(layer_id) stub on TTBackedKVCache (N rows — override calling fn in adapter instead); called by torch_native_backend.py:226,273
+# TODO: implement get_value_buffer(layer_id) stub on TTBackedKVCache (N rows — override calling fn in adapter instead); called by torch_native_backend.py:227,274

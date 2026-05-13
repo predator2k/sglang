@@ -1,0 +1,2 @@
+# Allow fixture CSVs tracked by this project
+!*.csv
