@@ -1,0 +1,87 @@
+P3a.1 T1.4 — NGRAM bit-exact correctness vs baseline
+Captured: 2026-05-13
+Hardware: 2× Tenstorrent Blackhole p150a
+Branch: tenstorrent-p1 @ c09ed918b
+
+================================================================
+Result: FAIL (10/10 prompts mismatch)
+================================================================
+Both servers ran on the same Llama-3.1-8B-Instruct, same context_length,
+same page_size, same paged_backend, same temperature=0. The only
+difference: NGRAM server had --speculative-algorithm NGRAM
+--speculative-num-steps 5 --speculative-ngram-max-bfs-breadth 1; baseline
+server omitted those flags.
+
+Example mismatch (prompt: "The capital of France is"):
+  NGRAM    : " Paris ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !!! overposting !"
+  BASELINE : " Paris, which is located in the northern part of the country.
+             The city is known for its stunning architecture, art museums,
+             fashion, and cuisine."
+
+All 10 prompts have similar pattern: NGRAM emits the correct FIRST
+token followed by gibberish/repetition; baseline emits coherent prose.
+
+================================================================
+Root cause: T1.2 v2 tile placeholder
+================================================================
+The tile-placeholder `_call_prefill_for_verify` (tt_llm.py:226) returns
+the last-token logits replicated across all 12 draft positions. So
+`target_predict[bs, dn]` has the SAME token at every draft position.
+
+VerifyTreeGreedy's accept rule (eagle_utils.cu:298):
+  if (draft_token_id == target_token_id) { accept; }
+
+With target_token_id constant across positions, the verify pipeline
+mistakenly accepts whichever draft tokens happen to match that single
+predicted token. Multiple wrong drafts get committed to KV-cache and
+the output diverges from greedy non-speculative.
+
+================================================================
+Resolution: T1.2 v3
+================================================================
+T1.4 PASS gate requires per-draft-position logits — i.e. true
+`[bs * draft_token_num, vocab]` next-token predictions. This needs:
+
+1. Per-user call to `tt_model.prefill_forward_single_user_text`
+   bypassing the batched `prefill_forward_text` wrapper.
+2. Proper per-submesh kv_cache slice (`self.kv_caches[model_id]`).
+3. Per-user page_table derived via `_get_prefill_user_page_table` or
+   equivalent slicing.
+4. Host-side extraction via `primary_model.concat_host_output(tt_logits)`
+   followed by slicing `[0, 0, :draft_seq_len, :vocab]`.
+5. Stack across users into `[bs * draft_token_num, vocab]`.
+
+Attempted in this session; failed at attention.py:984 because the
+kv_cache parameter expected per-submesh slice, not the top-level
+`[submesh][layer][kv]` structure. The cleanest path is to follow
+`prefill_forward_text` line 676 (`model_kv_cache = kv_cache[model_id]`)
+and line 651-660 (`_get_prefill_user_page_table`) before calling
+single-user. ~50-100 LoC plus hardware debugging.
+
+================================================================
+T1.4 status: BLOCKED on T1.2 v3 (not on platform/HW)
+================================================================
+All infrastructure works. The plumbing is real:
+- Server boots with NGRAM ✓
+- Verify pipeline executes (no Python errors) ✓
+- KV cache copy initialized ✓
+- Tree-mask reconstruction works (Python fallback ✓)
+- VerifyTreeGreedy executes (Python fallback ✓)
+- Output is generated end-to-end ✓
+
+The remaining gap is correctness of the verify-position logits, which
+is a tt_transformers integration question, not an SGLang or NGRAM
+question. Once T1.2 v3 lands and provides real per-position logits,
+T1.4 should PASS automatically because drafts that don't match the
+proper target prediction will be rejected, falling back to bonus tokens
+which by definition equal the non-spec baseline at temperature=0.
+
+================================================================
+Fixtures captured for diff regression testing
+================================================================
+- _fixtures/ngram_correctness_ngram.json
+- _fixtures/ngram_correctness_baseline.json
+
+These will be re-recorded after T1.2 v3 lands. The diff test
+(`test_ngram_matches_baseline`) is the gate that will go from FAIL to
+PASS at that point — no further test changes needed.
