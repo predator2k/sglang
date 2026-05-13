@@ -85,3 +85,101 @@ Expected: all 6 hardware-gated test files (test_smoke, test_greedy_correctness, 
 Step 2 manifest = 5/5 PASS. No INV violation was discovered during Phase 0.
 
 → **APPROVED to proceed to Phase 1** (after operator runs hardware tests in docker and confirms green).
+
+---
+
+# P2a.1 Verification Report
+
+Date: 2026-05-12
+Branch: tenstorrent-p1 (commits e5bb937a9..6de7ff6ce)
+Paged tt-metal image: `local-tt-metal:dev` (sha256:`973e972bddf5`) — built from tt-metal commit `89686ee7`
+
+## §9.1 Paged Smoke — PASS (hardware-verified)
+
+**Test:** `test_smoke_paged.py::test_paged_smoke_paris`
+**Prompt:** "What is the capital of France? Answer in one word."
+**Result:** HTTP 200, content contains "Paris." — **PASS**
+
+Run by operator inside `podman run ... local-tt-metal:dev` container with
+`SGLANG_PLATFORM=tenstorrent SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged`
+on 2× Tenstorrent Blackhole p150a. Server startup (mesh init + model load via
+plugin's `LlamaForCausalLM.initialize_sglang_model`) completed; inference
+returned correct one-word answer.
+
+Commit that added the test: `d2f3b966d` ("test(tenstorrent): §9.1 paged smoke on Blackhole (G8a first validation)")
+
+## §9.2 Paged Greedy Determinism — PASS (hardware-verified)
+
+**Test:** `test_greedy_correctness_paged.py::test_greedy_determinism_paged`
+**Method:** Each of 3 prompts run twice sequentially at temp=0 via `/v1/completions`. Outputs must match across runs.
+**Result:** All 3 prompt pairs produced identical outputs — **PASS**
+
+Bit-exact HF reference comparison deferred to P2a.3 perf-log task (BFP8 quantization drift tolerated in §9.2).
+
+Commit that added the test: `6de7ff6ce` ("test(tenstorrent): §9.2 paged greedy determinism on Blackhole")
+
+## CPU Unit Tests — Deferred (host env limitation, same as Phase 0)
+
+**`test_plugin_registration.py`** and **`test_page_table_translation.py`** both parse cleanly (AST OK). They require `sglang` and `torch` respectively — neither is installed on the host Python. These tests run inside docker; the environment constraint is unchanged from Phase 0.
+
+- `test_plugin_registration.py`: 2 tests — INV-6 namespace checks + model-registry patch verification. No hardware required; docker-runnable on any CUDA/TT image that has `sglang` installed.
+- `test_page_table_translation.py`: 3 tests — INV-3 + G2a block-ID math (dtype int32, math `token_index // block_size`, shape checks). No hardware required; torch-only.
+
+Both test files have syntactically valid Python; logic is sound. **Deferred to operator docker run.**
+
+## Compat Fixes Applied (3 patch categories, 3 SGLang-side fixes)
+
+All fixes landed across commits `e5bb937a9`, `9127e6290`, `ffaaff4db`:
+
+### SGLang-side (in-tree, committed):
+
+| Fix | Commit | Description |
+|---|---|---|
+| R6: lazy flashinfer.comm import | `e5bb937a9` | `except (ImportError, AssertionError)` in `token_dispatcher/flashinfer.py` — `libcudart` absent on TT hosts raises `AssertionError`, not `ImportError` |
+| Mode dispatch in `TTTpModelWorker` | `9127e6290` | `__init__` branches on `self._paged_mode`; paged delegates entirely to standard SGLang `ModelRunner`; simple path unchanged |
+| KV-pool factory overrides | `ffaaff4db` | `platform.py` `get_mha_kv_pool_cls` → `MHATokenToKVPool`, `get_paged_allocator_cls` → `PagedTokenToKVPoolAllocator` for paged mode; simple path still raises `NotImplementedError` |
+
+### tt-metal patches (out-of-tree, applied in container, tracked in `REBASE_TARGETS.md`):
+
+| Patch | File | Fix |
+|---|---|---|
+| 01 | `models/common/llama_models.py` | Soft-import `AutoModelForVision2Seq` (removed in transformers 5.x) |
+| 02 | `models/tt_transformers/tt/model_config.py` | Same soft-import + `rope_theta=500000.0` fallback for Llama-3.x |
+| 03 | `models/tt_transformers/tt/generator_sglang.py` | `super().decode_forward_text()` → `super().decode_forward()` at 4 call sites |
+
+Patch files at: `python/sglang/srt/hardware_backend/tenstorrent/scripts/tt_metal_patches/`.
+
+## Plugin Upstream Bug: `decode_forward_text` does not exist
+
+The Tenstorrent plugin's `generator_sglang.py` calls `super().decode_forward_text()` at 4 sites (lines 155, 198, 241, 305). This method does not exist on the `Generator` base class — the correct entry point is `decode_forward()`. This is an upstream tt-metal bug affecting all SGLang plugin users. Patched locally via patch 03. Tracked in `REBASE_TARGETS.md` for upstream submission to the Tenstorrent tt-metal repo.
+
+## Code-Side Dual-Track Integrity
+
+Confirmed by code inspection (`git log --oneline` + direct file reads):
+
+1. `execution/tt_transformers_backend.py` retains all `_do_*` private methods (`_do_new_request`, `_do_extend`, `_do_decode_step`, `_do_free`, `_do_reset_all`) — P1 simple-path logic intact.
+2. `tp_worker.py` has both init paths:
+   - `_init_model_runner_paged()` (line 78) — paged path
+   - `_init_model_runner_simple()` (line 93) — P1 simple path (T0.7 code unchanged)
+   - `__init__` branches on `self._paged_mode = resolve_execution_backend_name() == "tt_transformers_paged"` (line 65)
+3. `forward()` and `__init__` dispatch blocks are present at lines 189 and 210.
+
+**Simple-path hardware verification on the new image is deferred** — the `local-tt-metal:dev` image is a different build from the original P1 image (`d4116d2a7b20`). Re-running P1 hardware tests against the new image is a separate operator bring-up task; code-side integrity is confirmed above.
+
+## What's Next
+
+18 tasks remain across P2a.1+P2a.2+P2a.3+P2b. The next milestone is completing the full §9 acceptance suite:
+
+- §9.3: MMLU-mini accuracy gate (P2a.2)
+- §9.4: Stability / throughput gate (P2a.3)
+- §9.5: Perf log / telemetry gate (P2a.3)
+- Bake tt-metal patches into rebuilt image (P2a.2 cleanup)
+- Upstream patch 03 (`decode_forward` fix) to Tenstorrent tt-metal repo
+
+## Decision
+
+§9.1 PASS + §9.2 PASS on 2× Blackhole p150a hardware.
+CPU unit tests deferred (host env, same constraint as Phase 0; AST-confirmed valid).
+Dual-track code integrity confirmed by inspection.
+
+→ **P2a.1 ACCEPTED — proceed to P2a.2**
