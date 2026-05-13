@@ -34,7 +34,7 @@ P3b/P3c/P3d are scoped in §A1 — gated on P3a §10 acceptance + EAGLE result e
 | **G2** | Production observability: SGLang Prometheus metrics enabled (`--enable-metrics`) + custom Grafana dashboard JSON delivered. Panels: queue depth, batched decode tok/s, RadixCache hit rate, ITL p50/p99, KV pool utilization, per-arch (Llama / Qwen3) breakdown, speculative accept_rate, accept_length. | Dashboard JSON at `python/sglang/srt/hardware_backend/tenstorrent/scripts/grafana_p3a_dashboard.json`; manual screenshot during 24h test recorded in `_fixtures/p3a_grafana_screenshot.png`. |
 | **G3** | Speculative decoding — **NGRAM** integrated through plugin path. Config via `--speculative-algorithm NGRAM --speculative-num-steps N`. | ≥ 1.3× decode tok/s improvement vs no-spec baseline on Llama-3.1-8B; cache hit + RadixAttention still operational. |
 | **G4** | Speculative decoding — **EAGLE** (draft model cohosted on mesh). Draft model selection deferred to Phase 0 (Q1). | ≥ 2× decode tok/s on appropriate prompts vs no-spec. Acceptance length τ (`accept_length`) ≥ 2.0. |
-| **G5** | Speculative decoding — **Adaptive** auto-pick between NGRAM/EAGLE per prompt/context. | Adaptive switch logged; mixed-workload throughput ≥ better of NGRAM-only or EAGLE-only single-mode runs. |
+| **G5** | Speculative decoding — **EAGLE + `speculative_adaptive` num_steps tuner** enabled. Note: `speculative_adaptive` is NOT a third algorithm; it's a bool flag (server_args.py:580) that auto-tunes EAGLE's `num_steps` at runtime. Tests EAGLE with adaptive on/off comparison. | Adaptive-on run logs num_steps changes; throughput within 5% of best-tuned static num_steps (i.e., adaptive doesn't regress). |
 
 ### 1.2 Non-goals (explicitly NOT in P3a — pushed to P3b/P3c/P3d)
 
@@ -81,7 +81,18 @@ All paths relative to `python/sglang/srt/hardware_backend/tenstorrent/`.
 
 ### 2.3 SGLang upstream-class patches (in our fork only, per N9)
 
-Existing patches preserved. P3a adds **zero new** upstream-class patches — SGLang's native speculative_algorithm infrastructure is already complete; P3a only needs to wire Tenstorrent inference into it (see INV-8).
+Existing P2 patches preserved (`bypass_chunked_req` + `flashinfer.comm` AssertionError catch).
+
+**P3a adds new SGLang upstream-class patches** (NGRAM/EAGLE workers are CUDA-hardcoded; need TT-agnostic versions):
+
+| Path | Change | Tracked in |
+|---|---|---|
+| `python/sglang/srt/speculative/ngram_worker.py` | Replace `self.device = f"cuda:{gpu_id}"` (line 48) + `.cuda()` calls (line 229) + state allocation (line 122-143) with device-aware paths. On TT plugin path, use `device="cpu"` (host-side n-gram table). | `REBASE_TARGETS.md` (monthly rebase) |
+| `python/sglang/srt/speculative/eagle_info.py` | Replace 6+ `device="cuda"` literals with `device=current_platform.get_device_name()` or similar. | `REBASE_TARGETS.md` |
+| `python/sglang/srt/speculative/spec_utils.py:587` | Same CUDA hardcoding fix. | `REBASE_TARGETS.md` |
+| `python/sglang/srt/server_args.py:333-342` | Check + document: `EAGLE` may auto-promote to `FROZEN_KV_MTP`. Test must disable or expect this. | Note only — no patch required if expected behavior is documented |
+
+R-P3-3 (was MEDIUM, now **HIGH**) — Phase 0 W1 explicit budget for patching ≥3 SGLang upstream files. Adds to existing R6 monthly-rebase debt.
 
 ### 2.4 Architecture invariants (extend P2 INV-1..INV-7 with INV-8/INV-9)
 
@@ -239,14 +250,17 @@ Adaptive switch heuristic / dashboard JSON sanity
 
 | # | Gate | Test file |
 |---|---|---|
+| §10.1a | **Compressed 6h pre-run gate (MANDATORY before §10.1)** — decode tok/s drift < 5% on synthetic bimodal workload, completes within W7. Catches issues early to avoid full-24h dry-runs. | `test_stability_6h_pregate.py` |
 | §10.1 | 24h stability — synthetic bimodal workload, decode tok/s drift < 5% across 4×6h windows | `test_stability_24h_paged.py` |
 | §10.2 | Grafana dashboard JSON schema valid (parses + has all 8 panels) | `test_grafana_dashboard.py` |
 | §10.3 | NGRAM smoke: `--speculative-algorithm NGRAM` boots, decode succeeds | `test_speculative_ngram_smoke.py` |
+| **§10.3b** | **Bit-exact correctness — NGRAM**: for 10 fixed prompts at `temperature=0`, NGRAM output token-for-token equals non-speculative output. Standard practice — speculative must be a perf optimization, never a quality regression. | `test_speculative_ngram_correctness.py` |
 | §10.4 | NGRAM perf: ≥ 1.3× decode tok/s vs no-spec on Llama-3.1-8B same workload | `test_speculative_ngram_perf.py` |
 | §10.5 | EAGLE smoke: `--speculative-algorithm EAGLE --speculative-draft-model-path` boots, decode succeeds | `test_speculative_eagle_smoke.py` |
-| §10.6 | EAGLE perf: `accept_length` (τ) ≥ 2.0 measured over 100 requests | `test_speculative_eagle_perf.py` |
-| §10.7 | Adaptive: auto-switch logged; mixed-workload throughput ≥ better of NGRAM-only or EAGLE-only | `test_speculative_adaptive.py` |
-| §10.8 | Prometheus metrics exported when `--enable-metrics`: `sglang:spec_accept_length`, `sglang:spec_accept_rate`, `sglang:cache_hit_rate`, `sglang:queue_size` all queryable | `test_prometheus_metrics_p3a.py` |
+| **§10.5b** | **Bit-exact correctness — EAGLE**: same as §10.3b but for EAGLE. Greedy spec output == greedy non-spec output at temp=0. | `test_speculative_eagle_correctness.py` |
+| §10.6 | EAGLE perf: `accept_length` (τ) measured over 100 requests. **Threshold CALIBRATED** from 10-prompt sub-set in advance (per R-P3-4). Pass criteria: τ ≥ 0.85× of calibration baseline. NOT hardcoded 2.0 — Q4 best-guess says lower-bound 1.5 is plausible on TT BFP8. | `test_speculative_eagle_perf.py` |
+| §10.7 | EAGLE + `speculative_adaptive` (bool flag, NOT a separate algo): adaptive-on logs `num_steps` changes; throughput within 5% of best-tuned static num_steps run. | `test_speculative_adaptive.py` |
+| §10.8 | Prometheus metrics exported when `--enable-metrics`. **Required metric names** (per SGLang `observability/metrics_collector.py`): `sglang:spec_accept_length`, `sglang:spec_accept_rate`, `sglang:cache_hit_rate`, `sglang:queue_size`, `sglang:running_requests`, `sglang:processed_tokens_per_second`. All MUST be queryable; missing names fail the gate. | `test_prometheus_metrics_p3a.py` |
 | §10.9 | P2 §9 regression: rerun the P2a/P2b suite, all gates still PASS | (regression — no new file) |
 | §10.10 | EAGLE mesh cohosting: documented mesh layout decision in `_fixtures/p3a_eagle_mesh_evidence.txt` (INV-9) | (doc gate) |
 
@@ -282,7 +296,7 @@ def gen_request():
 |---|---|---|---|
 | R-P3-1 | EAGLE draft cohost on 2× Blackhole has unknown perf/memory profile | **HIGH** | Phase 0 Q1 explicit investigation (~1 week); fallback to NGRAM-only if EAGLE cohost is infeasible (downgrades G4 to "deferred to P3b/P3d") |
 | R-P3-2 | 24h stability run discovers memory leak or perf drift > 5% | MEDIUM | Compressed 6h pre-run gate in Phase 1 before committing to full 24h; if drift > 5% emerges, profile + iterate before final 24h |
-| R-P3-3 | SGLang spec scheduler assumes CUDA model behavior in some code path → fails on TT plugin path | MEDIUM | Phase 0 Q2 explicit grep for CUDA-specific code in `sglang/srt/speculative/*`; patch any incompatible assumption in-fork (R6 monthly rebase target) |
+| R-P3-3 | SGLang spec workers HARDCODE `device="cuda:..."` in multiple files (`ngram_worker.py:48`, `eagle_info.py` 6+ sites, `spec_utils.py:587`); workers call `.cuda()` (ngram_worker.py:229). Spec runner is NOT device-agnostic. | **HIGH** | Phase 0 W1 explicit budget for patching ≥3 SGLang upstream files to dispatch via `current_platform.get_device_name()` (or accept `device="cpu"` for ngram on TT). New entries in `REBASE_TARGETS.md`; existing P2 monthly cadence applies. INV-8 wording stays valid in spirit (we use SGLang's spec config), but §2.3 honesty fix landed. |
 | R-P3-4 | Speculative `accept_length` measurements vary widely with prompt type → G4 fails on adversarial workload | MEDIUM | Define test fixture with 100 fixed prompts; calibrate threshold (2.0) on 10-prompt subset first |
 | R-P3-5 | tt-metal patches (P2 era) need rebasing if we bump image | LOW | `REBASE_TARGETS.md` covers, monthly cadence |
 | R-P3-6 | Grafana dashboard panel JSON drifts between Grafana versions | LOW | Pin Grafana version in dashboard JSON metadata; mark version as documentation note |
@@ -326,10 +340,12 @@ Each phase has its own verification gate. Total **6-8 weeks** depending on hardw
 ### 5.3b P3a → P3b decision gate
 
 Proceed to P3b (features wave) iff:
-1. §10.1-§10.10 all PASS (or G4 downgraded with documented fallback)
+1. §10.1a + §10.1-§10.10 all PASS (or G4 downgraded with documented fallback)
 2. R-P3-1 (EAGLE cohost) resolved either as PASS or as documented infeasibility
 3. P2 §9 regression PASSes
-4. Decision evidence file `_fixtures/p3a_acceptance_report.md` committed
+4. **INV-1..INV-9 NOT violated** (verify via implementation-discovery escape hatch §5.2b)
+5. **Q1-Q5 each have explicit answer recorded** in `_fixtures/p3a_open_questions_evidence.txt`
+6. Decision evidence file `_fixtures/p3a_acceptance_report.md` committed
 
 ### 5.3c Rollback
 
