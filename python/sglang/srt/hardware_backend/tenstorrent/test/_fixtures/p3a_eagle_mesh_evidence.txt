@@ -1,0 +1,93 @@
+P3a Phase 0 Q1 — EAGLE draft cohost investigation (planning artifact)
+Captured: 2026-05-13
+Branch: tenstorrent-p1 at 60b0d465bcf119137355d0bd6006d2fa324842f6
+
+================================================================
+Constraint discovered
+================================================================
+Spec §5.2 Q1 best-guess was Llama-3.2-1B (draft) + Llama-3.1-8B-Instruct (main).
+Local /home/mhnie/tt-models/ does NOT have Llama-3.2-1B-Instruct.
+Available models: Llama-3.1-8B-Instruct, Qwen3-1.7B, Qwen3-8B, Qwen3-14B.
+
+PIVOT: candidate pair = Qwen3-1.7B (draft) + Qwen3-8B (main).
+Both Qwen3 variants validated in P2b T4.2 (Qwen3-8B paged smoke PASS).
+TenstorrentQwenForCausalLM class is registered (P2a.1 T1.1+T1.2).
+
+ALTERNATIVE: download Llama-3.2-1B-Instruct (~2.4 GB weights). Operator
+decides which to pursue. P3a.0 verification gate (T0.4) accepts either.
+
+================================================================
+Memory budget (Qwen3-1.7B + Qwen3-8B cohost)
+================================================================
+BFP8 weights:
+  - Qwen3-8B  ≈ 8 GB
+  - Qwen3-1.7B ≈ 1.7 GB
+KV pool (B=4 × 16K context × per-head × 32 layers):
+  - Per-model ≈ 40 GB on TT device (P2 verified for 8B; smaller for 1.7B)
+  - Two models cohost: ≈ 50-60 GB combined KV
+Total ≈ 60-70 GB on 128 GB total mesh memory (2 × p150a × 64 GB).
+Headroom ≈ 50%. Should fit.
+
+================================================================
+Layout A — shared (1,2) mesh, interleaved kernel scheduling
+================================================================
+Procedure (operator runs after restoring container with both models):
+
+  podman exec p3a-smoke bash -lc "source /opt/venv/bin/activate && python <<PY
+  from sglang.srt.hardware_backend.tenstorrent.models.tt_llm import TenstorrentQwenForCausalLM
+  from transformers import AutoConfig
+
+  # Main model
+  main_cfg = AutoConfig.from_pretrained('/models/Qwen3-8B')
+  main = TenstorrentQwenForCausalLM(config=main_cfg)
+
+  # Draft on SAME mesh
+  draft_cfg = AutoConfig.from_pretrained('/models/Qwen3-1.7B')
+  draft = TenstorrentQwenForCausalLM(config=draft_cfg, tt_model=None)  # share main.mesh_device
+
+  print('both models loaded; mesh:', main.mesh_device, draft.mesh_device)
+  PY"
+
+Pass criteria: both models initialize without crash; memory under 64 GB per card.
+
+================================================================
+Layout B — split mesh (1,1)+(1,1)
+================================================================
+Operator may need to bypass BaseMetalDeviceRunner.set_device() to manually
+open two single-device meshes:
+
+  import ttnn
+  main_mesh = ttnn.open_mesh_device(ttnn.MeshShape(1,1), device_ids=[0])
+  draft_mesh = ttnn.open_mesh_device(ttnn.MeshShape(1,1), device_ids=[1])
+
+Tradeoff: each model has dedicated card, no kernel-scheduling contention,
+but loses TP=2 collective speedup for main model.
+
+================================================================
+DECISION (pending operator experiment)
+================================================================
+Tentative: Layout A (shared mesh) + Qwen3-1.7B/Qwen3-8B pair.
+Reason: keeps TP=2 for main model perf; Qwen3 pair avoids the
+Llama-3.2-1B download.
+
+If operator-led experiment shows Layout A INFEASIBLE (e.g., memory OOM
+or kernel-scheduling contention degrades main throughput by >20%):
+  - Fallback 1: Layout B (split mesh)
+  - Fallback 2: Use Llama-3.2-1B + Llama-3.1-8B pair (requires download)
+  - Fallback 3 (per R-P3-1 mitigation): downgrade G4 to DEFERRED; P3a
+    ships with NGRAM only; EAGLE pushed to P3b/P3d.
+
+================================================================
+Q1 status: PLANNING ARTIFACT — investigation deferred to operator
+================================================================
+
+The actual mesh-layout experiment requires:
+- Server teardown + restart with both models
+- Memory monitoring during cohost load
+- Smoke test on each model independently
+- Throughput delta measurement vs single-model baseline
+
+This is real engineering work (~1 day) and is left to the operator per
+spec §5.3 P3a.0 W1 budget.
+
+P3a.1 (NGRAM speculative) can proceed in parallel — does NOT require EAGLE.
