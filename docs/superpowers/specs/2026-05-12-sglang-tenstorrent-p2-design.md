@@ -588,7 +588,9 @@ Spec went through 4 rounds of subagent-driven review during brainstorming:
 - `superpowers:writing-plans` skill — produces the implementation plan from this spec
 - `superpowers:subagent-driven-development` skill — executes the plan
 - Git remote: `predator2k/sglang` (`origin`). NEVER push to `sgl-project/sglang` per N9
-- tt-metal docker image: `ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-models-amd64:latest-rc` (sha256:`40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c`) — pinned per R1/R13
+- tt-metal docker images (two pins per R1/R13):
+  - **Phase 0 / P1-simple-path** (UMD-compatible with host KMD 2.8.0; no `generator_sglang.py`): `ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e` (sha256:`d4116d2a7b20383ec42c990b08f9c6159462f9f2b84f9a25448db678f17e41aa`)
+  - **Phase 2+ / paged path** (has `generator_sglang.py`; UMD mismatch with current host — must resolve before Phase 2 starts): `ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-22.04-release-models-amd64:latest-rc` (sha256:`40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c`)
 
 **Upstream code (tt-metal, read-only)**
 - `tt_transformers` (bundled in tt-metal docker image): `models/tt_transformers/tt/generator_sglang.py`, `common.py`, `attention.py`, `model.py`, `decoder.py`, `generator.py`
