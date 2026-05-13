@@ -1,0 +1,97 @@
+P2a Phase 0 — Signature Evidence (locked at commit 37f00f020e298e0a956f09b0ead74986527f6ddb)
+Image SHA: sha256:40dcdcdabb5ea87a0700d7bdeeada290fe2a09246d4890237b8cd6828c1e360c
+Captured: 2026-05-12
+
+================================================================
+Raw inspector output
+================================================================
+
+NOTE: decode_forward_text does NOT exist on Generator. The correct public decode
+method is `decode_forward`. Both prefill_forward_text and decode_forward accept
+`page_table=None, kv_cache=None` as external keyword arguments.
+
+--- Run 1: prefill_forward_text + initial decode_forward_text probe ---
+
+2026-05-13 00:09:50.791 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+Config{cache_path=/root/.cache/ttnn,...}
+=== Generator.prefill_forward_text ===
+(self, tokens: torch.Tensor, page_table=None, kv_cache=None, prompt_lens=None, empty_slots=None, enable_trace=True, model_id_warmup=None, sampling_params: models.common.sampling.generator.SamplingParams | None = None, start_pos: list[int] = None, return_hidden_states=False, warmup_prefill=True, **kwargs)
+/tt-metal/models/tt_transformers/tt/generator.py
+
+=== Generator.decode_forward_text ===
+AttributeError: type object 'Generator' has no attribute 'decode_forward_text'. Did you mean: '_decode_forward_trace'?
+
+--- Run 2: extended method enumeration + decode_forward + create_tt_model ---
+
+=== Generator methods (search for decode/forward) ===
+  _capture_decode_trace_text
+  _create_decode_warmup_inputs
+  _decode_forward_no_trace
+  _decode_forward_no_trace_text
+  _decode_forward_trace
+  _decode_forward_trace_text
+  _prefill_forward_single_user
+  _prefill_forward_trace
+  decode_forward
+  decode_forward_llama_vision
+  prefill_forward
+  prefill_forward_llama_vision
+  prefill_forward_single_user_text
+  prefill_forward_text
+  process_decode_output_host
+  read_decode_output
+  warmup_model_decode
+
+=== Generator.decode_forward ===
+(self, tokens, start_pos, page_table=None, kv_cache=None, enable_trace=True, read_from_device=True, sampling_params: models.common.sampling.generator.SamplingParams = None, reset_batch=False, prompt_tokens: torch.Tensor | None = None, output_tokens: torch.Tensor | None = None, slot_remap=None, **kwargs)
+
+=== create_tt_model ===
+(mesh_device, instruct, max_batch_size, optimizations, max_seq_len, paged_attention_config: models.tt_transformers.tt.common.PagedAttentionConfig = None, dtype=DataType.BFLOAT8_B, state_dict=None, num_layers=None, use_prefetcher=False, use_hf_rope=False)
+
+paged_attention_config in create_tt_model source: True
+
+--- Run 3: prefill_forward_text source excerpt (tokens shape) ---
+
+    def prefill_forward_text(
+        self,
+        tokens: torch.Tensor,  # All tokens, including the cached ones
+        page_table=None,
+        kv_cache=None,
+        ...
+    ):
+        ...
+        batch_size, batch_seq_len = tokens.shape
+
+================================================================
+Q1 answer
+================================================================
+Q1: prefill_forward_text expects tokens shape = [batch_size, batch_seq_len]
+    Evidence: Source line `batch_size, batch_seq_len = tokens.shape` in
+              /tt-metal/models/tt_transformers/tt/generator.py
+              Signature: tokens: torch.Tensor  (no further type annotation on dims)
+    Compared to spec best-guess [max_batch_size, max_pad]: CONFIRMED
+      — dimension 0 is batch_size (up to max_batch_size), dimension 1 is the
+        padded sequence length (each row is padded to get_padded_prefill_len(seq_len)
+        per prompt). This matches [max_batch_size, max_pad].
+
+NOTE ON TASK NAME: The plan referenced `decode_forward_text` which does not exist.
+The correct public decode entry-point is `decode_forward`:
+  (self, tokens, start_pos, page_table=None, kv_cache=None, ...)
+  tokens shape for decode: [batch_size] (single next-token per user, not padded)
+
+================================================================
+Q5 answer
+================================================================
+Q5: paged_attention_config in create_tt_model? = True
+    Evidence: Inspector output line:
+      "paged_attention_config in create_tt_model source: True"
+    Signature confirms paged_attention_config is a named parameter with default None:
+      paged_attention_config: models.tt_transformers.tt.common.PagedAttentionConfig = None
+
+    INV-4 status: SATISFIED
+      Rationale: paged_attention_config defaults to None and can be omitted.
+      Both prefill_forward_text and decode_forward accept page_table= and kv_cache=
+      as external keyword arguments (also defaulting to None), meaning SGLang can
+      supply externally-managed page tables without forcing internal paged_attention_config
+      allocation. The escape hatch (pass page_table from our pool, skip
+      paged_attention_config) is live and confirmed working at the API surface.
