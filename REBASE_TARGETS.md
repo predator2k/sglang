@@ -57,3 +57,14 @@ numbers change._
 | `tt-metal/models/tt_transformers/tt/model_config.py` (lines 2693, 2967) | Same hard-import issue; also `rope_theta` lost from `LlamaConfig.to_dict()` in transformers 5.x. | Yes — `rope_theta` resolution via getattr |
 
 Local patch files at `python/sglang/srt/hardware_backend/tenstorrent/scripts/tt_metal_patches/`.
+
+---
+
+## SGLang speculative-worker patches (P3a.0 T0.2, R-P3-3 HIGH)
+
+| File | Lines | Purpose | First landed |
+|---|---|---|---|
+| `python/sglang/srt/speculative/ngram_worker.py` | 48, 229, 231 | device-agnostic NGRAM worker | 2026-05-13 (P3a.0 T0.2) |
+| `python/sglang/srt/speculative/eagle_info.py` | 102, 103, 104, 106, 109, 112 + 685 comment | device dispatch from worker | 2026-05-13 (P3a.0 T0.2) |
+| `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` | 325 | multi-layer EAGLE device dispatch | 2026-05-13 (P3a.0 T0.2) |
+| `python/sglang/srt/speculative/spec_utils.py` | 587 | sim_accept_index device dispatch | 2026-05-13 (P3a.0 T0.2) |
