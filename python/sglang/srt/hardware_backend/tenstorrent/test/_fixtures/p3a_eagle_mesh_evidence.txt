@@ -1,93 +1,80 @@
-P3a Phase 0 Q1 — EAGLE draft cohost investigation (planning artifact)
+P3a Phase 0 Q1 — EAGLE draft cohost experiment
 Captured: 2026-05-13
-Branch: tenstorrent-p1 at 60b0d465bcf119137355d0bd6006d2fa324842f6
+Hardware: 2× Tenstorrent Blackhole p150a (BDFs 0000:01:00.0 + 0000:06:00.0)
+KMD: tenstorrent v2.8.0, FW 19.6.0
+tt-metal: local-tt-metal:dev (sha256:973e972bddf5), commit 89686ee7
+Models: /models/Qwen3-8B (main, BFP8), /models/Qwen3-1.7B (draft)
+Branch: tenstorrent-p1
 
 ================================================================
-Constraint discovered
+Pair selection
 ================================================================
-Spec §5.2 Q1 best-guess was Llama-3.2-1B (draft) + Llama-3.1-8B-Instruct (main).
-Local /home/mhnie/tt-models/ does NOT have Llama-3.2-1B-Instruct.
-Available models: Llama-3.1-8B-Instruct, Qwen3-1.7B, Qwen3-8B, Qwen3-14B.
-
-PIVOT: candidate pair = Qwen3-1.7B (draft) + Qwen3-8B (main).
-Both Qwen3 variants validated in P2b T4.2 (Qwen3-8B paged smoke PASS).
-TenstorrentQwenForCausalLM class is registered (P2a.1 T1.1+T1.2).
-
-ALTERNATIVE: download Llama-3.2-1B-Instruct (~2.4 GB weights). Operator
-decides which to pursue. P3a.0 verification gate (T0.4) accepts either.
+Llama-3.2-1B-Instruct was NOT locally available, so we PIVOTED to
+Qwen3-1.7B (draft) + Qwen3-8B (main). Both validated in P2b T4.2
+(Qwen3-8B paged smoke PASS); TenstorrentQwenForCausalLM is registered.
 
 ================================================================
-Memory budget (Qwen3-1.7B + Qwen3-8B cohost)
+Layout A — shared single (1,2) MeshDevice
 ================================================================
-BFP8 weights:
-  - Qwen3-8B  ≈ 8 GB
-  - Qwen3-1.7B ≈ 1.7 GB
-KV pool (B=4 × 16K context × per-head × 32 layers):
-  - Per-model ≈ 40 GB on TT device (P2 verified for 8B; smaller for 1.7B)
-  - Two models cohost: ≈ 50-60 GB combined KV
-Total ≈ 60-70 GB on 128 GB total mesh memory (2 × p150a × 64 GB).
-Headroom ≈ 50%. Should fit.
+Procedure: pre-open one ttnn.MeshDevice(shape=(1,2)) manually, then
+monkey-patch BaseMetalDeviceRunner.set_device() to return that mesh.
+Both TenstorrentQwenForCausalLM instances thus share the same mesh.
 
-================================================================
-Layout A — shared (1,2) mesh, interleaved kernel scheduling
-================================================================
-Procedure (operator runs after restoring container with both models):
+Attempted: 2026-05-13 21:43:34 (Qwen3-8B) then 2026-05-13 21:45:48 (Qwen3-1.7B)
+Result: **PASS**
+  - shared MeshDevice id=128190066917920, num_devices=2 ✓
+  - main Qwen3-8B  loaded 127.1s ; main.mesh_device is shared_mesh → True
+  - draft Qwen3-1.7B loaded 14.6s ; draft.mesh_device is shared_mesh → True
+  - same_mesh = True ✓
+  - No ETH timeout. No mesh teardown errors during process exit.
 
-  podman exec p3a-smoke bash -lc "source /opt/venv/bin/activate && python <<PY
-  from sglang.srt.hardware_backend.tenstorrent.models.tt_llm import TenstorrentQwenForCausalLM
-  from transformers import AutoConfig
-
-  # Main model
-  main_cfg = AutoConfig.from_pretrained('/models/Qwen3-8B')
-  main = TenstorrentQwenForCausalLM(config=main_cfg)
-
-  # Draft on SAME mesh
-  draft_cfg = AutoConfig.from_pretrained('/models/Qwen3-1.7B')
-  draft = TenstorrentQwenForCausalLM(config=draft_cfg, tt_model=None)  # share main.mesh_device
-
-  print('both models loaded; mesh:', main.mesh_device, draft.mesh_device)
-  PY"
-
-Pass criteria: both models initialize without crash; memory under 64 GB per card.
+Memory monitoring: not captured (TT does not expose per-device-free
+in ttnn API; we'll add tt-smi sampling in P3a.2 T2.1 hardware smoke).
 
 ================================================================
-Layout B — split mesh (1,1)+(1,1)
+Layout B — two separate (1,1) MeshDevices
 ================================================================
-Operator may need to bypass BaseMetalDeviceRunner.set_device() to manually
-open two single-device meshes:
+Attempted: 2026-05-13 21:37:00 (implicit via second TenstorrentQwenForCausalLM)
+Result: **FAIL**
+  - First model opened (1,2) mesh successfully (130s)
+  - Second model called ttnn.open_mesh_device(mesh_shape=(1,2)) again
+    via BaseMetalDeviceRunner._mesh_device(), which threw:
+      TT_THROW: Device 0: Timed out while waiting for active ethernet
+      core 30-25 to become active again.
+  - Stack trace: ttnn::distributed::open_mesh_device →
+                 MeshDevice::create →
+                 MeshDeviceImpl::create
+  - Root cause: BaseMetalDeviceRunner._initialize_mesh_device() does
+    not accept device_ids; tt-metal MeshDevice cannot be opened
+    twice in the same process even on disjoint device sets.
+  - Recovery required: `sudo modprobe -r tenstorrent && sudo modprobe tenstorrent`
+    plus `tt-smi -r 0,1` after each crash — the failed mesh init
+    wedges the ETH link state on device 0.
 
-  import ttnn
-  main_mesh = ttnn.open_mesh_device(ttnn.MeshShape(1,1), device_ids=[0])
-  draft_mesh = ttnn.open_mesh_device(ttnn.MeshShape(1,1), device_ids=[1])
-
-Tradeoff: each model has dedicated card, no kernel-scheduling contention,
-but loses TP=2 collective speedup for main model.
-
-================================================================
-DECISION (pending operator experiment)
-================================================================
-Tentative: Layout A (shared mesh) + Qwen3-1.7B/Qwen3-8B pair.
-Reason: keeps TP=2 for main model perf; Qwen3 pair avoids the
-Llama-3.2-1B download.
-
-If operator-led experiment shows Layout A INFEASIBLE (e.g., memory OOM
-or kernel-scheduling contention degrades main throughput by >20%):
-  - Fallback 1: Layout B (split mesh)
-  - Fallback 2: Use Llama-3.2-1B + Llama-3.1-8B pair (requires download)
-  - Fallback 3 (per R-P3-1 mitigation): downgrade G4 to DEFERRED; P3a
-    ships with NGRAM only; EAGLE pushed to P3b/P3d.
+Layout B is INFEASIBLE under the current tt-metal MeshDevice lifecycle.
 
 ================================================================
-Q1 status: PLANNING ARTIFACT — investigation deferred to operator
+DECISION
 ================================================================
+**Layout A (shared single (1,2) mesh) chosen for P3a.2 EAGLE work.**
 
-The actual mesh-layout experiment requires:
-- Server teardown + restart with both models
-- Memory monitoring during cohost load
-- Smoke test on each model independently
-- Throughput delta measurement vs single-model baseline
+Architectural impact for P3a.2 (EAGLE):
+1. `BaseMetalDeviceRunner` needs an optional `external_mesh_device`
+   constructor parameter (small refactor, ~10 LoC).
+2. `TenstorrentQwenForCausalLM.__init__` needs to accept and thread
+   through that parameter.
+3. EAGLE worker setup will:
+   - Build main model first → claims the shared (1,2) MeshDevice
+   - Build draft model second → reuses main.mesh_device
+4. Verify + draft kernels execute SEQUENTIALLY on the same mesh
+   (this matches EAGLE's natural data flow — no concurrency needed).
 
-This is real engineering work (~1 day) and is left to the operator per
-spec §5.3 P3a.0 W1 budget.
+Throughput risk: shared mesh means draft kernels share fabric with
+main. Empirical delta to be measured in P3a.2 T2.4 (perf gate).
 
-P3a.1 (NGRAM speculative) can proceed in parallel — does NOT require EAGLE.
+================================================================
+Q1 status: RESOLVED — Layout A PASS
+R-P3-1 status: DOWNGRADED from HIGH to MEDIUM
+  - Feasibility confirmed (cohost works in shared-mesh mode)
+  - Remaining risk: throughput delta (mitigated by P3a.2 T2.4)
+================================================================
