@@ -16,7 +16,7 @@ Phase 3a is the **first sub-phase of P3 — the innovation phase**. P2 shipped a
 
 1. **24h+ stability** on 2× Blackhole with synthetic bimodal workload (decode tok/s drift < 5% across windows)
 2. **Production observability** — Prometheus metrics + 1 Grafana dashboard (no alerting in P3a)
-3. **Speculative decoding — all three SGLang algorithms** (NGRAM + EAGLE + Adaptive) integrated through plugin path
+3. **Speculative decoding — two SGLang algorithms** (NGRAM + EAGLE), plus EAGLE's `speculative_adaptive` num_steps tuner enabled (which is a runtime knob on EAGLE, NOT a third algorithm)
 
 P3a estimate: **6-8 weeks total** (W1-W8). All-in scope; longer than original "lean" framing because user prioritized full speculative bring-up.
 
@@ -33,7 +33,7 @@ P3b/P3c/P3d are scoped in §A1 — gated on P3a §10 acceptance + EAGLE result e
 | **G1** | 24h+ stability on 2× Blackhole p150a with synthetic batched workload (B=4 concurrent; prompt length distribution = 80% uniform random in [1024, 8192], 20% uniform random in [10240, 12288]; max_tokens uniform random in [200, 1000]). ~30-50万 requests across 24h. | **decode tok/s drift < 5%** across 4×6h windows (baseline = W1, tail = W4). No crash / SIGQUIT throughout. |
 | **G2** | Production observability: SGLang Prometheus metrics enabled (`--enable-metrics`) + custom Grafana dashboard JSON delivered. Panels: queue depth, batched decode tok/s, RadixCache hit rate, ITL p50/p99, KV pool utilization, per-arch (Llama / Qwen3) breakdown, speculative accept_rate, accept_length. | Dashboard JSON at `python/sglang/srt/hardware_backend/tenstorrent/scripts/grafana_p3a_dashboard.json`; manual screenshot during 24h test recorded in `_fixtures/p3a_grafana_screenshot.png`. |
 | **G3** | Speculative decoding — **NGRAM** integrated through plugin path. Config via `--speculative-algorithm NGRAM --speculative-num-steps N`. | ≥ 1.3× decode tok/s improvement vs no-spec baseline on Llama-3.1-8B; cache hit + RadixAttention still operational. |
-| **G4** | Speculative decoding — **EAGLE** (draft model cohosted on mesh). Draft model selection deferred to Phase 0 (Q1). | ≥ 2× decode tok/s on appropriate prompts vs no-spec. Acceptance length τ (`accept_length`) ≥ 2.0. |
+| **G4** | Speculative decoding — **EAGLE** (draft model cohosted on mesh). Draft model selection deferred to Phase 0 (Q1). | ≥ 2× decode tok/s on appropriate prompts vs no-spec. Acceptance length τ (`accept_length`) measured via §10.6's **calibrated criterion** (τ ≥ 0.85× of 10-prompt calibration baseline), NOT a hardcoded 2.0 — Q4 admits 1.5 lower bound is plausible on TT BFP8. |
 | **G5** | Speculative decoding — **EAGLE + `speculative_adaptive` num_steps tuner** enabled. Note: `speculative_adaptive` is NOT a third algorithm; it's a bool flag (server_args.py:580) that auto-tunes EAGLE's `num_steps` at runtime. Tests EAGLE with adaptive on/off comparison. | Adaptive-on run logs num_steps changes; throughput within 5% of best-tuned static num_steps (i.e., adaptive doesn't regress). |
 
 ### 1.2 Non-goals (explicitly NOT in P3a — pushed to P3b/P3c/P3d)
