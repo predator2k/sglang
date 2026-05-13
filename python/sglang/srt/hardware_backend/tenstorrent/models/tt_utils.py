@@ -7,7 +7,6 @@ import os
 from abc import ABC
 
 import torch
-from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +42,8 @@ class BaseMetalDeviceRunner(ABC):
 
             # Now open device - will see only the devices assigned to this worker
             self.ttnn_device = self._mesh_device()
+        from sglang.srt.server_args import get_global_server_args
+
         server_args = get_global_server_args()
         self.max_batch_size = server_args.max_running_requests or 32
         return self.ttnn_device

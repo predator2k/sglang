@@ -9,9 +9,6 @@ import os
 from contextlib import suppress
 
 import torch
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from torch import nn
 
 from .tt_utils import BaseMetalDeviceRunner
@@ -32,6 +29,11 @@ class TTModels(nn.Module):
 
     def __init__(self, config, quant_config=None, tt_model=None, **kwargs):
         super().__init__()
+
+        # Lazy import: avoids pulling in sglang.srt.layers chain at class-definition time
+        # (needed for CPU-only unit tests where logits_processor → dp_attention → configs
+        # would fail due to optional deps like Lfm2Config / triton not present).
+        from sglang.srt.server_args import get_global_server_args
 
         # Setup worker environment FIRST, before any tt-metal imports or model init
         # This sets TT_METAL_CACHE and TT_CACHE_HOME per worker for isolation
@@ -85,9 +87,11 @@ class TTModels(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch,  # ForwardBatch — lazy import to avoid logits_processor chain
         input_embeds: torch.Tensor = None,
-    ) -> LogitsProcessorOutput:
+    ):  # -> LogitsProcessorOutput — lazy import
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
         page_table = self._build_page_table(
             forward_batch
         )  # returns block IDs for every user in current batch
@@ -156,6 +160,7 @@ class TTModels(nn.Module):
         This method should be called from the SGlang's ModelRunner after the pool is initialized.
         """
         import ttnn
+        from sglang.srt.server_args import get_global_server_args
 
         # Get hardware info from mesh_device (already opened by device_runner in tt_utils)
         num_devices_per_model = self.mesh_device.get_num_devices()
@@ -229,6 +234,8 @@ class TTModels(nn.Module):
     def _build_page_table(self, forward_batch):
         """Converts SGLang's token indices (memory positions) per user to block IDs per user.
         helper function for forward function"""
+        from sglang.srt.server_args import get_global_server_args
+
         req_to_token_pool = forward_batch.req_to_token_pool  # get token pool
         req_pool_indices = (
             forward_batch.req_pool_indices
@@ -247,7 +254,7 @@ class TTModels(nn.Module):
         return page_table.to(torch.int32)
 
     def _flatten_to_padded(
-        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+        self, input_ids: torch.Tensor, forward_batch  # ForwardBatch — lazy import
     ) -> torch.Tensor:
         """Converts SGLang's flattened input_ids to padded batch structure (batch_size, max_len).
         helper function for prefill mode (in forward function)
