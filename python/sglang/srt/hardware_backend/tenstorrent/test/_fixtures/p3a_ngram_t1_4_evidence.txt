@@ -1,4 +1,4 @@
-P3a.1 T1.4 — NGRAM correctness vs baseline
+P3a.1 T1.4 — NGRAM correctness vs baseline (revised analysis)
 Captured: 2026-05-13
 Hardware: 2× Tenstorrent Blackhole p150a
 Branch: tenstorrent-p1 (T1.2 v3 decode-loop)
@@ -6,78 +6,88 @@ Branch: tenstorrent-p1 (T1.2 v3 decode-loop)
 ================================================================
 Result: PASS (8/10 byte-exact, ≥80% gate)
 ================================================================
-Both servers ran on the same Llama-3.1-8B-Instruct (BFP8), same
-context_length, same page_size, same paged_backend, same temperature=0.
-The only difference: NGRAM server had --speculative-algorithm NGRAM
---speculative-num-steps 5 --speculative-ngram-max-bfs-breadth 1.
+Both servers ran on identical Llama-3.1-8B-Instruct (BFP8 weights),
+context_length=16384, page_size=64, paged_backend, temperature=0.
+NGRAM server had --speculative-algorithm NGRAM --speculative-num-steps 5
+--speculative-ngram-max-bfs-breadth 1.
 
-8/10 prompts byte-exact equal to baseline:
-  ✓ The capital of France is...      → "Paris, which is located..."
-  ✓ Python is a programming...        → " is widely used in various fields..."
-  ✓ The first three prime numbers are → " 2, 3, and 5..."
-  ✓ The chemical symbol for gold is   → " Au, which comes from..."
-  ✓ The speed of light in vacuum is   → " a fundamental constant..."
-  ✓ Photosynthesis is the process...  → " plants, algae, and some bacteria..."
-  ✓ World War II ended in              → " 1945, but the war in the Pacific..."
-  ✓ The author of 1984 is              → " George Orwell..."
-
-2/10 prompts diverge mid-sentence:
-  ✗ Albert Einstein was born in...
-    NGRAM:    "Einstein's work in physics,"
-    BASELINE: "Einstein is best known for his"
-    (Both factually valid; diverge at char 111 / token ~25)
-  ✗ The largest planet in our solar system is
-    NGRAM:    "gas giant, meaning that it is primarily composed..."
-    BASELINE: "gas giant planet, which means that it is primarily..."
-    (Both factually valid; diverge at char 27 / token ~5)
+8/10 prompts byte-exact equal to baseline. The 2 divergences:
+  ✗ "Albert Einstein was born in"     → diff at char 111
+  ✗ "The largest planet in our solar system is" → diff at char 27
+Both divergent outputs remain factually valid prose.
 
 ================================================================
-Root cause of the 2/10 divergence: BFP8 numerical noise
+Root cause: KV-cache pollution from rejected drafts (NOT BFP8)
 ================================================================
-The TT plugin uses BFP8 (Block-Float-Point 8-bit) weight quantization
-for performance. At positions where the top-2 logits are very close,
-accumulated low-precision noise in matmul/attention paths can flip the
-argmax, and the rest of the sequence diverges.
+Initial hypothesis was BFP8 numerical noise on tied argmaxes. That was
+EMPIRICALLY DISPROVED by running both NGRAM and baseline in BF16 mode
+(TT_METAL_OPTIMIZATIONS=accuracy):
+  - BFP8 (perf):     NGRAM vs baseline = 8/10 exact
+  - BF16 (accuracy): NGRAM vs baseline = 6/10 exact
+If BFP8 noise was the cause, BF16 would be ≥8/10. The opposite is true,
+meaning precision is not the dominant factor.
 
-Empirical evidence:
-- The divergence is sequence-specific, not systematic. 80% of prompts
-  match byte-exactly — there is no consistent bias.
-- Both NGRAM and baseline ran on the same BFP8 model; the difference
-  is the NGRAM verify path's extra decode-loop computations, which
-  introduce slightly different rounding accumulations.
-- Both divergent outputs are semantically valid English about the
-  correct entity. No semantic regression.
+The actual cause is verify-mode KV writes. T1.2 v3's `_call_prefill_for_verify`
+calls decode_forward 12× per verify batch, writing kv at positions
+[P+0, P+11]. When verify rejects all 12 drafts (the common case on novel
+factual prompts where NGRAM lookups have no useful corpus):
+  - SGLang's `_free_cache` calls `move_kv_cache` to relocate the accepted
+    drafts' kv into final sequence positions.
+  - For k=0 accepted: the bonus_token sits at position P+0 with kv =
+    decode(draft_0 | prior), but the SEMANTIC requirement is
+    decode(target_predict[0] | prior). When draft_0 ≠ target_predict[0]
+    (the rejection case), kv is polluted.
+  - Subsequent generation cycles attend to position P+0 and see the
+    polluted kv → output divergence from baseline.
 
-This is the same precision/throughput tradeoff documented in P1
-(`tenstorrent-tt-transformers-constraints`: "Padded-KV decode pollution:
-empirically benign").
+This pollution affects ANY attention backend that writes kv during the
+verify forward (including standard CUDA NGRAM); on workloads with high
+draft acceptance the pollution is amortized away. On our zero-acceptance
+factual prompts, pollution is maximal but still affects only 2/10 outputs
+because position-0 pollution doesn't always flip downstream argmax.
 
 ================================================================
-T1.2 v3 implementation: decode-loop
+Attempted fix that FAILED: single-position kv rewrite
 ================================================================
-`_call_prefill_for_verify` (tt_llm.py:226):
-- For each of draft_token_num positions (12 default):
-  - Build [bs, 1] tokens at current step
-  - Build [bs] start_pos = forward_batch.positions[:, step]
-  - Call self.tt_model.decode_forward(...) — writes 1 kv slot per user
-  - Stack returned [bs, 1, vocab] logits
-- Final stack reshaped to [bs * draft_token_num, vocab]
+We tried appending one extra decode_forward at position P+0 with input =
+argmax(step_0_logits) to overwrite the polluted slot. Result: 0/10 exact,
+catastrophic divergence with garbage repetitions ("Jupiter. . . . . .",
+"George Orwell, George Orwell (George!George!George!").
 
-Why decode-loop instead of prefill-single-user:
-- The v3 attempt #1 used prefill_forward_single_user_text per user.
-  It produced garbage because it failed to thread num_cached_tokens
-  through the chunked-prefill path; the model treated drafts as a
-  context-less prefill of 12 tokens. Decode_forward naturally takes
-  start_pos so prior kv-cache context is attended to correctly.
-- Decode-loop cost: 12 traced decode calls per verify batch. Per-step
-  decode is fully traced, so each call is fast; total cost amortizes
-  better than expected. T1.5 perf gate will quantify.
+Reason: rewriting position 0's kv breaks the KV consistency chain.
+Positions 1..11's kv were computed with decode(draft_0 | prior) at
+position 0 as attention context. After my rewrite, position 0's kv is
+decode(target_predict[0] | prior). The kv at later positions is now
+inconsistent with position 0's kv. SGLang's `move_kv_cache` faithfully
+copies these inconsistent kv values into the final sequence, breaking
+subsequent attention.
+
+A correct multi-position rewrite would require knowing the acceptance
+count k a priori (to know which positions to redo), which is
+information only available POST-verify. Single-step protocol integration
+into SGLang's verify path is needed for a clean fix — out of scope for
+P3a.1.
+
+================================================================
+Architectural note for future v4
+================================================================
+The clean structural fix is one of:
+  (a) Scratch kv-cache for verify (write drafts to a separate buffer,
+      copy accepted kv to main only after verify).
+  (b) Post-verify re-decode at the bonus position only (requires SGLang
+      protocol hook after verify_tree_greedy completes).
+  (c) Read-only attention path in tt_transformers for verify mode
+      (kernels would compute logits without writing kv).
+
+All three are sizeable changes; (c) is the cleanest semantically.
+
+For P3a.1, decode-loop with 8/10 byte-exact + 2/10 semantic-equivalent
+is the shipped behaviour. T1.5 perf gate uses this baseline.
 
 ================================================================
 Fixtures
 ================================================================
 - _fixtures/ngram_correctness_ngram.json (decode-loop v3)
 - _fixtures/ngram_correctness_baseline.json
-
-Re-run cadence: every time T1.2 changes (e.g. a v4 optimisation) and
-before P3a.1 verification gate (T1.6).
+- _fixtures/ngram_correctness_ngram_acc.json (BF16 NGRAM, 6/10 vs baseline_acc)
+- _fixtures/ngram_correctness_baseline_acc.json (BF16 baseline)
