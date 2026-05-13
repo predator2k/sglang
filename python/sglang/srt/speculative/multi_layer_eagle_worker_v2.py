@@ -42,6 +42,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     assign_hidden_states_pool_triton,
     rotate_input_ids_triton,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -322,7 +323,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                             (tree_info[2].size(0), 1),
                             i,
                             dtype=torch.long,
-                            device="cuda",
+                            device=(
+                                "cpu"
+                                if current_platform.device_name == "tenstorrent"
+                                else current_platform.device_name
+                            ),
                         )
                     )
 
