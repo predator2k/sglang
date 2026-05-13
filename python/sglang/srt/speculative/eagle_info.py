@@ -44,6 +44,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
 if is_cuda() or is_musa():
@@ -98,18 +99,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+        _dev = (
+            "cpu"
+            if current_platform.device_name == "tenstorrent"
+            else current_platform.device_name
+        )
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=_dev),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=_dev),
+            positions=torch.empty((0,), dtype=torch.int64, device=_dev),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=_dev
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=_dev
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=_dev
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -682,6 +688,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # V2 overlap worker only
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
+    # verify_done is None on non-CUDA platforms; CUDA-specific event used only when device.type == "cuda"
     verify_done: Optional[torch.cuda.Event] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
