@@ -224,28 +224,28 @@ class TTModels(nn.Module):
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
 
     def _call_prefill_for_verify(self, forward_batch):
-        """Verify-batch forward (P3a.1 T1.2 v2 — last-token tile placeholder).
+        """Per-draft-position logits via decode-loop (P3a.1 T1.2 v3).
 
         SGLang spec verify expects `next_token_logits` shaped
         [bs * draft_token_num, vocab]. tt_transformers' batched
-        `prefill_forward_text` only returns last-token logits per user
-        ([bs, 1, vocab]) — extracting per-position logits requires deep
-        wrangling of per-submesh kv_cache + page_table layouts.
+        `prefill_forward_text` only returns last-token logits per user;
+        attempting to bypass via `prefill_forward_single_user_text` requires
+        threading `num_cached_tokens` through a chunked-prefill path with
+        page_table padding that's fragile to get right (v3 attempt #1 left
+        the model with no prefix-attention context and produced garbage
+        outputs).
 
-        This placeholder tiles the last-token logits across all draft
-        positions to satisfy the shape contract. Consequence: NGRAM
-        acceptance rate ≈ 0% (only the bonus token at position N-1 will
-        ever match a draft); generated text is correct because rejected
-        drafts fall back to the bonus token, but no perf gain. Bit-exact
-        correctness (T1.4) is preserved; perf gate (T1.5) is NOT met
-        until T1.2 v3 implements true per-position logits via
-        `prefill_forward_single_user_text` + `concat_host_output` slicing
-        with proper per-submesh kv_cache/page_table_user threading.
+        Decode-loop approach: 12 `decode_forward` calls per verify batch
+        (one per draft position). Each call writes one draft KV slot at
+        the proper absolute position and returns logits at that position.
+        Correctness matches a sequential autoregressive decode; SGLang's
+        verify pipeline then walks the draft tree and reclaims rejected
+        slots from the allocator. Per-step decode is fully traced so the
+        cost amortizes; T1.5 perf gate will quantify the actual cost.
         """
         import torch as _torch
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        page_table = self._build_page_table(forward_batch)
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
         draft_token_num = int(spec_info.draft_token_num)
@@ -254,19 +254,35 @@ class TTModels(nn.Module):
             f"verify input_ids shape mismatch: got {flat_input.shape[0]}, "
             f"expected bs*dn = {bs}*{draft_token_num} = {bs * draft_token_num}"
         )
-        tokens_per_user = flat_input.view(bs, draft_token_num)
-        prompt_lens = [draft_token_num] * bs
-
-        logits = self.tt_model.prefill_forward(
-            tokens=tokens_per_user.to(_torch.int32),
-            page_table=page_table,
-            kv_cache=self.kv_caches,
-            prompt_lens=prompt_lens,
+        tokens_per_user = flat_input.view(bs, draft_token_num).to(_torch.int32)
+        positions_per_user = forward_batch.positions.view(bs, draft_token_num).to(
+            _torch.int32
         )
-        # logits shape: [bs, 1, vocab]. Squeeze + tile to [bs * dn, vocab].
-        last_token_logits = logits.squeeze(1)
-        tiled = last_token_logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, last_token_logits.shape[-1])
-        return LogitsProcessorOutput(next_token_logits=tiled)
+
+        page_table = self._build_page_table(forward_batch)
+
+        per_step_logits = []
+        for step in range(draft_token_num):
+            tokens_step = tokens_per_user[:, step:step + 1]  # [bs, 1]
+            positions_step = positions_per_user[:, step]      # [bs]
+            padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
+                tokens_step, positions_step, page_table
+            )
+            decode_out = self.tt_model.decode_forward(
+                tokens=padded_tokens,
+                start_pos=padded_positions,
+                page_table=padded_pt,
+                kv_cache=self.kv_caches,
+                enable_trace=True,
+                read_from_device=True,
+            )
+            # decode_out[0]: [tt_batch, 1, vocab]; slice back to actual bs.
+            logits_step = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
+            per_step_logits.append(logits_step)
+
+        stacked = _torch.stack(per_step_logits, dim=1)  # [bs, dn, vocab]
+        flat = stacked.reshape(-1, stacked.shape[-1])    # [bs * dn, vocab]
+        return LogitsProcessorOutput(next_token_logits=flat)
 
     def allocate_on_device(self):  # function aloocating kv cache
         """
