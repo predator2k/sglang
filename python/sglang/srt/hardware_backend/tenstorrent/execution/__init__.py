@@ -47,14 +47,13 @@ from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402, F
 
 
 def resolve_execution_backend_name(requested: str | None = None) -> str:
-    """Resolve "auto" / "" / None to the P2a default.
+    """Resolve to P2a default: tt_transformers_paged (plugin path).
 
-    Phase 0: auto → tt_transformers_single (paged backend not yet registered)
-    Phase 4 Task 4.10: flip auto → tt_transformers_paged
+    P2a.0 default was tt_transformers_single; P2a.1 flips to paged.
     """
     name = (requested or envs.SGLANG_TT_EXECUTION_BACKEND.get() or "auto").lower()
     if name == "auto":
-        return "tt_transformers_single"
+        return "tt_transformers_paged"  # was tt_transformers_single in P2a.0
     return name
 
 

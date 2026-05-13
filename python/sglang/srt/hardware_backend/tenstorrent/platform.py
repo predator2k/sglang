@@ -29,6 +29,10 @@ def activate_tt_platform() -> str | None:
         import ttnn  # noqa: F401
     except ImportError:
         return None
+    # Register Tenstorrent models with SGLang ModelRegistry (INV-6).
+    # Side-effect import: models/__init__.py calls register_tt_models()
+    from sglang.srt.hardware_backend.tenstorrent import models  # noqa: F401
+    logger.info("[TT-Platform] Tenstorrent model arches registered")
     return "sglang.srt.hardware_backend.tenstorrent.platform:TTSRTPlatform"
 
 
