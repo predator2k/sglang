@@ -1,0 +1,199 @@
+P3a Phase 0 — Open Questions Evidence
+Captured: 2026-05-13
+Branch: tenstorrent-p1 at 17e46859aecf88482098253b0a8247fe3cbaacd1
+
+================================================================
+Q2: Does SGLang speculative runner have CUDA-specific code paths?
+================================================================
+
+Grep command:
+  grep -rnE 'cuda|\.cuda\(\)|device\s*=\s*["'"'"']cuda' python/sglang/srt/speculative/
+
+Selected relevant hits (full output: 411 lines; CUDA-graph infrastructure hits
+are listed only in aggregate):
+
+  ngram_worker.py:48         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+  ngram_worker.py:122-143    _init_preallocated_tensors: 7× torch.empty/torch.full with device=self.device
+  ngram_worker.py:229        req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
+  ngram_worker.py:231        torch.from_numpy(mask[i]).cuda()
+  eagle_info.py:102          draft_token=torch.empty((0,...), device="cuda")
+  eagle_info.py:103          custom_mask=torch.full((0,...), device="cuda")
+  eagle_info.py:104          positions=torch.empty((0,...), device="cuda")
+  eagle_info.py:106          retrieve_index=torch.full((...), device="cuda")
+  eagle_info.py:109          retrieve_next_token=torch.full((...), device="cuda")
+  eagle_info.py:112          retrieve_next_sibling=torch.full((...), device="cuda")
+  eagle_info.py:685          verify_done: Optional[torch.cuda.Event] = None
+  multi_layer_eagle_worker_v2.py:325  device="cuda"  (parents_list entry)
+  spec_utils.py:587          sim_accept_index = torch.full((...), device="cuda")
+  ngram_info.py:39           if is_cuda() or is_musa(): ... import tree_speculative_sampling / verify_tree_greedy
+  spec_utils.py:34,51        if _is_cuda ... import fast_topk / TREE_SPEC_KERNEL_AVAILABLE guard
+  eagle_utils.py:14,173      if _is_cuda or _is_hip or _is_musa: ... import sgl_build_tree_kernel_efficient / verify_tree_greedy
+  eagle_info.py:49           if is_cuda() or is_musa(): ... (sgl_kernel conditional import)
+  eagle_info_v2.py:52        if is_cuda() or is_musa(): ... (sgl_kernel conditional import)
+  dflash_utils.py:28         if is_cuda() or is_musa(): ... (sgl_kernel conditional import)
+  dflash_worker.py:230       self._use_fused_kv_materialize = is_cuda()
+  eagle_worker.py:85         if is_cuda(): from sgl_kernel import segment_packbits
+  standalone_worker.py:20    if is_cuda(): from sgl_kernel import segment_packbits
+  standalone_worker_v2.py:20 if is_cuda(): from sgl_kernel import segment_packbits
+  multi_layer_eagle_worker.py:65  if is_cuda(): from sgl_kernel import segment_packbits
+  frozen_kv_mtp_worker.py:316  if self.target_worker.device != "cuda": (CUDA-graph init guard — safe)
+  [~200 additional hits: cuda_graph_runner references throughout eagle/frozen-kv workers — all SAFE]
+
+Categorized:
+  MUST patch (CUDA-hardcoded state allocation, device args):
+    - ngram_worker.py:48      — self.device hardcoded to "cuda:{gpu_id}" or "cuda"; all
+                                 preallocated tensors (lines 122-143) inherit this device.
+                                 Fix: derive device from target_worker.model_runner.device.
+    - ngram_worker.py:229,231 — .cuda() calls in USE_FULL_MASK tree-mask path; crash on TT.
+                                 Fix: replace with .to(self.device).
+    - eagle_info.py:102-112   — create_idle_input() hardcodes device="cuda" for 6 tensors
+                                 (draft_token, custom_mask, positions, retrieve_index,
+                                 retrieve_next_token, retrieve_next_sibling).
+                                 Fix: pass device argument through from caller context.
+    - eagle_info.py:685       — verify_done: Optional[torch.cuda.Event]; torch.cuda.Event
+                                 is CUDA-only. TT path must skip or stub this field.
+    - multi_layer_eagle_worker_v2.py:325 — device="cuda" when building parents_list tensors
+                                 inside EAGLE multi-layer draft loop.
+                                 Fix: use self.device or model_runner.device.
+    - spec_utils.py:587       — sim_accept_index = torch.full(..., device="cuda") in
+                                 simulate_acceptance_length(); used by benchmarking / adaptive
+                                 spec path. Fix: use accept_index.device (already available
+                                 in same scope as accept_index.device at line 590).
+
+  MUST audit (dispatch via tensor.device — should work if tensor is CPU/TT, but verify):
+    - ngram_info.py:39        — if is_cuda() or is_musa(): imports verify_tree_greedy /
+                                 tree_speculative_sampling from sgl_kernel. TT will not enter
+                                 these branches, so the sgl_kernel CUDA kernels are not
+                                 called. However the else-branch must still exist or the
+                                 caller must avoid the TREE_SPEC_KERNEL_AVAILABLE path.
+    - spec_utils.py:34,51     — _is_cuda guard for fast_topk / TREE_SPEC_KERNEL_AVAILABLE.
+                                 TT falls through to CPU fast_topk path (line 37–38 else
+                                 branch). Functional but may need a TT-specific topk.
+    - eagle_utils.py:14,173   — _is_cuda guard for build_tree_kernel / verify_tree_greedy.
+                                 TT will take the non-CUDA branch; correctness depends on
+                                 whether a CPU fallback is fully implemented.
+    - eagle_info.py:49 /      — is_cuda() or is_musa() guards around sgl_kernel imports
+      eagle_info_v2.py:52 /     (tree kernels). TT skips import; runtime must not call the
+      dflash_utils.py:28        guarded symbols. Verify callers gate on TREE_SPEC_KERNEL_AVAILABLE.
+    - dflash_worker.py:230    — self._use_fused_kv_materialize = is_cuda(). TT gets False,
+                                 disabling fused KV materialize. Correctness: OK (fallback
+                                 path exists); performance impact: acceptable for P3a.
+    - frozen_kv_mtp_worker.py:316 — if self.target_worker.device != "cuda": skips
+                                 cuda_graph capture. TT will skip graph capture cleanly.
+
+  SAFE (string-only, CUDA-graph infrastructure references in log messages / field names):
+    - All ~200 remaining grep hits in:
+        eagle_worker.py, eagle_worker_v2.py, multi_layer_eagle_worker.py,
+        multi_layer_eagle_worker_v2.py, eagle_draft_cuda_graph_runner.py,
+        eagle_draft_extend_cuda_graph_runner.py, frozen_kv_mtp_cuda_graph_runner.py,
+        multi_layer_eagle_draft_extend_cuda_graph_runner.py,
+        adaptive_spec_params.py, adaptive_runtime_state.py
+      These are: cuda_graph_runner attribute names, CudaGraphRunner class references,
+      can_run_cuda_graph flags, log-message strings, and TYPE_CHECKING-guarded imports.
+      All gated behind disable_cuda_graph=True (which TT already sets) or
+      device != "cuda" guards already present (frozen_kv_mtp_worker.py:316).
+    - eagle_worker.py:85 / standalone_worker.py:20 / standalone_worker_v2.py:20 /
+      multi_layer_eagle_worker.py:65 — segment_packbits import under is_cuda(); noqa F401
+      means it is re-exported for other callers but no call site was found inside spec.
+      SAFE for TT (TT skips the if-is_cuda block).
+
+Q2 answer: YES — confirmed 6 MUST-patch sites across 4 files:
+  - speculative/ngram_worker.py: lines 48, 122-143, 229, 231
+  - speculative/eagle_info.py: lines 102, 103, 104, 106, 109, 112 (6 tensor literals)
+                                line 685 (torch.cuda.Event field)
+  - speculative/multi_layer_eagle_worker_v2.py: line 325
+  - speculative/spec_utils.py: line 587
+
+R-P3-3 verdict: HIGH confirmed.
+T0.2 must patch ngram_worker.py, eagle_info.py, multi_layer_eagle_worker_v2.py,
+and spec_utils.py. MUST-audit sites should be re-examined in T1.1 when
+SpecDecodeAdapter is wired in.
+
+New sites NOT listed in spec §2.3:
+  - eagle_info.py:685          (torch.cuda.Event field — not in §2.3)
+  - multi_layer_eagle_worker_v2.py:325  (device="cuda" in parents_list — not in §2.3)
+
+================================================================
+Q3: Does plugin's forward() need new code path for verify-batch?
+================================================================
+
+Evidence: grep 'spec_info' python/sglang/srt/model_executor/forward_batch_info.py
+
+  forward_batch_info.py:404    spec_info: Optional[SpecInput] = None
+  forward_batch_info.py:482    spec_info=batch.spec_info,
+  forward_batch_info.py:513-516  if batch.spec_info is not None: spec_adjusted token counts
+  forward_batch_info.py:551-554  ret.positions overridden by spec_info.positions
+  forward_batch_info.py:587-588  same positions override logic for extend path
+  forward_batch_info.py:719    position_chunks = torch.split(batch.spec_info.positions, ...)
+  forward_batch_info.py:910    spec_info adjusts seq-len accounting
+  forward_batch_info.py:991-1008 spec_info.is_draft_input() branch: pads topk_p, topk_index,
+                                  num_accepted_drafts, num_accepted_tokens tensors
+
+The ForwardBatch.spec_info field carries an optional SpecInput (NgramVerifyInput,
+EagleDraftInput, etc.) that encodes the draft tree structure, custom masks,
+retrieve indices, and positional offsets required by the verifier. The plugin's
+current forward() only branches on ForwardMode.EXTEND / ForwardMode.DECODE; a
+TARGET_VERIFY batch arrives with forward_mode=TARGET_VERIFY (set in
+ngram_worker.py:247) and a populated spec_info.
+
+The TT model runner's forward() does not inspect spec_info at all today. Because
+tt_transformers runs standard autoregressive attention, a TARGET_VERIFY batch with
+a flat draft-token sequence and modified positions will be forwarded correctly only
+if the attention mask is compatible with the verify tree structure. This requires
+either (a) the verify batch to be collapsed to a flat sequence before dispatch
+(handled by the spec runner before calling forward()) or (b) an explicit
+SpecDecodeAdapter branch in the plugin.
+
+Q3 answer: YES — verify-batch carries draft-tree shape via spec_info. Plugin's
+current TTModels.forward() only handles EXTEND/DECODE; a new branch is needed.
+This will be introduced as SpecDecodeAdapter in T1.1. The adapter must:
+  1. Detect forward_mode == TARGET_VERIFY
+  2. Flatten draft tree tokens and positions into the sequence format tt_transformers
+     expects (one flat KV extension per verify step)
+  3. Post-process logits to restore per-draft-token shape for spec_utils.py acceptance
+
+================================================================
+Q5: Memory budget for cohosting 8B + 1B + 4 KV pools?
+================================================================
+
+Q5 answer (calculated, not measured — T0.3 verifies empirically):
+
+  Hardware: 2× Tenstorrent Blackhole p150a
+  Device memory per card: ~64 GB (p150a L1+DRAM; conservative estimate)
+  Total device memory: ~128 GB across TP=2
+
+  Weight memory (BFP8 weights, TP sharded across 2 cards):
+    Llama-3.1-8B  (BFP8): ~8 GB total → ~4 GB per card
+    Llama-3.2-1B  (BFP8): ~1 GB total → ~0.5 GB per card
+    Subtotal weights: ~9 GB total / ~4.5 GB per card
+
+  KV cache memory (4 pools, Layout A — target + draft, each with prefill+decode):
+    Assumption: context=16K tokens, 32 layers, 8 heads, head_dim=128, BFP8 (1 byte/element)
+    Per-token KV (one layer, K+V, one head): 2 × 128 = 256 bytes
+    Per-token KV (32 layers, 8 heads): 256 × 32 × 8 = 65536 bytes = 64 KB
+    Pool size (B=4 req × 16K ctx): 4 × 16384 × 64 KB = ~4 GB per pool
+    4 pools (target-prefill, target-decode, draft-prefill, draft-decode): ~16 GB total
+    TP sharding: KV is typically NOT TP-sharded (each card holds full KV) → 16 GB per card
+
+    Note: 16K context is a conservative upper bound; 4K context yields ~1 GB per pool /
+    4 GB total for 4 pools (1 GB per card).
+
+  Total estimated footprint:
+    Weights (both models):        ~9 GB total  (~4.5 GB per card)
+    4 KV pools @ 16K context:    ~16 GB total (~16 GB per card — not TP-sharded)
+    Runtime + activation buffers:  ~4 GB per card (conservative)
+    ─────────────────────────────────────────────────────────────
+    Rough total:                  ~29 GB per card (16K ctx) or ~9 GB per card (4K ctx)
+
+  2× p150a budget: ~64 GB per card
+  Utilization: ~29/64 = ~45% at 16K context → fits comfortably.
+
+  If "4 KV pools" means 4 independent pools for 4 concurrent sequences (B=4 batch):
+    Total KV: B=4 × 16K × 64 KB = ~4 GB total (shared across target + draft)
+    Footprint: weights ~9 GB + KV ~4 GB + overhead ~4 GB = ~17 GB per card → ~27% utilization
+
+  Either interpretation fits within 64 GB per card (128 GB total TP=2).
+  T0.3 should measure actual tt_transformers allocation after model load to replace
+  these estimates with observed figures.
+
+Should fit comfortably. T0.3 verifies empirically (Layout A or B).
