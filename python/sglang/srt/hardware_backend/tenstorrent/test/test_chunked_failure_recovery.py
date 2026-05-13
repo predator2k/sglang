@@ -32,8 +32,58 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def _ensure_real_parent_packages():
+    """Pre-populate sys.modules with lightweight real-package stubs for the
+    ``sglang.srt.*`` namespace hierarchy.
+
+    ``_make_pkg`` (used by ``_install_stubs``) only inserts a fake module when
+    the key is absent from ``sys.modules``.  If this function runs first, the
+    parent packages are already claimed by real (or minimal-real) entries, so
+    ``_make_pkg`` leaves them alone.
+
+    Without this guard, when pytest collects ``test_chunked_failure_recovery``
+    before ``test_plugin_registration`` (in the same process), the fake parent
+    stubs inserted here would cause ``test_plugin_registration`` to fail with
+    ``ImportError: cannot import name … from 'sglang.srt.hardware_backend.
+    tenstorrent.models' (unknown location)`` because the stub has no real
+    attributes.
+
+    We only create minimal path-aware module objects — no ``__init__.py`` is
+    executed, so no import side-effects are triggered.
+    """
+    import pathlib
+
+    _SGLANG_PYTHON = pathlib.Path(__file__).parents[5]  # .../python/
+
+    _PARENT_PKGS = [
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.hardware_backend",
+        "sglang.srt.hardware_backend.tenstorrent",
+    ]
+    for dotted in _PARENT_PKGS:
+        if dotted in sys.modules:
+            continue
+        parts = dotted.split(".")
+        pkg_dir = _SGLANG_PYTHON.joinpath(*parts)
+        mod = types.ModuleType(dotted)
+        mod.__path__ = [str(pkg_dir)]
+        mod.__package__ = dotted
+        sys.modules[dotted] = mod
+
+
+_ensure_real_parent_packages()
+
+
 def _install_stubs():
-    """Insert minimal stubs for modules that tt_llm imports at module level."""
+    """Insert minimal stubs for modules that tt_llm imports at module level.
+
+    Returns the set of sys.modules keys that were freshly added (so the caller
+    can remove them on teardown, preventing cross-test pollution when this
+    module runs alongside test_plugin_registration.py in the same pytest
+    process).
+    """
+    added_keys: set = set()
 
     def _make_pkg(*parts):
         """Create nested fake package hierarchy a.b.c … and return the leaf."""
@@ -44,6 +94,7 @@ def _install_stubs():
                 mod = types.ModuleType(full)
                 mod.__path__ = []  # mark as package
                 sys.modules[full] = mod
+                added_keys.add(full)
                 if parent is not None:
                     setattr(parent, name, mod)
             parent = sys.modules[full]
@@ -57,6 +108,7 @@ def _install_stubs():
         stub = types.ModuleType(tt_utils_path)
         stub.BaseMetalDeviceRunner = MagicMock()
         sys.modules[tt_utils_path] = stub
+        added_keys.add(tt_utils_path)
 
     # worker_setup stub
     ws_path = (
@@ -66,6 +118,7 @@ def _install_stubs():
         stub = types.ModuleType(ws_path)
         stub.setup_worker_from_process_title = MagicMock()
         sys.modules[ws_path] = stub
+        added_keys.add(ws_path)
 
     # sglang.srt.server_args stub (get_global_server_args)
     _make_pkg("sglang", "srt", "server_args")
@@ -96,8 +149,27 @@ def _install_stubs():
         "models",
     )
 
+    return added_keys
 
-_install_stubs()
+
+_STUB_KEYS = _install_stubs()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _remove_stubs_after_module():
+    """Yield to let all tests in this module run, then evict stub entries.
+
+    This prevents sys.modules pollution from reaching test_plugin_registration
+    (or any other test file) when both run in the same pytest worker process.
+    Only keys that were freshly inserted by _install_stubs() are removed;
+    real pre-existing modules are left untouched.
+    """
+    yield
+    for key in list(_STUB_KEYS):
+        sys.modules.pop(key, None)
+    # Also evict the dynamically loaded tt_llm stub so it doesn't shadow the
+    # real module in later tests.
+    sys.modules.pop("sglang.srt.hardware_backend.tenstorrent.models.tt_llm", None)
 
 # Now we can safely import TTModels from tt_llm via importlib.
 # Because tt_llm.py uses relative imports (from .tt_utils import …) we must
