@@ -31,6 +31,7 @@ def register_tt_models():
         TT_MODEL_REGISTRY = {
             "LlamaForCausalLM": TenstorrentLlamaForCausalLM,  # Llama-3.1-8B, Llama-3.1-70B, etc.
             "Qwen2ForCausalLM": TenstorrentQwenForCausalLM,  # Qwen2.5-7B, Qwen2.5-14B, etc.
+            "Qwen3ForCausalLM": TenstorrentQwenForCausalLM,  # Qwen3-8B, Qwen3-14B, etc.
             "MistralForCausalLM": TenstorrentMistralForCausalLM,  # Mistral-7B
             "GptOssForCausalLM": TenstorrentGptOssForCausalLM,  # GPT-OSS
         }
