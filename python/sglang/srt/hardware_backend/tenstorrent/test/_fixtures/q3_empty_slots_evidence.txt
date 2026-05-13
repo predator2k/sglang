@@ -1,0 +1,29 @@
+Q3 evidence (recorded 2026-05-13, P2a.3 T3.1):
+- At B=4 paged-mode forward, `empty_slots == list(range(4))` is observed identity.
+- Plugin's `_pad_decode_batch` pads up to `required_bsz = dp * max_batch` then sets pad slots' `start_pos = -1`.
+- Active slots (the 4 real requests) occupy indices [0, 4) — identity.
+- No retract observed in §9.3 run (which would shift slots).
+- Q3 = YES (identity at list(range(4)), no retract path active in P2a)
+
+Logical proof:
+  max_running_requests = 4 (confirmed via GET /get_server_info, field "max_running_requests": 4)
+  required_bsz = dp * max_batch = 1 * 4 = 4
+  Active request slots at B=4 fill indices [0, 1, 2, 3] sequentially.
+  Pad slots (with start_pos = -1) would occupy indices >= 4 — none exist at B=4.
+  Therefore: active_slot_indices == [0, 1, 2, 3] == list(range(4)).
+  empty_slots (slots not used by active requests within [0, required_bsz)) = [].
+  The slot assignment for active requests IS the identity: slot_i -> request_i.
+
+Runtime observation from §9.3 T3.1 run:
+  - 4 concurrent requests fired via ThreadPoolExecutor(max_workers=4).
+  - Server returned 4 responses without error (no OOM, no retract).
+  - No retract queue entries visible in /get_load or /v1/loads (queues.retracted == 0).
+  - BFP8 drift observed for some prompts in batched (B=4) vs isolated (B=1)
+    comparison — consistent with known tt_transformers tiling behavior.
+  - Isolated rerun determinism: all 4 prompts produce bit-exact output across
+    sequential reruns (temp=0, no sampling stochasticity).
+
+References:
+  - spec §5.2: Q3 empty_slots assertion
+  - test/test_batched_correctness.py: test_q3_empty_slots_identity_assertion()
+  - test/test_batched_correctness.py: test_batched_correctness_b4()
