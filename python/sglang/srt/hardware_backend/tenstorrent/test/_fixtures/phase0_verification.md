@@ -519,3 +519,18 @@ All blocking conditions met:
 HiRadixCache, disaggregation, tt-xla model-coverage expansion, performance kernel
 tuning, 4× p150a mesh, Galaxy mesh support, 24h+ stability, production
 observability. Entry point: `superpowers:brainstorming` for P3 scoping.
+
+---
+
+## P3a.0 verification (2026-05-13)
+
+| Deliverable | Status | Commit |
+|---|---|---|
+| Q2/Q3/Q5 evidence (audit + memory budget) | PASS | `2b1471e64` |
+| R-P3-3 patches (4 SGLang files device-agnostic) | PASS | `93feb9f67`, `d512f17be`, `b16c75c78`, `9a5703832` |
+| REBASE_TARGETS.md updated | PASS | `60b0d465b` |
+| Q1 EAGLE mesh planning artifact | PASS (planning) | `32e48361b` |
+
+**Decision**: P3a.0 ACCEPTED for the code-side work. Q1 (EAGLE cohost) deferred
+to operator-led experiment as documented in the planning artifact. P3a.1 (NGRAM
+speculative) can proceed in parallel — does NOT require EAGLE.
