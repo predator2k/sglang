@@ -1,3 +1,20 @@
+> **STATUS 2026-05-13**: These three patches have been migrated to a proper
+> tt-metal fork at `predator2k/tt-metal` on branch `tenstorrent-p1` (base
+> commit `89686ee78d`). The fork has three real commits:
+>
+>   6f5817e7d4 — compat(common): soft-import AutoModelForVision2Seq
+>   477facd22a — compat(tt_transformers): rope_theta fallback for Llama-3/Qwen3
+>   a0b16d1aa6 — fix(generator_sglang): decode_forward_text → decode_forward
+>
+> Continue adding tt-metal changes to that branch directly. Patch 04
+> (NGRAM tree-mask SDPA self-mask) is sketched in `04-attention-self-mask-flag.patch`
+> with the trace-capture blocker documented; it should land as a real
+> tt-metal commit once the ttnn buffer pre-allocation plumbing is figured out.
+>
+> The patches in this directory remain for backwards compatibility (still
+> applied via the apply-loop below for now), but new work should target
+> the fork.
+
 # tt-metal patches for P2a.1 plugin-absorbed path
 
 These patches are applied to the **tt-metal source inside the running container**

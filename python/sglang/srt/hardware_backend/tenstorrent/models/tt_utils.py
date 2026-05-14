@@ -30,9 +30,33 @@ class BaseMetalDeviceRunner(ABC):
 
     def get_pipeline_device_params(self):
         """Return device params including trace_region_size for tracing support."""
-        return {
+        import ttnn
+
+        params = {
             "trace_region_size": 50000000,  # ~50MB for trace buffers
         }
+        # Blackhole default dispatch is WORKER+COL (ttnn picks this when nothing
+        # is passed), which places dispatch cores on top of compute cores and
+        # collides with any kernel whose CoreGrid hasn't been hand-tuned to
+        # dodge them. EAGLE 2-model cohost with untuned model_params/ fallback
+        # configs (e.g. Qwen3-8B + Qwen3-1.7B, neither has a model_params/
+        # entry in tt-metal) hits a TT_FATAL "kernel cannot be placed on
+        # dispatch cores" during prefill bmm. Switching to ROW dispatch with
+        # FabricTensixConfig.MUX moves dispatch off compute cores (ETH-side
+        # under MUX), which is the same config the simple-path MeshDeviceCtx
+        # uses on this hardware. ROW dispatch on Blackhole requires both
+        # fabric_config and fabric_tensix_config to be set — both are paired
+        # below in `_configure_fabric`.
+        if ttnn.device.is_blackhole():
+            params["dispatch_core_axis"] = ttnn.DispatchCoreAxis.ROW
+            params["fabric_tensix_config"] = ttnn.FabricTensixConfig.MUX
+            # `get_updated_device_params` safety gate requires BOTH keys to
+            # exist in the dict (it uses `.get()` not the global fabric state);
+            # without it, the gate force-flips ROW → COL and we end up back at
+            # WORKER+COL. `_initialize_mesh_device` strips this key before the
+            # kwargs splat into `open_mesh_device` (which doesn't accept it).
+            params["fabric_config"] = ttnn.FabricConfig.FABRIC_1D
+        return params
 
     def set_device(self):
         if self.ttnn_device is None:
@@ -99,6 +123,20 @@ class BaseMetalDeviceRunner(ABC):
             dispatch_core_type, dispatch_core_axis, fabric_tensix_config
         )
         new_device_params["dispatch_core_config"] = dispatch_core_config
+
+        # P3a.2 T2.2.A probe — confirm dispatch_core_config actually built.
+        # Grep `TT_DISPATCH_PROBE` in scheduler logs after EAGLE boot.
+        try:
+            self.logger.warning(
+                "TT_DISPATCH_PROBE input_params=%r resolved_type=%s resolved_axis=%s fabric_tensix=%s is_blackhole=%s",
+                device_params,
+                getattr(dispatch_core_config, "get_dispatch_core_type", lambda: None)(),
+                getattr(dispatch_core_config, "get_dispatch_core_axis", lambda: None)(),
+                fabric_tensix_config,
+                ttnn.device.is_blackhole(),
+            )
+        except Exception as _probe_exc:  # noqa: BLE001
+            self.logger.warning("TT_DISPATCH_PROBE failed: %r", _probe_exc)
 
         return new_device_params
 
@@ -180,15 +218,37 @@ class BaseMetalDeviceRunner(ABC):
             f"Device {self.device_id}: Setting fabric config to {fabric_config} for {num_devices} devices"
         )
 
-        ttnn.set_fabric_config(fabric_config)
+        # On Blackhole, ROW dispatch (set in get_pipeline_device_params) requires
+        # FabricTensixConfig.MUX to be active. Match the 4-arg call simple-path
+        # MeshDeviceCtx uses. On non-Blackhole, keep the 1-arg call (no MUX).
+        if ttnn.device.is_blackhole():
+            ttnn.set_fabric_config(
+                fabric_config,
+                ttnn.FabricReliabilityMode.STRICT_INIT,
+                None,  # num_planes
+                ttnn.FabricTensixConfig.MUX,
+            )
+        else:
+            ttnn.set_fabric_config(fabric_config)
 
         return fabric_config
 
     def _initialize_mesh_device(self, mesh_shape, device_params, fabric_config):
         import ttnn
 
+        # `fabric_config` and `fabric_tensix_config` are only used by
+        # `get_updated_device_params` to decide the DispatchCoreConfig — they
+        # are not accepted by `open_mesh_device` and must be removed from the
+        # kwargs splat. (The upstream mirror uses `.get()`, not `.pop()`, so
+        # these leak through.)
+        clean_params = {
+            k: v
+            for k, v in device_params.items()
+            if k not in ("fabric_config", "fabric_tensix_config")
+        }
+
         try:
-            mesh_device = ttnn.open_mesh_device(mesh_shape=mesh_shape, **device_params)
+            mesh_device = ttnn.open_mesh_device(mesh_shape=mesh_shape, **clean_params)
         except Exception as e:
             self.logger.error(
                 f"Device {self.device_id}: Mesh device initialization failed: {e}"
