@@ -47,7 +47,11 @@ class BaseMetalDeviceRunner(ABC):
         # uses on this hardware. ROW dispatch on Blackhole requires both
         # fabric_config and fabric_tensix_config to be set — both are paired
         # below in `_configure_fabric`.
-        if ttnn.device.is_blackhole():
+        # P3a.2 T2.2.C diagnostic: `SGLANG_TT_DISPATCH=legacy` skips the
+        # Blackhole override entirely, falling back to ttnn's WORKER+COL
+        # default. Use this to test whether the ROW+MUX path is implicated
+        # in downstream BFP8 / KV-alloc crashes.
+        if ttnn.device.is_blackhole() and os.environ.get("SGLANG_TT_DISPATCH") != "legacy":
             params["dispatch_core_axis"] = ttnn.DispatchCoreAxis.ROW
             params["fabric_tensix_config"] = ttnn.FabricTensixConfig.MUX
             # `get_updated_device_params` safety gate requires BOTH keys to
@@ -221,7 +225,8 @@ class BaseMetalDeviceRunner(ABC):
         # On Blackhole, ROW dispatch (set in get_pipeline_device_params) requires
         # FabricTensixConfig.MUX to be active. Match the 4-arg call simple-path
         # MeshDeviceCtx uses. On non-Blackhole, keep the 1-arg call (no MUX).
-        if ttnn.device.is_blackhole():
+        # SGLANG_TT_DISPATCH=legacy mirrors the diagnostic bypass above.
+        if ttnn.device.is_blackhole() and os.environ.get("SGLANG_TT_DISPATCH") != "legacy":
             ttnn.set_fabric_config(
                 fabric_config,
                 ttnn.FabricReliabilityMode.STRICT_INIT,
