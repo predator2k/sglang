@@ -65,6 +65,70 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## TODO list (post-session)
+
+### TODO-1: Layout-A wo aliasing fix (T2.2.G)
+
+**Problem:** With shared (1,2) cohost mesh, the draft's `ttnn.as_tensor`
+for the wo weight returns the target's per-device shape rather than the
+draft's. Root cause not pinned: either tt-metal's DRAM-sharded buffer
+allocator aliases across as_tensor calls with matching mem_config
+layout, or `cache_file_name` keys collide despite different paths.
+
+**Investigation needed:**
+  - Read ttnn C++ `as_tensor` + `MemoryConfig` allocator paths to see if
+    there's a buffer-handle cache keyed on layout-only.
+  - Try forcing `cache_file_name=None` for the draft's wo (skip the
+    on-disk cache lookup) to see if that breaks the aliasing.
+  - Try `ttnn.DRAM_MEMORY_CONFIG` (interleaved, not sharded) for the
+    draft's wo specifically — bypasses the DRAM-sharded code path.
+
+**Reward:** Layout-A would have zero per-inference overhead vs the
+Layout-B CPU bounce.
+
+### TODO-2: Layout-B single-chip warmup hang (T2.2.H follow-up)
+
+**Problem:** With `SGLANG_TT_SPEC_DRAFT_MESH_LAYOUT=split` Layout-B
+boots cleanly to Uvicorn, but the first inference hangs in the target
+model's tt-metal lazy warmup (`prefill_forward_text` → tt-metal C++
+opaque). py-spy can't merge native frames; we don't have the exact
+C++ call site.
+
+**Hypotheses** (ordered by probability):
+  1. `trace_region_size=50_000_000` is too large for solo Blackhole's
+     DRAM allocator — silently locks. Try 10_000_000 or omit.
+  2. tt-metal kernel grid configs computed for `num_devices=1` are
+     unsupported on Blackhole (e.g., the QKV / SDPA / WO matmul
+     auto-configs that we patched for `num_devices=2` produce
+     different shapes).
+  3. Some warmup op (e.g., all-gather for CCL) is called
+     unconditionally and waits for the multi-device fabric that
+     single-chip mesh doesn't have.
+  4. tt-metal's program cache / dispatch state from the FIRST mesh
+     open (target on chip 0) leaks into the SECOND mesh open (draft on
+     chip 1), corrupting both.
+
+**Investigation steps:**
+  - Reproduce with single-model (no EAGLE) at `mesh_shape=(1,1)`,
+    physical_device_ids=[0]. If it hangs identically → it's
+    single-chip warmup, not EAGLE.
+  - ~~Drop trace_region_size to 10 MB, retry.~~ **TRIED in v25, still
+    hangs at the same `rotary_embedding_llama` warning. Hypothesis 1
+    eliminated.**
+  - Add `MAX_PREFILL_CHUNK_SIZE` env clamping.
+  - Try `TT_METAL_WATCHER` env to see kernel-level events leading up
+    to the hang.
+  - Try `--max-prefill-tokens 32` + `--chunked-prefill-size 64` to
+    force tiny prefill shapes (we patched server_args.page_size=64
+    earlier so this should pass validation).
+
+**Note re: CPU bounce:** The "CPU bounce for EAGLE handoff" idea was
+based on a wrong hypothesis (cross-mesh tensor read at the EAGLE
+level). At the SGLang Python boundary we already convert
+ttnn→torch at every model boundary, so the EAGLE protocol handoff
+is implicitly CPU-mediated. The real hang is below SGLang, inside
+tt-metal's warmup on a single-chip mesh.
+
 ## Layout-B split-mesh implemented (v24) — boots; inference hangs on cross-mesh
 
 The original Layout-B "infeasible" finding (T0.3) tested mesh_shape=(1,2)

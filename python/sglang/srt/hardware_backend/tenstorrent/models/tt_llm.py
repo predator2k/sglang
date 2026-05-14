@@ -144,7 +144,10 @@ class TTModels(nn.Module):
                 self.mesh_device = ttnn.open_mesh_device(
                     mesh_shape=ttnn.MeshShape(1, 1),
                     physical_device_ids=[next_chip],
-                    trace_region_size=50000000,
+                    # P3a.2 T2.2.H: dropped from 50 MB to 10 MB — solo
+                    # Blackhole p150a DRAM allocator may silently lock
+                    # when asked for 50 MB trace region.
+                    trace_region_size=10000000,
                     num_command_queues=1,
                 )
                 self.device_runner.ttnn_device = self.mesh_device
