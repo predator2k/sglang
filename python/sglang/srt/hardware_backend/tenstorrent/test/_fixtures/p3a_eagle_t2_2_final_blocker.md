@@ -65,6 +65,33 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## Proven catch-22 (v10 evidence)
+
+Tested `SGLANG_TT_DISPATCH=legacy` (WORKER+COL dispatch — 10 rows
+visible) WITH all the `(8, 10)` → `(8, 8)` Python-side patches still
+applied. Result: the SAME `bmm_large_block_zm_fused_bias_activation`
+kernel that iter-8 originally crashed on now crashes again:
+
+  TT_FATAL: Illegal kernel placement for bmm_large_block_zm_fused_bias_activation,
+  Kernels cannot be placed on dispatch cores!
+
+This proves the two failure modes are TWO ENDS OF THE SAME CONFLICT:
+
+  - ETH+ROW+MUX dispatch (my fix) frees worker cores from dispatch but
+    leaves only 9 rows; matmul kernels asking for 10 rows fail with CB
+    overflow.
+  - WORKER+COL dispatch (legacy) keeps 10 rows of workers, but the bmm
+    kernel's CoreGrid lands on the dispatch cores → placement crash.
+
+Both branches hit the same tt-metal C++ matmul auto-config picking an
+8×10 grid that exceeds available workers under any dispatch layout on
+P300. The 8×10 default was tuned for single-chip Blackhole p150 where
+all 10 rows are workers; on 2-chip P300 under MUX it doesn't fit.
+
+Log evidence:
+  - `p3a_eagle_t2_2_post_dispatch_v9_full_patch.log` — MUX path, CB-overflow crash
+  - `p3a_eagle_t2_2_post_dispatch_v10_legacy.log`     — legacy path, placement crash
+
 ## Recommendation
 
 Land the 6 commits in `predator2k/sglang` `tenstorrent-p1` and pause P3a.2
