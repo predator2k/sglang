@@ -97,6 +97,7 @@ class TTModels(nn.Module):
             os.environ["HF_MODEL"] = cfg_path or get_global_server_args().model_path
 
             self.device_runner = BaseMetalDeviceRunner(device_id=str(rank))
+            _layout = os.environ.get("SGLANG_TT_SPEC_DRAFT_MESH_LAYOUT", "shared")
             if mesh_device is not None:
                 # P3a.2 EAGLE: cohost on a pre-opened mesh (typically the main
                 # model's mesh). The runner.set_device() override pattern from
@@ -106,8 +107,7 @@ class TTModels(nn.Module):
                 self.device_runner.ttnn_device = mesh_device  # match runner state
             elif (
                 TTModels._shared_main_mesh is not None
-                and os.environ.get("SGLANG_TT_SPEC_DRAFT_MESH_LAYOUT", "shared")
-                == "shared"
+                and _layout == "shared"
             ):
                 # Auto-cohost: a previous TTModels instance is already on a
                 # mesh. SGLang's eagle_worker loads the draft via standard
@@ -115,10 +115,56 @@ class TTModels(nn.Module):
                 # intent from the presence of a prior mesh.
                 logger.info(
                     f"[TT-SGLANG] auto-cohost draft on shared mesh id="
-                    f"{id(TTModels._shared_main_mesh)} (P3a.2 T2.1)"
+                    f"{id(TTModels._shared_main_mesh)} (P3a.2 T2.1 Layout-A)"
                 )
                 self.mesh_device = TTModels._shared_main_mesh
                 self.device_runner.ttnn_device = self.mesh_device
+            elif (
+                TTModels._shared_main_mesh is not None
+                and _layout == "split"
+            ):
+                # P3a.2 T2.2.H — Layout-B split-mesh cohost: target on chip 0,
+                # draft on chip 1. The original Layout-B finding (T0.3) tested
+                # only `mesh_shape=(1,2)` on the second model — both tried to
+                # claim all chips and ETH-timed-out. Proper split uses
+                # `mesh_shape=(1,1)` + `physical_device_ids=[N]` so each model
+                # owns a disjoint chip.
+                #
+                # Diagnosed need (T2.2.G): Layout-A causes wo (and likely
+                # other DRAM-sharded weights) to alias across models on the
+                # shared mesh — second model's `ttnn.as_tensor` produces the
+                # first model's per-device shape. Splitting the mesh breaks
+                # the aliasing because each model has its own DRAM region.
+                import ttnn
+                next_chip = 1  # target took chip 0 by convention
+                logger.info(
+                    f"[TT-SGLANG] split-mesh cohost: opening draft on chip {next_chip} "
+                    f"with mesh_shape=(1,1) (P3a.2 T2.2.H Layout-B)"
+                )
+                self.mesh_device = ttnn.open_mesh_device(
+                    mesh_shape=ttnn.MeshShape(1, 1),
+                    physical_device_ids=[next_chip],
+                    trace_region_size=50000000,
+                    num_command_queues=1,
+                )
+                self.device_runner.ttnn_device = self.mesh_device
+            elif _layout == "split":
+                # P3a.2 T2.2.H Layout-B: first model (target) opens a (1,1)
+                # mesh on chip 0 only, leaving chip 1 for the draft.
+                import ttnn
+                logger.info(
+                    "[TT-SGLANG] split-mesh cohost: opening target on chip 0 "
+                    "with mesh_shape=(1,1) (P3a.2 T2.2.H Layout-B)"
+                )
+                self.mesh_device = ttnn.open_mesh_device(
+                    mesh_shape=ttnn.MeshShape(1, 1),
+                    physical_device_ids=[0],
+                    trace_region_size=50000000,
+                    num_command_queues=1,
+                )
+                self.device_runner.ttnn_device = self.mesh_device
+                if TTModels._shared_main_mesh is None:
+                    TTModels._shared_main_mesh = self.mesh_device
             else:
                 self.mesh_device = self.device_runner.set_device()
                 # First TTModels in the process becomes the "main"; cache its
