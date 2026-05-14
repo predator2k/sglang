@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 class TTModels(nn.Module):
+    # Class-level cache of the first-instantiated TTModels' MeshDevice. EAGLE
+    # spec-decode mode loads the draft model after the main, and SGLang's
+    # standard ModelRunner doesn't go through eagle_draft.load_eagle_draft —
+    # it calls our constructor directly with no mesh_device kwarg. P3a.0 T0.3
+    # proved a 2nd MeshDevice in the same process is INFEASIBLE, so when we
+    # detect this scenario (env var SGLANG_TT_SPEC_DRAFT_PATH set AND
+    # _shared_main_mesh is already populated), we auto-cohost on the existing
+    # mesh instead of opening a new one.
+    _shared_main_mesh = None
     # Class-level constants for default/fallback values
     DEFAULT_BLOCK_SIZE = 64
     DEFAULT_MAX_BATCH_SIZE = 32
@@ -78,7 +87,14 @@ class TTModels(nn.Module):
                 if torch.distributed.is_initialized()
                 else 0
             )
-            os.environ["HF_MODEL"] = get_global_server_args().model_path
+            # HF_MODEL drives tt_transformers.ModelArgs. For the main model,
+            # this is the server's --model-path. For the EAGLE draft (loaded
+            # by SGLang's eagle_worker via a second TTModels instance), it
+            # must point at the draft's weights, not the main's. We resolve
+            # from config._name_or_path when available (HuggingFace AutoConfig
+            # sets this to the model path it loaded from).
+            cfg_path = getattr(config, "_name_or_path", None) or ""
+            os.environ["HF_MODEL"] = cfg_path or get_global_server_args().model_path
 
             self.device_runner = BaseMetalDeviceRunner(device_id=str(rank))
             if mesh_device is not None:
@@ -88,8 +104,27 @@ class TTModels(nn.Module):
                 # constructor parameter so eagle_draft.py can pass main.mesh_device.
                 self.mesh_device = mesh_device
                 self.device_runner.ttnn_device = mesh_device  # match runner state
+            elif (
+                TTModels._shared_main_mesh is not None
+                and os.environ.get("SGLANG_TT_SPEC_DRAFT_MESH_LAYOUT", "shared")
+                == "shared"
+            ):
+                # Auto-cohost: a previous TTModels instance is already on a
+                # mesh. SGLang's eagle_worker loads the draft via standard
+                # ModelRunner with no mesh_device kwarg, so we infer cohost
+                # intent from the presence of a prior mesh.
+                logger.info(
+                    f"[TT-SGLANG] auto-cohost draft on shared mesh id="
+                    f"{id(TTModels._shared_main_mesh)} (P3a.2 T2.1)"
+                )
+                self.mesh_device = TTModels._shared_main_mesh
+                self.device_runner.ttnn_device = self.mesh_device
             else:
                 self.mesh_device = self.device_runner.set_device()
+                # First TTModels in the process becomes the "main"; cache its
+                # mesh for any subsequently-instantiated drafts.
+                if TTModels._shared_main_mesh is None:
+                    TTModels._shared_main_mesh = self.mesh_device
 
         # P3a: spec-decode routing adapter (INV-8) — initialised after all setup
         from sglang.srt.hardware_backend.tenstorrent.models.spec_decode import SpecDecodeAdapter
@@ -356,6 +391,32 @@ class TTModels(nn.Module):
         vocab = logits.shape[-1]
         tiled = logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, vocab)
         return LogitsProcessorOutput(next_token_logits=tiled)
+
+    # P3a.2 T2.2: EAGLE worker expects target/draft model to expose
+    # embed/lm_head tensors for weight tying. tt_transformers keeps these on
+    # the TT device, not as host nn.Parameters, so we return empty host-side
+    # placeholders. The draft model loaded via tt_transformers already has
+    # its own embed/lm_head on device — set_embed_and_head() is a no-op
+    # (we cannot actually retie device-resident weights with host tensors,
+    # but EAGLE's standard tie-weights path isn't strictly required for the
+    # draft to function; it'll use its own loaded weights independently).
+    def get_embed_and_head(self):
+        import torch as _torch
+        return _torch.empty(0), _torch.empty(0)
+
+    def set_embed_and_head(self, embed, head):
+        # No-op: draft model already has its own weights from tt_transformers.
+        # EAGLE's intent is to share weights between target/draft to save memory
+        # and ensure consistent tokenization, but on TT the weights live on
+        # device and re-tying them at this layer isn't tractable.
+        pass
+
+    def set_embed(self, embed):
+        pass
+
+    @property
+    def hot_token_id(self):
+        return None  # EAGLE3 hot-token filter not applicable here
 
     def allocate_on_device(self):  # function aloocating kv cache
         """
