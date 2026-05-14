@@ -65,6 +65,37 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## Breakthrough: tt-metal C++ investigation revealed the real Layout-B blocker
+
+The original "device.cpp clamp" was applied UNCONDITIONALLY to clamp
+grid.y ≤ 8. That was correct for Layout-A under MUX (12x9 → 12x8) but
+**broke single-chip Layout-B**, which natively has an 11x10 grid that
+matmul kernels need all 10 rows of.
+
+v27 (single-model + my unconditional clamp) crashed at the same 8x10
+matmul kernel grid issue we were chasing for Layout-A's "wo aliasing".
+v28 (single-model + conditional clamp — only clamp under ETH/MUX
+dispatch) cleared the kernel-grid check. `/health` returned **200**
+for the first time across all 29 iterations.
+
+The "wo aliasing" hypothesis from T2.2.G was **WRONG**. The actual
+cause of v3-v9 crashes was the same 8x10 kernel grid being requested
+on the 12x9 grid Layout-A exposed. Once my conditional clamp gives
+no-MUX single-chip the full 11x10, the issue disappears.
+
+**v29 progress (single-model Qwen3-8B, solo chip 0):**
+  - boots cleanly
+  - `/health` → HTTP 200 (first time!)
+  - inference enters real forward
+  - prefill completes
+  - decode crashes at `distributed_norm.py:108 → rmsnorm.py:154` with
+    `RuntimeError: bad optional access` (C++ std::bad_optional_access)
+
+The new blocker (T2.2.I) is a missing `std::optional` value somewhere
+in `ttnn.rms_norm`'s sharded program_config path. Probably the norm's
+sharded config references a multi-device-assumed field (e.g.,
+`cluster.ring_size`, prefetcher fields) that's empty on single chip.
+
 ## TODO list (post-session)
 
 ### TODO-1: Layout-A wo aliasing fix (T2.2.G)
