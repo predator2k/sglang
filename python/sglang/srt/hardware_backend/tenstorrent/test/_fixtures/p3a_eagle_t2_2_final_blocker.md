@@ -65,6 +65,33 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## tt-metal C++ rebuild attempted (v13)
+
+Patched `tt_metal/impl/device/device.cpp::compute_with_storage_grid_size()`
+to clamp `grid.y` to ≤8 (forcing the device-reported grid to be 11×8 on
+P300/MUX so any auto-config reading the device grid never picks the
+dispatch row). Rebuilt `libtt_metal.so` and `_ttnncpp.so` via ninja
+inside the container; replaced the loaded .so files. Probe confirmed
+device now reports 11×8.
+
+Result: v13 boots cleanly to `Uvicorn running` but the first inference
+request STILL fails with the same TT_FATAL — `Circular buffer core range
+[0-0 - 7-9] in program 70 exceeds device compute grid (12x8)`.
+
+Python-side trace confirms the failing kernel is the **LM head's
+DRAM-sharded matmul** at `lm_head.py:158`, not the QKV / SDPA / MLP path
+I patched earlier. DRAM-sharded matmul derives its CoreRangeSet from
+the input tensor's DRAM-sharding layout (8 columns × N rows where N is
+chosen by tt-metal C++ to evenly divide the vocab dim), not from
+`compute_with_storage_grid_size`. So the device-grid clamp does not
+reach this code path.
+
+To unblock here would require either patching
+`ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_dram_sharded_program_factory.cpp`
+(or a sibling DRAM-sharded factory) to clamp the row count, or providing
+a tuned `dram_matmul_config` in `tt_transformers/tt/model_config.py` for
+Qwen3 on P300 that hardcodes a fitting grid. Both are non-trivial.
+
 ## Proven catch-22 (v10 evidence)
 
 Tested `SGLANG_TT_DISPATCH=legacy` (WORKER+COL dispatch — 10 rows
