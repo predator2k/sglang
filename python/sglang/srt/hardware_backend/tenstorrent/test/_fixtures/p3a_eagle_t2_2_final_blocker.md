@@ -65,6 +65,41 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## Layout-B split-mesh implemented (v24) — boots; inference hangs on cross-mesh
+
+The original Layout-B "infeasible" finding (T0.3) tested mesh_shape=(1,2)
+on both models — both claimed ALL chips and ETH-timed-out. Proper
+Layout-B uses `mesh_shape=(1,1) + physical_device_ids=[N]` per model so
+target and draft own disjoint chips.
+
+Wired `SGLANG_TT_SPEC_DRAFT_MESH_LAYOUT=split` into
+`tt_llm.TTModels.__init__`: first model opens chip 0, second opens
+chip 1. Committed at `091d63b12`.
+
+v24 result: BOTH meshes open successfully (no ETH timeout), BOTH models
+load, KV alloc completes for both, **warmup completes for both, Uvicorn
+comes up**. First inference request via `/v1/chat/completions` then
+hangs for the full 300 s watchdog timeout. py-spy dump shows
+`forward_batch_generation` (eagle_worker.py:461) stuck deep in ttnn
+C++ — no Python-level exception.
+
+**Probable cause:** EAGLE's protocol needs to move tensors between
+target's mesh (chip 0) and draft's mesh (chip 1) — at minimum the
+draft consumes the target's hidden_states; with split meshes there is
+no ETH fabric between the two chips so the inter-mesh tensor read
+blocks indefinitely.
+
+**Path forward** (next session):
+  - **CPU-bounce transfer for EAGLE handoff** — copy hidden_states /
+    accept-mask through host RAM between target.mesh and draft.mesh.
+    Costs a host-device roundtrip per spec step but is the only fix
+    that keeps cohost without solving the Layout-A wo aliasing.
+  - **Lazy clone of small per-model buffers** — patch `attention.py`
+    so each model allocates its own per-mesh-isolated wo (revisit
+    Layout-A with explicit unique cache_file_name+mem_config).
+  - **Llama-3.1-8B + Llama-3.2-1B** when Llama-3.2-1B becomes
+    available — only officially-tuned tt_transformers EAGLE pair.
+
 ## WO matmul cohost aliasing diagnosed (v20–v23) — Layout-A wall
 
 Probed both `ttnn.as_tensor` input (pt_wo) and output (self.wo) for each
