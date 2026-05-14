@@ -205,14 +205,23 @@ class TTSRTPlatform(SRTPlatform):
         )
 
     def get_paged_allocator_cls(self):
-        """Paged path needs SGLang's PagedTokenToKVPoolAllocator (slot-index
-        tracker). KV bytes themselves live on TT device via plugin's
-        allocate_kv_cache; this allocator only manages indices.
+        """Paged path needs a slot-index tracker. KV bytes themselves live on
+        TT device via plugin's allocate_kv_cache; this allocator only manages
+        indices.
+
+        SGLang's stock `PagedTokenToKVPoolAllocator.alloc_extend` /
+        `alloc_decode` call Triton kernels that fail on TT (no active
+        driver). `TTCpuPagedTokenToKVPoolAllocator` overrides only those
+        two methods with pure-CPU ports — semantically identical, runs in
+        plain torch on the host. Everything else (`alloc`, `free`, sorting,
+        clearing) is inherited unchanged.
         """
         import os
         if os.environ.get("SGLANG_TT_EXECUTION_BACKEND") == "tt_transformers_paged":
-            from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-            return PagedTokenToKVPoolAllocator
+            from sglang.srt.hardware_backend.tenstorrent.cpu_paged_allocator import (
+                TTCpuPagedTokenToKVPoolAllocator,
+            )
+            return TTCpuPagedTokenToKVPoolAllocator
         raise NotImplementedError("Paged allocator not used in simple path")
 
     def get_mla_kv_pool_cls(self):
