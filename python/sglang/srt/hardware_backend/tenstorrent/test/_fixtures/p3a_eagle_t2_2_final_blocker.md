@@ -65,6 +65,27 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## Decode path walked (v28-v33) — 6 layers fixed; current crash at WO decode
+
+Each iteration revealed a distinct DECODE-mode sharded-on-single-chip
+issue:
+
+  v28: First HTTP 200 (conditional MUX clamp landed)
+  v29: lm_head DECODE WIDTH_SHARDED → mem cfg patched to DRAM
+  v30: distributed_norm bad_optional → force unsharded on single-chip
+  v31: QKV decode bad_optional → matmul + mem cfg to regular/DRAM
+  v32: sharded_to_interleaved storage err → is_sharded() guard
+  v33: MLP/etc. bad_optional → dram_matmul_config single-chip fallback
+  v33+: WO decode input grid `{[0-0 - 10-1], [0-2 - 9-2]}` exceeds
+        regular matmul's `[0-0 - 8-8]` — upstream norm/attn still
+        emits L1-sharded layouts; needs DRAM coercion before WO matmul.
+
+All in tt-metal fork `6843c6c614`. Single-chip Qwen3-8B now runs full
+prefill through 6 layers of decode. Pattern: every DECODE-mode site
+that used DRAM-sharded matmul or sharded mem_config now needs the
+input forced to DRAM. Next blocker (T2.2.J) is the same pattern at
+the WO matmul.
+
 ## Breakthrough: tt-metal C++ investigation revealed the real Layout-B blocker
 
 The original "device.cpp clamp" was applied UNCONDITIONALLY to clamp
