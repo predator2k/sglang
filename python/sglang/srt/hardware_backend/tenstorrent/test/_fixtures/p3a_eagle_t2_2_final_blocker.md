@@ -65,6 +65,33 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## QK-norm + SDPA shape strip landed (v17–v19) — exposed WO matmul mismatch
+
+Probed Q/K/V shapes right before QK-norm and confirmed the GQA-fused
+padding in `nlp_create_qkv_heads`:
+
+  padded_head_dim = head_dim * (1 + n_local_kv_heads / n_local_heads)
+
+For Qwen3-1.7B on (1,2) mesh: 128 * (1 + 4/8) = 192. The logical Q/K/V
+shape is `[1, 8, seq, 128]` but padded shape is `[1, 8, seq, 192]`.
+RMSNorm and SDPA reject this padding.
+
+Patched `attention.py:forward_prefill` to slice Q, K, V last dim back
+to `head_dim` via `ttnn.slice` after `nlp_create_qkv_heads`. Committed
+to tt-metal fork at `ea7b7f3061`.
+
+v18 cleared QK-norm. v19 cleared SDPA. Now blocked at WO output matmul
+(attention.py:1169) with `TT_FATAL: width=1024 height=2048` — attn_output
+post-concat_heads is 1024-wide (8 Q heads × 128 per device) but `wo`
+matrix has height 2048. Likely an all-gather expected but not happening
+on the 2-device fabric (vs ring topology assumption). See P3a.2 T2.2.G.
+
+This is the **6th distinct shape/grid mismatch** in the Qwen3+P300
+path. Each fix reveals the next. The pattern strongly suggests Qwen3
+has no `model_params/Qwen3/P300/` tuning in tt-metal — every shape
+calc falls through to a default that's only correct for one (untested)
+hardware/model combination.
+
 ## LM head workaround landed (v14–v16) — exposed QK-norm shape mismatch
 
 After v13's C++ device-grid clamp didn't help (LM head's DRAM-sharded
