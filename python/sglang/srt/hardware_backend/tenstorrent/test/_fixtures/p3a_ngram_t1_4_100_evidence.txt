@@ -51,15 +51,30 @@ can flip an argmax at near-tie positions, causing the 11/100 divergence.
 ================================================================
 Path to 100/100
 ================================================================
-True bit-exactness requires either:
-  (a) Tree-attention support in tt-metal's decode_forward (kernel-
-      level change).
-  (b) Patching SGLang's NgramVerifyInput.prepare_for_verify to
-      additionally allocate a slot at position seq_lens-1 (= where
-      prev_emit's kv would go in non-spec mode), then decoding at
-      that position. This would match baseline's position exactly.
+True bit-exactness requires tree-attention with self-masking at the
+root position. tt-metal's `decode_forward` does standard causal
+self-attention (every position attends to itself), so the input
+token at position seq_lens leaks into the output logits — exactly
+what CUDA's tree-mask suppresses.
 
-Both are larger changes than fit P3a.1's scope.
+Verified empirically (debug probe 2026-05-13):
+  - SGLang DOES allocate kv slots at BOTH positions seq_lens-1 AND
+    seq_lens in spec mode (slot_at_seq_lens_minus_1 = 70,
+    slot_at_seq_lens = 71 for the first verify cycle).
+  - The earlier hypothesis "kv hole at seq_lens-1" was wrong.
+  - A dual-write fix (decode prev_emit at BOTH seq_lens-1 and
+    seq_lens) was tried and gave 0/10: it double-counts prev_emit
+    in the model's attention context, causing repetition outputs
+    ("Paris, of course, Paris is not..." / "70 years ago ago,").
+
+Real fix options (all out of P3a.1 scope per "no SGLang core changes"
+user constraint):
+  (a) Add tree-attention/self-mask support to tt-metal's decode_forward
+      kernel. Closes the gap structurally.
+  (b) Mathematically subtract self-attention contribution from output
+      logits post-decode. Approximate; needs careful derivation.
+  (c) Patch SGLang's NgramVerifyInput.prepare_for_verify protocol —
+      explicitly disallowed by the user.
 
 ================================================================
 Progress summary
