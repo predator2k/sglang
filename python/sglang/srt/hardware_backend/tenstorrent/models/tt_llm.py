@@ -86,7 +86,12 @@ class TTModels(nn.Module):
         # P3a: spec-decode routing adapter (INV-8) — initialised after all setup
         from sglang.srt.hardware_backend.tenstorrent.models.spec_decode import SpecDecodeAdapter
         self._spec_adapter = SpecDecodeAdapter(self)
-        self._last_emit_logits = None
+        # Per-request prev_emit token cache for spec verify (Issue 2 fix).
+        # Keyed by req_pool_idx so concurrent requests in a shared verify batch
+        # each see their own previously-committed token id, avoiding the
+        # "Batch size mismatch" crash when prefill bs=1 prev_emit was applied
+        # to verify bs>1.
+        self._prev_emit_per_req: dict[int, int] = {}
 
     def on_chunked_prefill_failure(
         self, req, out_cache_loc_this_chunk, allocator, req_to_token_pool
@@ -188,9 +193,16 @@ class TTModels(nn.Module):
             logger.debug("tt_model.prefill_forward executed")
             # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
             squeezed = logits.squeeze(1)
-            # Cache prefill's last-position logits for the first spec-verify
-            # cycle (which needs prev_emit = argmax(squeezed) per user).
-            self._last_emit_logits = squeezed.detach().clone()
+            # Cache argmax token per request for the FIRST spec-verify cycle.
+            try:
+                req_indices = forward_batch.req_pool_indices.tolist()
+                argmax_tokens = squeezed.argmax(dim=-1).tolist()
+                if not isinstance(argmax_tokens, list):
+                    argmax_tokens = [argmax_tokens]
+                for req_idx, tok in zip(req_indices, argmax_tokens):
+                    self._prev_emit_per_req[int(req_idx)] = int(tok)
+            except Exception as exc:
+                logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
             return LogitsProcessorOutput(next_token_logits=squeezed)
 
         elif forward_batch.forward_mode.is_decode():  # decode mode
@@ -276,12 +288,23 @@ class TTModels(nn.Module):
         # protocol: SGLang's _free_cache will move kv from this slot to the
         # final bonus position, so the bonus's kv = encoding(prev_emit) which
         # matches baseline's "decode of prev_emit at the bonus position".
-        last_logits = self._last_emit_logits
-        if last_logits is None:
-            # Fallback (shouldn't happen post-prefill); use draft_0 as input.
-            prev_emit = tokens_per_user[:, 0:1]
-        else:
-            prev_emit = last_logits.argmax(dim=-1).to(_torch.int32).unsqueeze(1)  # [bs,1]
+        # Per-request prev_emit token lookup (Issue 2 fix: avoids the
+        # shape mismatch that crashed when one cached logits tensor was
+        # applied to a concurrent verify batch).
+        req_indices = forward_batch.req_pool_indices.tolist()
+        prev_emit_list = []
+        miss_count = 0
+        for i, req_idx in enumerate(req_indices):
+            tok = self._prev_emit_per_req.get(int(req_idx), None)
+            if tok is None:
+                miss_count += 1
+                tok = int(tokens_per_user[i, 0].item())
+            prev_emit_list.append(int(tok))
+        if miss_count > 0:
+            logger.warning(
+                f"[TT-SGLANG] prev_emit cache miss for {miss_count}/{bs} reqs"
+            )
+        prev_emit = _torch.tensor(prev_emit_list, dtype=_torch.int32).unsqueeze(1)  # [bs,1]
 
         positions_step = positions_per_user[:, 0]  # [bs] = seq_lens
         padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
@@ -296,7 +319,15 @@ class TTModels(nn.Module):
             read_from_device=True,
         )
         logits = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
-        self._last_emit_logits = logits.detach().clone()
+        # Update per-request prev_emit token cache for the next verify cycle.
+        try:
+            argmax_tokens = logits.argmax(dim=-1).tolist()
+            if not isinstance(argmax_tokens, list):
+                argmax_tokens = [argmax_tokens]
+            for req_idx, tok in zip(req_indices, argmax_tokens):
+                self._prev_emit_per_req[int(req_idx)] = int(tok)
+        except Exception as exc:
+            logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
         vocab = logits.shape[-1]
         tiled = logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, vocab)
         return LogitsProcessorOutput(next_token_logits=tiled)
