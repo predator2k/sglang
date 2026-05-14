@@ -65,6 +65,45 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## WO matmul cohost aliasing diagnosed (v20–v23) — Layout-A wall
+
+Probed both `ttnn.as_tensor` input (pt_wo) and output (self.wo) for each
+Attention instance:
+
+  Target Qwen3-8B layer 0:
+    BEFORE: pt_wo = (1, 1, 4096, 4096)
+    AFTER:  self.wo.shape = (1, 1, 2048, 4096)  ← correct per-device after dim-2 shard
+
+  Draft Qwen3-1.7B layer 0:
+    BEFORE: pt_wo = (1, 1, 2048, 2048)  ← state_dict + transposes correct
+    AFTER:  self.wo.shape = (1, 1, 2048, 4096)  ← WRONG, should be (1, 1, 1024, 2048)
+
+The same `(1, 1, 2048, 4096)` shape persists for every draft layer's wo.
+Draft's pt_wo input is correct (verified per-layer); `ttnn.as_tensor`
+itself is what produces the wrong shape — the draft's wo allocation
+appears to alias the target's prior wo buffer on the shared cohost
+mesh.
+
+**This is a structural Layout-A limitation:** sharing one mesh between
+target + draft means DRAM-sharded buffer allocations from both models
+collide. The 7 distinct shape/grid mismatches we've worked around so
+far (dispatch, page_size, attention_backend, allocator, LM head,
+QK-norm/SDPA, and now WO) increasingly look like surface symptoms of
+the same root: cohost without per-model isolation breaks Qwen3's
+tt_transformers wiring in ways that grow with each new layer of
+shared state.
+
+**Path forward** (out of scope for this session):
+  - **Layout B revisited** — re-attempt split-mesh cohost (separate
+    mesh per model) despite the early-finding that it's infeasible on
+    P300. The current evidence weights against Layout-A more than
+    the original concern weighted against Layout-B.
+  - **Different mesh_mapper / mem_config** for wo specifically — force
+    a fresh non-DRAM-sharded allocation per model to break aliasing.
+  - **Llama-3.2-1B + Llama-3.1-8B** when Llama-3.2-1B becomes
+    available — the only officially-supported tt_transformers EAGLE
+    pair with proper P300 tunings, sidesteps this Qwen3 path entirely.
+
 ## QK-norm + SDPA shape strip landed (v17–v19) — exposed WO matmul mismatch
 
 Probed Q/K/V shapes right before QK-norm and confirmed the GQA-fused
