@@ -13,28 +13,38 @@ from sglang.srt.models.registry import ModelRegistry
 logger = logging.getLogger(__name__)
 
 
+def _build_tt_model_registry():
+    """Mapping from HuggingFace architecture names to TT model classes."""
+    from .tt_llm import (
+        TenstorrentGptOssForCausalLM,
+        TenstorrentLlamaForCausalLM,
+        TenstorrentMistralForCausalLM,
+        TenstorrentQwenForCausalLM,
+    )
+    return {
+        "LlamaForCausalLM": TenstorrentLlamaForCausalLM,
+        "Qwen2ForCausalLM": TenstorrentQwenForCausalLM,
+        "Qwen3ForCausalLM": TenstorrentQwenForCausalLM,
+        "MistralForCausalLM": TenstorrentMistralForCausalLM,
+        "GptOssForCausalLM": TenstorrentGptOssForCausalLM,
+    }
+
+
+def get_tt_model_class_for_arch(arch: str):
+    """Look up the Tenstorrent model class for a given HF architecture string.
+
+    Used by P3a.2 eagle_draft.py to resolve the draft model class without
+    relying on SGLang's loader pipeline. Returns None if the arch is unknown.
+    """
+    return _build_tt_model_registry().get(arch)
+
+
 def register_tt_models():
     """Register TT-Metal models with SGLang's model registry."""
     logger.info("[TT-Plugin] register_tt_models() called")
     try:
-        # Import all TT model classes
-        from .tt_llm import (
-            TenstorrentGptOssForCausalLM,
-            TenstorrentLlamaForCausalLM,
-            TenstorrentMistralForCausalLM,
-            TenstorrentQwenForCausalLM,
-        )
-
+        TT_MODEL_REGISTRY = _build_tt_model_registry()
         logger.info("[TT-Plugin] Imported TT model classes successfully")
-
-        # Mapping from HuggingFace architecture names to TT model classes
-        TT_MODEL_REGISTRY = {
-            "LlamaForCausalLM": TenstorrentLlamaForCausalLM,  # Llama-3.1-8B, Llama-3.1-70B, etc.
-            "Qwen2ForCausalLM": TenstorrentQwenForCausalLM,  # Qwen2.5-7B, Qwen2.5-14B, etc.
-            "Qwen3ForCausalLM": TenstorrentQwenForCausalLM,  # Qwen3-8B, Qwen3-14B, etc.
-            "MistralForCausalLM": TenstorrentMistralForCausalLM,  # Mistral-7B
-            "GptOssForCausalLM": TenstorrentGptOssForCausalLM,  # GPT-OSS
-        }
 
         # CRITICAL: Directly patch SGLang's ModelRegistry
         ModelRegistry.models.update(TT_MODEL_REGISTRY)

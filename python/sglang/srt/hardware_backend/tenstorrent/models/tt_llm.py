@@ -27,7 +27,7 @@ class TTModels(nn.Module):
     MAX_TOKENS_DEEPSEEK_WORMHOLE = 32768
     MAX_TOKENS_WORMHOLE_CONSTRAINED = 65536
 
-    def __init__(self, config, quant_config=None, tt_model=None, **kwargs):
+    def __init__(self, config, quant_config=None, tt_model=None, mesh_device=None, **kwargs):
         super().__init__()
 
         # Lazy import: avoids pulling in sglang.srt.layers chain at class-definition time
@@ -81,7 +81,15 @@ class TTModels(nn.Module):
             os.environ["HF_MODEL"] = get_global_server_args().model_path
 
             self.device_runner = BaseMetalDeviceRunner(device_id=str(rank))
-            self.mesh_device = self.device_runner.set_device()
+            if mesh_device is not None:
+                # P3a.2 EAGLE: cohost on a pre-opened mesh (typically the main
+                # model's mesh). The runner.set_device() override pattern from
+                # P3a.0 T0.3 proved cohost feasibility; here we expose it as a
+                # constructor parameter so eagle_draft.py can pass main.mesh_device.
+                self.mesh_device = mesh_device
+                self.device_runner.ttnn_device = mesh_device  # match runner state
+            else:
+                self.mesh_device = self.device_runner.set_device()
 
         # P3a: spec-decode routing adapter (INV-8) — initialised after all setup
         from sglang.srt.hardware_backend.tenstorrent.models.spec_decode import SpecDecodeAdapter
@@ -241,24 +249,41 @@ class TTModels(nn.Module):
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
 
     def _call_prefill_for_verify(self, forward_batch):
-        """Per-draft-position logits via decode-loop (P3a.1 T1.2 v3).
+        """Verify-batch forward (P3a.1 T1.2 v4 + Issue 2 fix).
 
-        SGLang spec verify expects `next_token_logits` shaped
-        [bs * draft_token_num, vocab]. tt_transformers' batched
-        `prefill_forward_text` only returns last-token logits per user;
-        attempting to bypass via `prefill_forward_single_user_text` requires
-        threading `num_cached_tokens` through a chunked-prefill path with
-        page_table padding that's fragile to get right (v3 attempt #1 left
-        the model with no prefix-attention context and produced garbage
-        outputs).
+        NGRAM STATUS: TODO — operationally usable but not bit-exact.
+        ============================================================
+        This implementation produces correct-shape verify logits and
+        survives concurrent chat-completion traffic, but inherits an
+        architectural gap: tt-metal's `decode_forward` has no
+        tree-attention self-mask, so the input token at position
+        `seq_lens` leaks into output logits via standard causal
+        self-attention. CUDA NGRAM uses flashinfer's
+        `prefill_wrapper_verify` with tree-mask root self-mask to
+        suppress that leak; we cannot replicate this without kernel
+        work in `paged_scaled_dot_product_attention_decode`.
 
-        Decode-loop approach: 12 `decode_forward` calls per verify batch
-        (one per draft position). Each call writes one draft KV slot at
-        the proper absolute position and returns logits at that position.
-        Correctness matches a sequential autoregressive decode; SGLang's
-        verify pipeline then walks the draft tree and reclaims rejected
-        slots from the allocator. Per-step decode is fully traced so the
-        cost amortizes; T1.5 perf gate will quantify the actual cost.
+        Measured impact (Llama-3.1-8B-Instruct BFP8, P3a.1 T1.4 suite):
+          - 89/100 byte-exact NGRAM-vs-baseline on diverse prompts
+          - Visible token-doubling artifacts ("$22", "ege gegs sold sold")
+            in some outputs; usually don't affect final-answer
+            extraction on simple benchmarks.
+
+        Next steps for full correctness:
+          - Implement tree-mask in tt-metal decode SDPA (see
+            `scripts/tt_metal_patches/04-attention-self-mask-flag.patch`
+            for the patch shape — currently blocked on trace-capture
+            pre-allocation plumbing).
+          - OR pivot to EAGLE (P3a.2), which has much higher draft
+            acceptance and so the self-attention leak matters less.
+
+        Per SGLang team guidance 2026-05-13: invest in EAGLE instead.
+
+        Implementation: single decode at `position=seq_lens` with
+        `input=prev_emit` (cached per-request to handle concurrent
+        verify batches). Output logits tiled to [bs*dn, vocab] —
+        siblings always fail acceptance because they're compared
+        against the same root argmax, preserving bonus-only semantics.
         """
         import torch as _torch
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
