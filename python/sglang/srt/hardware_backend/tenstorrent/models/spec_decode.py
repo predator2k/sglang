@@ -35,7 +35,13 @@ class SpecDecodeAdapter:
 
     def forward(self, forward_batch: "ForwardBatch") -> "LogitsProcessorOutput":
         spec_info = getattr(forward_batch, "spec_info", None)
-        if spec_info is not None:
+        # Only route to verify path when the forward_mode actually is
+        # TARGET_VERIFY. EAGLE additionally uses DRAFT_EXTEND / DRAFT_EXTEND_V2
+        # forward modes whose spec_info is an EagleDraftInput (no
+        # draft_token_num field) — those should go through the standard
+        # path so the draft model's regular extend/decode runs.
+        fm = forward_batch.forward_mode
+        if spec_info is not None and fm.is_target_verify():
             return self._verify_forward(forward_batch)
         return self._standard_forward(forward_batch)
 

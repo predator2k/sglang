@@ -57,12 +57,27 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
+            # P3a.2: TT-native pass-through. The draft model's actual attention
+            # runs inside tt_transformers' forward; this backend is a no-op
+            # shell that satisfies the EAGLE worker's contract for managing
+            # draft attention metadata.
+            "torch_native": self._create_tt_decode_backend,
         }
 
         return self._create_backend(
             "decode_attention_backend",
             backend_map,
             "EAGLE is not supported in decode attention backend {backend_type}",
+        )
+
+    def _create_tt_decode_backend(self):
+        from sglang.srt.hardware_backend.tenstorrent.tt_eagle_backend import (
+            TTMultiStepDraftBackend,
+        )
+        return TTMultiStepDraftBackend(
+            self.draft_model_runner,
+            topk=self.topk,
+            speculative_num_steps=self.speculative_num_steps,
         )
 
     def create_draft_extend_backend(self):
@@ -83,6 +98,8 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
+            # P3a.2: TT-native pass-through (see _create_tt_decode_backend).
+            "torch_native": self._create_tt_decode_backend,
         }
         backend_name = (
             "decode_attention_backend"

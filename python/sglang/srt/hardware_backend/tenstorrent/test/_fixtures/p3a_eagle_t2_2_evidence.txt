@@ -1,0 +1,130 @@
+P3a.2 T2.2 — EAGLE smoke attempt + infrastructure blocker analysis
+Captured: 2026-05-13
+Hardware: 2× Tenstorrent Blackhole p150a
+Model pair: Qwen3-8B (main) + Qwen3-1.7B (draft)
+Branch: tenstorrent-p1 @ 539bdddae
+
+================================================================
+Result: BOOT BLOCKED at draft attention backend layer
+================================================================
+Five boot iterations advanced through small fix cycles. Hit a structural
+wall at SGLang's EAGLE draft attention backend whitelist — none of the
+supported backends ({flashinfer, triton, aiter, fa3, hybrid_linear_attn,
+flashmla, trtllm_mha, trtllm_mla, nsa, ascend, fa4, dsv4}) have a
+TT-native implementation that integrates with our paged tt_transformers
+kv path.
+
+================================================================
+Boot iteration log
+================================================================
+
+Iter 1 — `TypeError: '>' not supported between NoneType and int`
+  Location: server_args.py:3745 (`self.speculative_eagle_topk > 1`)
+  Cause: --speculative-eagle-topk not auto-populated when --speculative-
+         algorithm EAGLE is set.
+  Fix:   Pass --speculative-eagle-topk 1 --speculative-num-steps 5
+         --speculative-num-draft-tokens 6 explicitly.
+
+Iter 2 — model-name mismatch on draft load
+  Location: tt_transformers generator_sglang.py:80 assert
+  Error: "The model specified in sglang (/models/Qwen3-1.7B) does not
+         match the model name (Qwen3-8B) with model weights
+         (/models/Qwen3-8B)"
+  Cause: our TenstorrentLlamaForCausalLM.__init__ unconditionally
+         set HF_MODEL = server_args.model_path, so when EAGLE's draft
+         loaded our class, it inherited the main path.
+  Fix:   HF_MODEL := config._name_or_path (each instance resolves its own).
+
+Iter 3 — host OOM, scheduler SIGKILL'd
+  Location: kernel OOM killer at 52 GB anon-rss
+  Cause: 2-model setup × KV phantom buffers × max_running_requests=4 ×
+         context_length=16384 exceeded host RAM budget on the dev box.
+  Fix:   --max-running-requests 1 --context-length 4096
+         --mem-fraction-static 0.5
+
+Iter 4 — `AttributeError: TenstorrentQwenForCausalLM has no get_embed_and_head`
+  Location: eagle_worker.py:177
+  Cause: EAGLE's tie-weights protocol expects the target model to expose
+         embed/lm_head as host nn.Parameters. tt_transformers keeps these
+         on the TT device.
+  Fix:   Stub methods get_embed_and_head(), set_embed_and_head(),
+         set_embed(), hot_token_id property. Draft uses its own loaded
+         weights independently (no actual tying, but boot-functional).
+
+Iter 5 — `EAGLE is not supported in decode attention backend torch_native`
+  Location: draft_utils.py:35 (DraftBackendFactory._create_backend)
+  Cause: SGLang's EAGLE requires the draft worker's decode attention
+         backend to be in a fixed whitelist of {flashinfer, triton, ...}.
+         All are CUDA / non-TT. Our paged path uses 'torch_native' because
+         model.forward() calls tt_transformers prefill/decode directly,
+         bypassing SGLang's attention backend system entirely.
+  Status: BLOCKED. Requires writing a TT-native EAGLE draft attention
+          backend.
+
+================================================================
+What a TT EAGLE draft attention backend needs
+================================================================
+Reference: TritonMultiStepDraftBackend (triton_backend.py:1248), ~250 LoC
+implementation.
+
+Required interface:
+  - __init__(model_runner, topk, speculative_num_steps): allocates
+    kv_indptr buffers, instantiates N-1 inner attention backends for
+    consecutive draft steps.
+  - init_forward_metadata(forward_batch): generates draft-decode kv
+    indices (currently uses a custom Triton kernel
+    `generate_draft_decode_kv_indices`).
+  - common_template(forward_batch, kv_indices_buffer, call_fn): orchestrates
+    per-step metadata + invokes the call_fn (model's forward) per step.
+  - forward_extend / forward_decode / init_cuda_graph_state: routine
+    attention backend hooks.
+
+For TT, the inner-backend `forward_*` methods would need to route to
+tt_transformers prefill_forward / decode_forward, but those expect their
+own page_table/kv_cache state, not SGLang's. The integration is
+non-trivial because:
+
+  1. tt_transformers manages its own kv layout per submesh (allocate_kv_cache
+     returns a [submesh][layer][k_or_v] tree).
+  2. SGLang's draft kv_indptr tracking assumes per-step buffer rotation;
+     tt_transformers doesn't expose that abstraction.
+  3. The custom kernel `generate_draft_decode_kv_indices` is Triton-only
+     (we can't run Triton on TT) — a pure-Python port would be slow but
+     necessary.
+  4. CUDA-graph compatibility: tt_transformers traces its own decode;
+     SGLang's cuda graph runners assume a CUDA primitive that doesn't
+     exist on TT.
+
+Estimated effort: 1-2 weeks of focused work, mostly mechanical but
+needing careful empirical verification at each layer.
+
+================================================================
+Alternatives
+================================================================
+A. **Continue and build TT EAGLE backend** — substantial, multi-day. Right
+   long-term answer if EAGLE is the strategic direction.
+B. **Stub backend that no-ops** — minimal SGLang patch + a TT backend class
+   that returns dummy metadata. Will likely fail at the first call_fn
+   invocation when the draft tries to actually run attention. Worth ~30 min
+   to try; signals how much more work is needed.
+C. **Pause P3a.2** — EAGLE on TT is bigger than estimated. Document
+   findings, defer to P3b/P4 with explicit infrastructure scope. Continue
+   to P3a.3 (Observability) or P3a.4 (Stability) which don't need EAGLE.
+D. **Pivot to MTP or non-spec** — if the goal is "match original model on
+   real benchmarks", non-spec serving on TT (already working today) might
+   suffice. NGRAM (89/100 byte-exact, operationally usable) is also still
+   available with the Issue 2 fix.
+
+================================================================
+Committed state
+================================================================
+- T2.1 eagle_draft.py (commit 3463580a6): co-mesh loader, mesh kwarg,
+  registry helper.
+- T2.2 partial (commit 539bdddae): smoke test file, get_embed_and_head
+  stubs, _shared_main_mesh class cache for auto-cohost.
+- No SGLang core changes attempted in this session for EAGLE — the
+  draft_utils.py whitelist is the cleanest cut-line and would still need
+  a real (or stub) backend behind it.
+
+Next session: decide between (A) build backend, (B) stub & explore, (C)
+pause, (D) pivot. Each has clear scope and trade-offs.
