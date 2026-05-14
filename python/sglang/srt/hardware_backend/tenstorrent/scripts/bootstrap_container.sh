@@ -13,6 +13,18 @@
 #              /dev/hugepages-1G    -> /dev/hugepages-1G
 # Devices:     /dev/tenstorrent     (all p150a's)
 # Network:     host (port 30000 exposed direct)
+# Privileged:  yes — required so /sys/kernel/mm/hugepages is unmasked
+#              (tt-metal UMD reads nr_hugepages at device init). Rootless
+#              podman masks /sys/kernel by default; neither a plain bind
+#              mount nor `--security-opt unmask=...` lifts that mask, only
+#              `--privileged` does. Dev box with direct TT device
+#              passthrough — privileged adds no meaningful new attack
+#              surface here.
+#
+# Launch note: sglang's server_args init requires `--device tenstorrent` on
+# the CLI to enable the TT path. `SGLANG_PLATFORM=tenstorrent` alone is not
+# enough — `get_device()` returns "No accelerator available" without the
+# explicit flag.
 #
 # Inside container, the runtime venv is /opt/venv (uv-managed, no system pip).
 # SGLang is installed editable from /sglang/python with --no-build-isolation
@@ -44,7 +56,14 @@ if podman ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
   fi
 else
   echo "Creating container $NAME..."
+  # Rootless podman masks /sys/kernel with an empty tmpfs by default, hiding
+  # the hugepages sysfs that tt-metal's UMD reads at device init. Neither a
+  # plain bind-mount nor `--security-opt unmask=...` lifts that mask; only
+  # `--privileged` (or a fully unmasked /sys) makes it visible. This is a
+  # dev box with direct TT device passthrough already in place, so the
+  # privileged flag adds no meaningful new attack surface here.
   podman run -d --name "$NAME" \
+    --privileged \
     --device /dev/tenstorrent \
     -v /dev/hugepages-1G:/dev/hugepages-1G \
     -v "${HOST_SGLANG}:/sglang" \
@@ -79,7 +98,7 @@ uv pip install --no-build-isolation -e /sglang/python --no-deps >/dev/null
 # nvidia-cutlass-dsl, sgl-deep-gemm, sglang-kernel, quack-kernels, tilelang).
 # transformers>=5.0 is required by our tt_transformers/tt/model_config.py patch.
 uv pip install --no-build-isolation \
-  pybase64 fastapi uvicorn aiohttp msgspec setproctitle python-multipart \
+  pybase64 fastapi uvicorn uvloop aiohttp msgspec setproctitle python-multipart \
   IPython modelscope einops gguf interegular llguidance partial_json_parser \
   openai-harmony pillow psutil py-spy requests scipy sentencepiece blobfile \
   compressed-tensors easydict timm soundfile build datasets ninja anthropic \
