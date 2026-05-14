@@ -65,6 +65,39 @@ Same root cause — every paged Qwen3 (or Llama-3.1-8B) launch hits the same
 matmul 8×10 wall. Single-model paged is currently broken on this branch
 on this hardware until one of A/B/C/D above is taken.
 
+## LM head workaround landed (v14–v16) — exposed QK-norm shape mismatch
+
+After v13's C++ device-grid clamp didn't help (LM head's DRAM-sharded
+matmul derives its grid from DRAM banks, not device grid), v14–v16
+worked around the LM head specifically:
+
+  - `get_lm_head_program_config` now uses regular
+    `MatmulMultiCoreReuseMultiCastProgramConfig` with explicit `(8, 8)`
+    grid instead of `dram_matmul_config` (which picks 8×10 via DRAM
+    bank-to-reader assignment).
+  - `get_lm_head_input_mem_config` PREFILL → `DRAM_MEMORY_CONFIG`
+    (regular matmul rejects WIDTH_SHARDED input).
+  - `get_lm_head_output_mem_config` PREFILL → `DRAM_MEMORY_CONFIG`
+    (regular matmul rejects WIDTH_SHARDED output).
+
+Committed to tt-metal fork at `predator2k/tt-metal` tenstorrent-p1
+`09eab40b87`. Boot now reaches PAST the LM head (further than any prior
+iteration).
+
+**Next blocker (v16)**: warmup forward pass crashes in Qwen3's QK-norm
+at `rmsnorm.py:154`:
+
+  TT_FATAL: Gamma's last padded dim needs to equal tile width and
+  gamma's volume needs to align with last padded dim of input.
+  gamma.padded_shape: Shape([1, 1, 4, 32])  (volume 128)
+  a.padded_shape:    Shape([1, 8, 128, 192]) (last dim 192)
+
+QK-norm gamma sized for head_dim=128, but input last dim is 192 (=
+128 + 64?). Shape-mismatch in Qwen3's QKV pre-norm tensor layout
+on P300 — separate from the matmul grid issue. Likely needs either
+a tt_transformers patch matching the gamma to the actual post-QKV
+shape, or a Qwen3-specific config in `model_params/Qwen3-8B/P300/`.
+
 ## tt-metal C++ rebuild attempted (v13)
 
 Patched `tt_metal/impl/device/device.cpp::compute_with_storage_grid_size()`
