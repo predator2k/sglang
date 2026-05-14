@@ -1,0 +1,53 @@
+# P3a.1 T1.4 attempted tt-metal patch — BLOCKED on trace-capture limitation.
+#
+# Goal: add an opt-in `_skip_self_attention` instance flag to the attention
+# layer that, when True, causes `paged_scaled_dot_product_attention_decode`
+# to use cur_pos-1 instead of cur_pos as its attention range bound. This
+# would emulate CUDA NGRAM's tree-mask root self-mask, removing the input
+# token's self-attention contribution from output logits.
+#
+# Issue: the patch creates the cur_pos-1 tensor via `ttnn.full(...)` inside
+# `forward_decode`, but tt-metal raises:
+#
+#   RuntimeError: TT_FATAL ... fd_mesh_command_queue.cpp:590: !trace_id_.has_value()
+#   info: Writes are not supported during trace capture. trace id: 2
+#
+# Decode forward is fully traced for performance; allocating an intermediate
+# tensor inside it isn't allowed. Working around this needs a pre-allocated
+# `cur_pos_minus_one` ttnn buffer threaded through the trace setup, which is
+# multi-file kernel-API work (decode trace plumbing, model.forward signature
+# changes, attention layer init).
+#
+# Captured here as a roadmap for future work. NOT applied (would crash on first
+# verify forward when the flag is set).
+#
+# Path to 100/100 byte-exact NGRAM-vs-baseline requires this kind of kernel
+# patch, not Python-level changes. See p3a_ngram_t1_4_100_evidence.txt for
+# full architectural analysis.
+--- a/models/tt_transformers/tt/attention.py
++++ b/models/tt_transformers/tt/attention.py
+@@ -703,12 +703,23 @@
+         # Which leads to slightly different outputs from attention (due to accumulated errors)
+         sdpa_decode_prog_cfg = self.args.get_attn_sdpa_decode_program_config(self.prefetcher)
+         if page_table is not None:
++            # P3a.1: optional skip-self-attention mode (tt-sglang tree-attention emulation
++            # for NGRAM verify root). When self._skip_self_attention is True, attention
++            # reads kv at [0, current_pos - 1] (excluding the just-written K at current_pos),
++            # so the input token doesn't leak into the output logits via self-attention.
++            if getattr(self, "_skip_self_attention", False):
++                _one_t = ttnn.full(current_pos.shape, 1, dtype=current_pos.dtype,
++                                   device=current_pos.device(),
++                                   memory_config=current_pos.memory_config())
++                _attn_pos = ttnn.subtract(current_pos, _one_t)
++            else:
++                _attn_pos = current_pos
+             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                 q_heads_1BQD,
+                 keys,
+                 values,
+                 page_table_tensor=page_table,
+-                cur_pos_tensor=current_pos,
++                cur_pos_tensor=_attn_pos,
+                 scale=self.scale,
+                 sliding_window_size=self.sliding_window,
+                 program_config=sdpa_decode_prog_cfg,
