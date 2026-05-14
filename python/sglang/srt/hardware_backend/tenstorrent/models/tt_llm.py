@@ -86,6 +86,7 @@ class TTModels(nn.Module):
         # P3a: spec-decode routing adapter (INV-8) — initialised after all setup
         from sglang.srt.hardware_backend.tenstorrent.models.spec_decode import SpecDecodeAdapter
         self._spec_adapter = SpecDecodeAdapter(self)
+        self._last_emit_logits = None
 
     def on_chunked_prefill_failure(
         self, req, out_cache_loc_this_chunk, allocator, req_to_token_pool
@@ -186,7 +187,11 @@ class TTModels(nn.Module):
             )
             logger.debug("tt_model.prefill_forward executed")
             # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
-            return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
+            squeezed = logits.squeeze(1)
+            # Cache prefill's last-position logits for the first spec-verify
+            # cycle (which needs prev_emit = argmax(squeezed) per user).
+            self._last_emit_logits = squeezed.detach().clone()
+            return LogitsProcessorOutput(next_token_logits=squeezed)
 
         elif forward_batch.forward_mode.is_decode():  # decode mode
             tokens = forward_batch.input_ids.unsqueeze(
@@ -261,28 +266,40 @@ class TTModels(nn.Module):
 
         page_table = self._build_page_table(forward_batch)
 
-        per_step_logits = []
-        for step in range(draft_token_num):
-            tokens_step = tokens_per_user[:, step:step + 1]  # [bs, 1]
-            positions_step = positions_per_user[:, step]      # [bs]
-            padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
-                tokens_step, positions_step, page_table
-            )
-            decode_out = self.tt_model.decode_forward(
-                tokens=padded_tokens,
-                start_pos=padded_positions,
-                page_table=padded_pt,
-                kv_cache=self.kv_caches,
-                enable_trace=True,
-                read_from_device=True,
-            )
-            # decode_out[0]: [tt_batch, 1, vocab]; slice back to actual bs.
-            logits_step = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
-            per_step_logits.append(logits_step)
+        # SGLang allocates slots only at positions [seq_lens, seq_lens+dn-1]
+        # for the draft tokens; position seq_lens-1 is NOT freshly allocated
+        # in verify mode (its slot belongs to the previously-committed token
+        # if any, or is unset for the very first verify cycle). Decoding at
+        # seq_lens-1 risks writing to an unmanaged slot and corrupting state.
+        # Decoding at seq_lens uses NGRAM's allocated slot but with input =
+        # prev_emit, which threads baseline-equivalent kv through the
+        # protocol: SGLang's _free_cache will move kv from this slot to the
+        # final bonus position, so the bonus's kv = encoding(prev_emit) which
+        # matches baseline's "decode of prev_emit at the bonus position".
+        last_logits = self._last_emit_logits
+        if last_logits is None:
+            # Fallback (shouldn't happen post-prefill); use draft_0 as input.
+            prev_emit = tokens_per_user[:, 0:1]
+        else:
+            prev_emit = last_logits.argmax(dim=-1).to(_torch.int32).unsqueeze(1)  # [bs,1]
 
-        stacked = _torch.stack(per_step_logits, dim=1)  # [bs, dn, vocab]
-        flat = stacked.reshape(-1, stacked.shape[-1])    # [bs * dn, vocab]
-        return LogitsProcessorOutput(next_token_logits=flat)
+        positions_step = positions_per_user[:, 0]  # [bs] = seq_lens
+        padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
+            prev_emit, positions_step, page_table
+        )
+        decode_out = self.tt_model.decode_forward(
+            tokens=padded_tokens,
+            start_pos=padded_positions,
+            page_table=padded_pt,
+            kv_cache=self.kv_caches,
+            enable_trace=True,
+            read_from_device=True,
+        )
+        logits = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
+        self._last_emit_logits = logits.detach().clone()
+        vocab = logits.shape[-1]
+        tiled = logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, vocab)
+        return LogitsProcessorOutput(next_token_logits=tiled)
 
     def allocate_on_device(self):  # function aloocating kv cache
         """

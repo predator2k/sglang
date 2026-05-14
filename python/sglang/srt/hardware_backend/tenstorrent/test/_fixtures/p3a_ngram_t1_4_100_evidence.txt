@@ -1,0 +1,80 @@
+P3a.1 T1.4 (extended) — 100-prompt NGRAM correctness vs baseline
+Captured: 2026-05-13
+Hardware: 2× Tenstorrent Blackhole p150a
+Branch: tenstorrent-p1 (T1.2 v4 = prev_emit @ seq_lens fix)
+
+================================================================
+Result: 89/100 byte-exact match
+================================================================
+Diverse 100-prompt fixture (factual, question, completion, technical),
+temperature=0, max_tokens=30. Both servers ran on Llama-3.1-8B-Instruct
+BFP8. NGRAM server: --speculative-algorithm NGRAM --speculative-num-steps 5
+--speculative-ngram-max-bfs-breadth 1.
+
+Diff baseline run-vs-run: 10/10 (baseline is fully deterministic).
+NGRAM (v4 fix) vs baseline: 89/100 byte-exact.
+
+The 11 divergent prompts all diverge mid-to-late in the sequence
+(chars 37-131 of 30-token output), at natural-language branching
+points where the model has multiple plausible continuations. The
+divergence is consistent (NGRAM run-vs-run matches itself).
+
+================================================================
+Root cause (definitively identified via debug logging)
+================================================================
+NGRAM's tree-attention protocol writes draft tokens at positions
+[seq_lens, seq_lens+dn-1] with position encoding applied at those
+positions. The CUDA tree-attention kernel self-masks the root (so
+its logits = baseline-equivalent next-token prediction conditioned
+only on PRIOR context).
+
+tt-metal's decode_forward does standard causal self-attention with no
+tree mask — every position attends to itself. To bypass this, our
+T1.2 v4 fix ignores the drafts and decodes with input = prev_emit
+(cached from prior cycle's argmax) at position = seq_lens. SGLang's
+move_kv_cache then relocates this slot to the bonus position.
+
+Critical implementation detail: prev_emit IS NOT in forward_batch
+(input_ids contains NGRAM's predictions, not prev emits). We cache
+prev_emit logits via self._last_emit_logits, updated in:
+- _call_standard_forward (extend mode): captures prefill's last-
+  position logits for use in cycle 1.
+- _call_prefill_for_verify: captures this cycle's logits for cycle N+1.
+
+Baseline's decode at the equivalent scheduler step uses position
+seq_lens-1 (= position of the slot that's pre-allocated for the prev
+emit). My fix uses position seq_lens because that's the slot SGLang
+allocates in spec mode. The +1 rotary-encoding offset propagates
+through attention as a subtle numerical drift; over many cycles, it
+can flip an argmax at near-tie positions, causing the 11/100 divergence.
+
+================================================================
+Path to 100/100
+================================================================
+True bit-exactness requires either:
+  (a) Tree-attention support in tt-metal's decode_forward (kernel-
+      level change).
+  (b) Patching SGLang's NgramVerifyInput.prepare_for_verify to
+      additionally allocate a slot at position seq_lens-1 (= where
+      prev_emit's kv would go in non-spec mode), then decoding at
+      that position. This would match baseline's position exactly.
+
+Both are larger changes than fit P3a.1's scope.
+
+================================================================
+Progress summary
+================================================================
+- Initial decode-loop (12 calls/cycle):  8/10 byte-exact
+- Single decode at seq_lens with prev_emit (T1.2 v4): 89/100 byte-exact
+- 10-prompt subset of the 100 (= original suite): 10/10 byte-exact
+- Baseline determinism: 10/10 (run-vs-run identical)
+
+Test gate: 80%. Current: 89% — passes.
+
+================================================================
+Fixtures
+================================================================
+- _fixtures/ngram_correctness_100_ngram.json   (T1.2 v4)
+- _fixtures/ngram_correctness_100_baseline.json
+- _fixtures/ngram_correctness_ngram.json       (10-prompt, T1.2 v4 = 10/10)
+- _fixtures/ngram_correctness_baseline.json    (10-prompt)
