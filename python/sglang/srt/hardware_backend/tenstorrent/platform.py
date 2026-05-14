@@ -132,6 +132,38 @@ class TTSRTPlatform(SRTPlatform):
         # No NCCL / disaggregation
         server_args.enable_dp_attention = False
 
+        # SGLang's `_get_attention_backend_from_str` whitelist rejects
+        # "tenstorrent" (auto-derived from device name). Force the pass-through
+        # "torch_native" backend — our paged path doesn't actually use SGLang's
+        # attention abstraction (model.forward calls tt_transformers directly),
+        # so the backend choice only needs to validate. P3a.2 patched
+        # draft_utils.DraftBackendFactory to route torch_native to
+        # TTMultiStepDraftBackend for the EAGLE draft path.
+        if server_args.attention_backend in (None, "tenstorrent"):
+            server_args.attention_backend = "torch_native"
+
+        # Force page_size=64 on TT (paged path). tt_transformers'
+        # `paged_scaled_dot_product_attention_decode` and BFP8 tile-packing
+        # require the per-block dim to be 32-aligned (tiles are 32×32);
+        # the kv_cache shape SGLang computes from page_size is
+        # `(num_blocks, num_kv_heads, page_size, head_size)`, and
+        # `pack_as_bfp8_tiles` on `(…, page_size, head_size)` segfaults
+        # when page_size doesn't satisfy that alignment.
+        #
+        # SGLang's default for attention_backend="tenstorrent" is
+        # page_size=1 (server_args._handle_page_size), which crashes here.
+        # The user-facing knob `--page-size 64` works, but missing it should
+        # not segfault — force the supported value if the user left it at
+        # the default. Anything else gets a hard error.
+        if paged:
+            if server_args.page_size in (None, 1):
+                server_args.page_size = 64
+            elif server_args.page_size != 64:
+                raise ValueError(
+                    f"TT paged path requires --page-size 64 "
+                    f"(tt-metal tile alignment); got {server_args.page_size}."
+                )
+
         # Disable grammar backend — P1/P2a does completion-only, no JSON /
         # regex / tool-call constraints. The bundled xgrammar in tt-metal docker
         # is older than current sglang expects (missing StructuralTag), so
