@@ -5,8 +5,22 @@
 # `podman rm`, or after the container's overlay is wiped.
 #
 # Image:       localhost/local-tt-metal:dev  (sha256:973e972bddf5)
-#              Built from /home/mhnie/tt-metal at commit 89686ee7
-#              (UMD bump 2026-05-12), see scripts/reset_devices.sh.
+#              Build context: /home/mhnie/tt-metal-sglang (the fork at
+#              predator2k/tt-metal, branch tenstorrent-p1, base commit
+#              89686ee7 from UMD bump 2026-05-12).
+#              See memory `tenstorrent-tt-metal-fork` for the full
+#              12-commit fork index and `scripts/reset_devices.sh` for
+#              image catalog notes.
+#
+#              IMPORTANT: do NOT rebuild from the non-fork
+#              /home/mhnie/tt-metal — the 8 Blackhole P300 patches
+#              (DRAM mem-cfg fallbacks, grid-y clamp, RMSNorm
+#              _force_unsharded, fused-AG for num_devices>=2, etc.)
+#              live ONLY on the fork. They have no apply-loop fallback
+#              below; the patches dir only sources patches 01–04.
+#              A non-fork build will fail at EAGLE-3 boot on P300 with
+#              the WIDTH_SHARDED / grid 12x9 / bad_optional_access
+#              errors we already solved.
 # Container:   p3a-ngram
 # Mounts:      /home/mhnie/sglang   -> /sglang
 #              /home/mhnie/tt-models -> /models
@@ -75,7 +89,12 @@ else
     -c "sleep infinity" >/dev/null
 fi
 
-echo "Applying tt-metal in-container patches..."
+echo "Applying tt-metal in-container patches (legacy fallback)..."
+# Only patches 01–04 are tracked here as patch files. The fork-based
+# image already contains them as real commits, plus 8 Blackhole P300
+# patches that have NO patch-file equivalent. `patch --dry-run` skips
+# patches already applied, so this loop is a safe no-op against a
+# fork-based image.
 podman exec "$NAME" bash -c '
 set -e
 cd /tt-metal
