@@ -374,25 +374,21 @@ class TTModels(nn.Module):
                     _w._parent = parent
                     _w._orig = orig
                 def __call__(_w, x, *args, **kwargs):
-                    # Only capture in DECODE mode (verify only uses decode);
-                    # prefill calls model.norm too but we don't need it.
-                    mode = kwargs.get("mode", None)
-                    if mode is None and args:
-                        # mode may be passed positionally as 2nd arg
-                        mode = args[1] if len(args) >= 2 else None
+                    if not getattr(_w._parent, "_first_norm_call_logged", False):
+                        logger.info(
+                            f"[TT-SGLANG] pre-norm wrapper FIRST call: "
+                            f"args_len={len(args)} kwargs_keys={list(kwargs.keys())} "
+                            f"mode={kwargs.get('mode', '<missing>')}"
+                        )
+                        _w._parent._first_norm_call_logged = True
                     try:
                         import ttnn as _ttnn_local
-                        from models.tt_transformers.tt.common import Mode as _Mode
-                        is_decode = (mode == _Mode.DECODE) or (
-                            isinstance(mode, str) and mode.lower() == "decode"
-                        )
-                        if is_decode:
-                            try:
-                                shards = _ttnn_local.get_device_tensors(x)
-                                host = _ttnn_local.to_torch(shards[0])
-                            except Exception:
-                                host = _ttnn_local.to_torch(x)
-                            _w._parent._captured_hidden_host = host
+                        try:
+                            shards = _ttnn_local.get_device_tensors(x)
+                            host = _ttnn_local.to_torch(shards[0])
+                        except Exception:
+                            host = _ttnn_local.to_torch(x)
+                        _w._parent._captured_hidden_host = host
                     except Exception as _exc:
                         if not getattr(_w._parent, "_norm_capture_warned", False):
                             logger.warning(f"[TT-SGLANG] pre-norm capture failed: {_exc!r}")
