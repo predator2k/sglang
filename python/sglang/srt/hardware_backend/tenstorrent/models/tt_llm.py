@@ -695,18 +695,20 @@ class TTModels(nn.Module):
                 hidden_stub[b * draft_token_num] = captured_aux_concat[b]
                 if has_embed:
                     vocab_size = int(embed_w.shape[0])
-                    # Positions 1..dtn-1: bonus_aux + 0.05 * embed(token_at_pos)
-                    # triplicated to fill 3*hidden, where token_at_pos is the
-                    # draft's proposed token at that position. Tiny perturbation
-                    # magnitude — large enough to break symmetry, small enough
-                    # to not destroy the captured signal.
+                    # Positions 1..dtn-1: stronger embed perturbation
+                    # (T2.2.U: 0.5 vs T2.2.T's 0.05). The captured target
+                    # aux has L2 ~1434, embed magnitudes are ~10-20, so even
+                    # 0.5x embed = ~5-10 perturbation is small relative to
+                    # the captured signal. v89's 0.05 was too small to break
+                    # token-identity ambiguity for adjacent positions →
+                    # double-token output ("of of"). Try 0.5.
                     for i in range(1, draft_token_num):
                         tok_id = int(flat_input[b * draft_token_num + i].item())
                         tok_id = max(0, min(tok_id, vocab_size - 1))
                         embed_vec = embed_w[tok_id].to(_torch.bfloat16)  # [hidden]
                         embed_triplet = _torch.cat([embed_vec] * 3, dim=-1)  # [3*hidden]
                         hidden_stub[b * draft_token_num + i] = (
-                            captured_aux_concat[b] + 0.05 * embed_triplet
+                            captured_aux_concat[b] + 0.5 * embed_triplet
                         )
             if not getattr(self, "_logged_aux_concat", False):
                 logger.info(
