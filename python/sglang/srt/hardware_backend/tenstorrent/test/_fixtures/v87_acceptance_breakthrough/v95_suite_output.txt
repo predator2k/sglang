@@ -1,0 +1,14 @@
+category   tok/s   accept   length  prompt -> output (truncated)
+------------------------------------------------------------------------------------------------------------------------
+factual    9.60    0.476    1.52    'The capital of Japan is'      -> ' Tokyo, and the capital capital of of the Tokyo capital of o'
+factual    8.08    0.292    1.33    'The largest planet in our solar system is' -> ' __________. The The largest planet in our solar system is _'
+math       9.03    0.455    1.45    '1 + 1 = '                     -> '2, 22 + 11 = 33,  '
+recipe     7.70    0.237    1.26    'To make scrambled eggs, you need' -> ' 2 eggs, 11 tablespoon of milk, and 11/2 teaspoon of salt sa'
+history    7.93    0.240    1.28    'World War 2 ended in'         -> ' 1945.. The United States and the Soviet Soviet Union were t'
+tech       8.34    0.343    1.37    'Python is a programming language that' -> ' is used for a wide range of applications applications, from'
+code       8.16    0.292    1.33    'def fibonacci(n):\n    if n <' -> ' 0:\\n        raise ValueError ValueError("Negative numbers a'
+story      7.29    0.175    1.20    'Once upon a time, there lived a clever fox who' -> ' loved to play tricks on others. One day, he sawared that th'
+
+AVG over 8 prompts: 8.27 tok/s, accept_rate=0.314
+
+Results saved to /tmp/v95_suite_results.json
