@@ -638,30 +638,41 @@ class TTModels(nn.Module):
         per_pos_logits = []  # list of [bs, vocab] tensors
 
         # P3a.2 T2.2.Z+4: tree-mask emulation via _skip_self_attention.
-        # Set the flag on every attention layer so decode's SDPA uses
-        # cur_pos-1 as the kv read bound, excluding the just-written
-        # input token from self-attention. This breaks the chat-template
-        # "OkayOkay..." self-reinforcement on /v1/chat/completions.
-        # The attention.py patch was previously blocked on trace-capture
-        # allocator, but we use enable_trace=False here so the
-        # `ttnn.full(...)` inside attention works.
+        # OPT-IN via env var SGLANG_TT_EAGLE_TREE_MASK=1. When enabled,
+        # decode SDPA uses cur_pos-1 as the kv read bound, excluding the
+        # just-written input token from self-attention. This breaks the
+        # chat-template "OkayOkay..." self-reinforcement on
+        # /v1/chat/completions. HOWEVER, it also degrades /generate
+        # quality severely (raw text outputs become "Tokyo\n![]( 2024年")
+        # because the target loses track of just-emitted context for
+        # non-loopy prompts. Trade-off:
+        #
+        #   SGLANG_TT_EAGLE_TREE_MASK=0 (default): /generate works well,
+        #     /v1/chat/completions produces OkayOkay loop.
+        #   SGLANG_TT_EAGLE_TREE_MASK=1: /v1/chat/completions produces
+        #     coherent (slightly noisy) thinking, /generate produces
+        #     degenerate output.
+        #
+        # Proper fix is per-request mode detection, deferred. For now,
+        # the env var lets operators pick which endpoint to optimize for.
         _attn_layers = []
-        try:
-            for layer in self.tt_model.model[0].layers:
-                inner = getattr(layer, "_orig", layer)  # unwrap our capture wrapper
-                a = getattr(inner, "attention", None)
-                if a is not None:
-                    _attn_layers.append(a)
-                    a._skip_self_attention = True
-            if _attn_layers and not getattr(self, "_logged_skip_self_attn", False):
-                logger.info(
-                    f"[TT-SGLANG] Enabled _skip_self_attention on "
-                    f"{len(_attn_layers)} attention layers for verify "
-                    f"(tree-mask emulation)"
-                )
-                self._logged_skip_self_attn = True
-        except Exception as exc:
-            logger.warning(f"[TT-SGLANG] tree-mask flag wire-up failed: {exc!r}")
+        _tree_mask_on = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "0") == "1"
+        if _tree_mask_on:
+            try:
+                for layer in self.tt_model.model[0].layers:
+                    inner = getattr(layer, "_orig", layer)
+                    a = getattr(inner, "attention", None)
+                    if a is not None:
+                        _attn_layers.append(a)
+                        a._skip_self_attention = True
+                if _attn_layers and not getattr(self, "_logged_skip_self_attn", False):
+                    logger.info(
+                        f"[TT-SGLANG] Tree-mask ENABLED via env var "
+                        f"on {len(_attn_layers)} attention layers"
+                    )
+                    self._logged_skip_self_attn = True
+            except Exception as exc:
+                logger.warning(f"[TT-SGLANG] tree-mask wire-up failed: {exc!r}")
 
         try:
             for i in range(draft_token_num):
