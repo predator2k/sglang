@@ -567,41 +567,40 @@ class TTModels(nn.Module):
             return None
 
     def _call_prefill_for_verify(self, forward_batch):
-        """Verify-batch forward.
+        """Verify-batch forward. Entered from SpecDecodeAdapter._verify_forward
+        on `forward_mode.is_target_verify()` — i.e. both NGRAM and EAGLE-3.
 
-        Two consumers, in order of historical introduction:
+        Current implementation (P3a.2 T2.2.W, v92+): per-position
+        multi-decode. Runs `draft_token_num` sequential decodes, one per
+        spec-batch position, capturing real 3-aux-layer hidden states from
+        target layers [2, 18, 33] after each. The captured `[bs*dn, 3*hidden]`
+        tensor feeds EAGLE-3's spec_info.hidden_states. Each decode runs
+        with `enable_trace=False` because trace mode deallocates the
+        aux-layer intermediates we need to capture. v111 added prefill-time
+        chat-template detection so /v1/chat/completions runs in the same
+        launch as /generate.
 
-          1. NGRAM verify (P3a.1) — single decode at `position=seq_lens`
-             with `input=prev_emit`, output logits tiled to [bs*dn, vocab].
-             Siblings always fail acceptance because they compare against
-             the same root argmax → bonus-only semantics. 89/100 byte-exact
-             vs CUDA NGRAM baseline; the gap is tt-metal's missing
-             content-aware tree-mask SDPA (see memory
-             `tenstorrent-p3a-ngram-architectural-limit`).
+        NGRAM verify also flows through this path. The original NGRAM
+        implementation (single decode at position=seq_lens with
+        input=prev_emit, output tiled to [bs*dn, vocab]) was replaced by
+        the multi-decode rewrite; the rewrite is still correct for NGRAM
+        but pays dn× more decode calls per cycle than the bonus-tiled
+        form. The NGRAM 89/100 byte-exact-vs-baseline ceiling remains
+        because tt-metal lacks a content-aware tree-mask SDPA (see memory
+        `tenstorrent-p3a-ngram-architectural-limit`).
 
-          2. EAGLE-3 verify (P3a.2 T2.2.W, v92+, CURRENT) — per-position
-             multi-decode (one decode per spec-batch position), capturing
-             real 3-aux-layer hidden states from target layers [2, 18, 33]
-             after each. The captured `[bs*dn, 3*hidden]` tensor feeds
-             EAGLE-3's spec_info.hidden_states. Cost: dn× more decode calls
-             per verify cycle (run with `enable_trace=False` because trace
-             mode deallocates the aux-layer intermediates). v111 added
-             prefill-time chat-template detection so /v1/chat/completions
-             also works in the same launch.
+        Tree-mask emulation: the `_skip_self_attention` attention-layer
+        flag (tt-metal patch 04, fork commit `8cc0c7acc5`) is engaged
+        per-batch via runtime loop / chat-flag detection further below.
+        It bounds SDPA at cur_pos-1, emulating a root self-mask. The
+        original trace-capture blocker doesn't fire because this verify
+        path runs with trace disabled.
 
-        Both paths share the same chain-attention limitation (no
-        content-aware tree-mask SDPA in tt-metal decode → token doublings
-        and, before v111, chat-template repetition loops). The
-        `_skip_self_attention` flag (tt-metal patch 04 / fork commit
-        `8cc0c7acc5`) emulates a root self-mask and is engaged
-        per-request in the EAGLE-3 verify path; it sidesteps the original
-        trace-capture blocker because the EAGLE-3 verify decode runs with
-        trace disabled.
-
-        Full content-aware tree-mask SDPA in `paged_scaled_dot_product_attention_decode`
-        would close the remaining gap (e.g., 100/100 byte-exact NGRAM,
-        no token doublings under EAGLE-3) but is multi-file tt-metal
-        kernel work and is out of scope here.
+        Full content-aware tree-mask SDPA in
+        `paged_scaled_dot_product_attention_decode` would close the
+        remaining gaps (100/100 byte-exact NGRAM, no token doublings
+        under EAGLE-3) but is multi-file tt-metal kernel work, out of
+        scope here.
         """
         import torch as _torch
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
