@@ -69,6 +69,12 @@ podman exec \
 - v94b 96 tokens Wikipedia content
 - v95 diverse 8-prompt suite: 7/8 correct
 - v99 chat-template limitation diagnosed
+- v102 reproducibility confirmed; production-stable
+- v103 `_skip_self_attention` tree-mask patch applied (no-trace verify)
+- v107 auto-detect attempt; loop-detector misfires (superseded by v111)
+- v111 **prefill-time chat detection — unified mode**: single launch serves both endpoints
+- v112 alternating cross-mode validation: 4 requests, all correct
+- v113 chat completions reaches Tokyo with full reasoning chain
 
 ## Evidence files in this directory
 - v87_per_request.json — first accept_rate > 0
@@ -82,6 +88,11 @@ podman exec \
 - v94b_python_endurance.json — Wikipedia-quality content
 - v95_suite_results.json + v95_suite_output.txt — 8-prompt suite
 - v99_chat_template_limitation.json — chat issue documented
+- v102_repro_results.json — reproducibility validation
+- v111_unified_mode.json — unified-mode breakthrough
+- v112_alternating_validation.json — 4 alternating GEN/CHAT requests, all correct
+- v113_full_reasoning_chain.json — chat completions delivers Tokyo with full reasoning
+- README.md — maintainer guide with architecture overview
 - FINAL_STATE.md — this document
 
 ## Update (v103): tree-mask env-var-gated workaround for chat — **SUPERSEDED by v111**
