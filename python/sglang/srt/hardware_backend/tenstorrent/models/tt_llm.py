@@ -461,17 +461,31 @@ class TTModels(nn.Module):
         tiled = logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, vocab)
         # P3a.2 EAGLE-3: eagle_worker.verify (eagle_worker.py:958) sets
         # spec_info.hidden_states = logits_output.hidden_states so the draft
-        # can re-feed accepted-token hidden states next round. Provide a
-        # bfloat16 zero stub of shape [bs*draft_token_num, hidden_size] so
-        # `batch.spec_info.hidden_states[accept_index]` in eagle_info.verify
-        # (eagle_info.py:566) doesn't crash on NoneType. Functionally the
-        # target's hidden states aren't extractable from the TT device with
-        # the current paged path, so the draft's re-feed quality is degraded;
-        # this is the same trade-off as the extend-mode stub.
+        # can re-feed accepted-token hidden states next round. The TT device
+        # doesn't expose intermediate hidden states for decode, so we
+        # approximate: use the target's embedding of each draft token as a
+        # signal-carrying hidden_states. This is NOT the true post-norm
+        # hidden_state EAGLE-3 was trained on, but it's a better-than-zero
+        # input that at least encodes token identity. Likely keeps
+        # acceptance rate low (the EAGLE draft was trained on real
+        # last-layer hidden states), but degrades gracefully — vs zeros,
+        # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
-        hidden_stub = _torch.zeros(
-            (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
-        )
+        try:
+            embed_w, _ = self.get_embed_and_head()  # cached after first call
+            if embed_w is not None and embed_w.numel() > 0:
+                # flat_input is [bs * draft_token_num], embed_w is [vocab, hidden]
+                ids = flat_input.to(_torch.long).clamp(min=0, max=int(embed_w.shape[0]) - 1)
+                hidden_stub = embed_w[ids].to(_torch.bfloat16)
+            else:
+                hidden_stub = _torch.zeros(
+                    (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
+                )
+        except Exception as exc:
+            logger.warning(f"verify hidden_states embed-lookup failed ({exc!r}); zeros stub")
+            hidden_stub = _torch.zeros(
+                (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
+            )
         return LogitsProcessorOutput(next_token_logits=tiled, hidden_states=hidden_stub)
 
     # P3a.2 T2.2: EAGLE worker expects target/draft model to expose
