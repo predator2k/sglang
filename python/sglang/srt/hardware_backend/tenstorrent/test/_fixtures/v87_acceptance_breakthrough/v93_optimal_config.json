@@ -1,0 +1,29 @@
+{
+  "iteration": "v93 (T2.2.X)",
+  "summary": "Optimal config: num_steps=2 num_draft_tokens=3 (vs v92's 5/6). 2x throughput + higher accept_rate, same factual quality.",
+  "config_change": "--speculative-num-steps 2 --speculative-num-draft-tokens 3",
+  "test1_prompt": "The capital of France is",
+  "test1_output": " Paris. The capital of Italy the United Kingdom is London London. The capital of capital of Germany the United Kingdom is Kingdom",
+  "test1_metrics": {
+    "throughput_tok_per_sec": 5.71,
+    "spec_accept_rate": 0.219,
+    "spec_accept_length": 1.50,
+    "spec_accept_histogram": [11, 3, 2]
+  },
+  "test2_prompt": "List three large cities and their countries:",
+  "test2_output": "1. Tokyo, Japan  22. New New York, USA USA  3. London. London,, United Kingdom\\nOkay, let let",
+  "test2_metrics": {
+    "throughput_tok_per_sec": 5.73,
+    "spec_accept_rate": 0.205,
+    "spec_accept_length": 1.45,
+    "spec_accept_histogram": [14, 7, 1]
+  },
+  "comparison_to_v92": {
+    "v92_throughput": "2.78-2.95 tok/s",
+    "v93_throughput": "5.71-5.73 tok/s (~2x)",
+    "v92_accept_rate": "0.10-0.12",
+    "v93_accept_rate": "0.20-0.22 (~2x)",
+    "factual_quality": "preserved — same 3-city/3-country output, same Paris→London→Germany chain"
+  },
+  "explanation": "With dtn=3, each verify cycle runs 3 sequential decodes (vs 6) → 2x faster. The bonus is at position 0; only 2 draft positions are speculated, but real-position hidden states still give the draft good seeds. Net: similar absolute accepts per cycle, fewer decode-cycles, higher tok/s."
+}
