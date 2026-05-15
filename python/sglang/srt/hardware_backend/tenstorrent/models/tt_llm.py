@@ -352,6 +352,94 @@ class TTModels(nn.Module):
         else:
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
 
+    def _install_lm_head_hidden_capture_once(self):
+        """Wrap the target's final-norm to save its INPUT (pre-norm last-layer
+        hidden state) before the norm op consumes it. EAGLE-3's midlayer
+        re-norms the hidden state via its own hidden_norm (llama_eagle3.py:86),
+        so it expects an UN-normed input. Capturing post-norm (lm_head input)
+        gives a re-normed value that drifts the draft out of distribution
+        and yields accept_rate=0; capturing pre-norm matches training.
+
+        Reads the ttnn tensor to host inside the wrapper's __call__ (multi-
+        device meshes require per-device read via get_device_tensors).
+        """
+        if getattr(self, "_lm_head_hidden_capture_installed", False):
+            return
+        try:
+            inner = self.tt_model.model[0]
+            original_norm = inner.norm
+
+            class _PreNormHiddenCaptureWrapper:
+                def __init__(_w, parent, orig):
+                    _w._parent = parent
+                    _w._orig = orig
+                def __call__(_w, x, *args, **kwargs):
+                    # Only capture in DECODE mode (verify only uses decode);
+                    # prefill calls model.norm too but we don't need it.
+                    mode = kwargs.get("mode", None)
+                    if mode is None and args:
+                        # mode may be passed positionally as 2nd arg
+                        mode = args[1] if len(args) >= 2 else None
+                    try:
+                        import ttnn as _ttnn_local
+                        from models.tt_transformers.tt.common import Mode as _Mode
+                        is_decode = (mode == _Mode.DECODE) or (
+                            isinstance(mode, str) and mode.lower() == "decode"
+                        )
+                        if is_decode:
+                            try:
+                                shards = _ttnn_local.get_device_tensors(x)
+                                host = _ttnn_local.to_torch(shards[0])
+                            except Exception:
+                                host = _ttnn_local.to_torch(x)
+                            _w._parent._captured_hidden_host = host
+                    except Exception as _exc:
+                        if not getattr(_w._parent, "_norm_capture_warned", False):
+                            logger.warning(f"[TT-SGLANG] pre-norm capture failed: {_exc!r}")
+                            _w._parent._norm_capture_warned = True
+                    return _w._orig(x, *args, **kwargs)
+                def __getattr__(_w, name):
+                    return getattr(_w._orig, name)
+
+            inner.norm = _PreNormHiddenCaptureWrapper(self, original_norm)
+            self._lm_head_hidden_capture_installed = True
+            logger.info(
+                "[TT-SGLANG] Installed pre-norm hidden-state capture wrapper "
+                "(EAGLE-3 acceptance recovery)"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[TT-SGLANG] pre-norm hidden capture install failed: {exc!r}; "
+                "verify will fall back to bonus-embed stub"
+            )
+            self._lm_head_hidden_capture_installed = False
+
+    def _read_captured_hidden_host(self, bs):
+        """Return the captured pre-lm-head hidden state as a host torch
+        tensor of shape [bs, hidden_size], or None if unavailable.
+
+        The wrapper reads the ttnn tensor to host inside its __call__ so the
+        captured value is already a torch tensor by the time we read it
+        here. Shape variants seen so far: [bs, 1, hidden], [1, 1, bs, hidden],
+        [num_devices, 1, 1, bs, hidden] (concatenated across mesh).
+        """
+        import torch as _torch
+        host = getattr(self, "_captured_hidden_host", None)
+        if host is None:
+            return None
+        try:
+            # Squeeze all-singleton leading dims.
+            while host.dim() > 2 and host.shape[0] == 1:
+                host = host.squeeze(0)
+            if host.dim() == 3 and host.shape[1] == 1:
+                host = host.squeeze(1)
+            if host.dim() >= 2 and host.shape[-1] == self.config.hidden_size:
+                return host[:bs].to(_torch.bfloat16).contiguous()
+            return None
+        except Exception as exc:
+            logger.warning(f"[TT-SGLANG] reshape captured hidden failed: {exc!r}")
+            return None
+
     def _call_prefill_for_verify(self, forward_batch):
         """Verify-batch forward (P3a.1 T1.2 v4 + Issue 2 fix).
 
@@ -439,15 +527,36 @@ class TTModels(nn.Module):
         padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
             prev_emit, positions_step, page_table
         )
+        # P3a.2 T2.2.Q: install a lazy lm_head wrapper that captures the
+        # pre-lm-head (= post-norm last-layer hidden state) ttnn tensor on
+        # the first decode call. The wrapper is Python-only (no ttnn op)
+        # so it doesn't change the trace; on subsequent trace replays the
+        # captured tensor's memory address is reused by tt-metal's trace
+        # engine, so reading it via ttnn.to_torch() yields the latest
+        # hidden state. This is the input that EAGLE-3's draft midlayer
+        # was trained on — substituting it should bring accept_rate > 0.
+        self._install_lm_head_hidden_capture_once()
+
+        # P3a.2 T2.2.Q: trace replay deallocates intermediate ttnn tensors,
+        # so the lm_head-input reference captured during trace compile
+        # becomes invalid after replay (TT_THROW "Tensor is not allocated").
+        # Disable trace for verify so each call freshly allocates the
+        # intermediate, making it readable via ttnn.to_torch(). Cost:
+        # per-call Python overhead through ttnn ops (~5–10× slower than
+        # trace replay). Worth it for getting accept_rate > 0.
         decode_out = self.tt_model.decode_forward(
             tokens=padded_tokens,
             start_pos=padded_positions,
             page_table=padded_pt,
             kv_cache=self.kv_caches,
-            enable_trace=True,
+            enable_trace=False,
             read_from_device=True,
         )
         logits = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
+
+        # Read back the captured post-norm hidden state (may be None on first
+        # call before trace replayed, or if wrapper failed to install).
+        captured_hidden_host = self._read_captured_hidden_host(bs)
         # Update per-request prev_emit token cache for the next verify cycle.
         try:
             argmax_tokens = logits.argmax(dim=-1).tolist()
@@ -471,33 +580,39 @@ class TTModels(nn.Module):
         # last-layer hidden states), but degrades gracefully — vs zeros,
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
-        try:
-            embed_w, _ = self.get_embed_and_head()  # cached after first call
-            if embed_w is not None and embed_w.numel() > 0:
-                # P3a.2 T2.2.P: use the target's argmax (bonus token) embedding
-                # tiled across all draft_token_num positions per batch. The
-                # bonus is what the target "wants to emit next", and
-                # embed(bonus) is a per-batch signal that should correlate
-                # with the EAGLE-3 draft's expected `prev_hidden` better than
-                # per-position embed(input_ids) (which is just the draft's
-                # speculation). Still NOT the true post-norm hidden_state,
-                # but closer-to-distribution for EAGLE-3's midlayer.
-                vocab_size = int(embed_w.shape[0])
-                bonus_per_batch = logits.argmax(dim=-1).to(_torch.long).clamp(min=0, max=vocab_size - 1)
-                # bonus_per_batch: [bs]; embed → [bs, hidden]; tile → [bs * draft_token_num, hidden]
-                bonus_hidden = embed_w[bonus_per_batch].to(_torch.bfloat16)
-                hidden_stub = bonus_hidden.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(
-                    n_verify_tokens, -1
-                ).contiguous()
-            else:
+        if captured_hidden_host is not None:
+            # Real post-norm hidden state per batch [bs, hidden]. Tile across
+            # all draft_token_num positions — EAGLE3's midlayer expects one
+            # hidden_state per token, but we only have one per request (the
+            # last position decoded). Tiling is the standard approach when
+            # spec_info expects flat [bs*draft_token_num, hidden].
+            hidden_stub = (
+                captured_hidden_host[:bs]
+                .to(_torch.bfloat16)
+                .unsqueeze(1)
+                .expand(-1, draft_token_num, -1)
+                .reshape(n_verify_tokens, -1)
+                .contiguous()
+            )
+        else:
+            try:
+                embed_w, _ = self.get_embed_and_head()  # cached after first call
+                if embed_w is not None and embed_w.numel() > 0:
+                    vocab_size = int(embed_w.shape[0])
+                    bonus_per_batch = logits.argmax(dim=-1).to(_torch.long).clamp(min=0, max=vocab_size - 1)
+                    bonus_hidden = embed_w[bonus_per_batch].to(_torch.bfloat16)
+                    hidden_stub = bonus_hidden.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(
+                        n_verify_tokens, -1
+                    ).contiguous()
+                else:
+                    hidden_stub = _torch.zeros(
+                        (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
+                    )
+            except Exception as exc:
+                logger.warning(f"verify hidden_states fallback failed ({exc!r}); zeros stub")
                 hidden_stub = _torch.zeros(
                     (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
                 )
-        except Exception as exc:
-            logger.warning(f"verify hidden_states bonus-embed lookup failed ({exc!r}); zeros stub")
-            hidden_stub = _torch.zeros(
-                (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
-            )
         return LogitsProcessorOutput(next_token_logits=tiled, hidden_states=hidden_stub)
 
     # P3a.2 T2.2: EAGLE worker expects target/draft model to expose
