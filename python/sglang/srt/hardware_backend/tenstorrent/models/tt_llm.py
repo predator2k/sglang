@@ -653,18 +653,15 @@ class TTModels(nn.Module):
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — runtime loop detection only (loose safety net)
-            # T2.2.Z+6 warmup-window approach REVERTED: enabling tree-mask
-            # at the START of generation produces coherent chat output
-            # ("the user is asking for what the capital of Japan is. I
-            # need to provide the correct answer. Tokyo. But wait...")
-            # BUT degrades raw generate ("Paris\\n![](2\\n![](2..." after
-            # the first correct token). Tree-mask at the GENERATION start
-            # destroys generate coherence even with N=3 warmup.
-            # Final state: chat-template loop is operator-selected via
-            # SGLANG_TT_EAGLE_TREE_MASK=1.
+        else:  # "auto" — runtime loop detection (threshold=1)
+            # T2.2.Z+7: threshold=1 (catch FIRST same-token repeat).
+            # Chat-template loop forms at cycle 2 (bonus = Okay both
+            # cycles). Setting threshold=1 engages tree-mask at cycle 3,
+            # potentially early enough to recover. Trade-off: any natural
+            # bigram repetition in /generate (rare for greedy decode but
+            # not impossible) also triggers tree-mask which may hurt.
             _tree_mask_on = any(
-                self._consec_same_count_per_req.get(int(r), 0) >= 2
+                self._consec_same_count_per_req.get(int(r), 0) >= 1
                 for r in req_indices
             )
         _attn_layers = []
