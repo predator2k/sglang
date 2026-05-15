@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: © 2026 predator2k <pr3dat0r2000@icloud.com>
-"""TT-native stub for EAGLE's MultiStepDraftBackend (P3a.2 T2.2 boot).
+"""Backend for EAGLE-3 draft on the TT plugin path.
+
+Topology recap: target (e.g. Qwen3-8B) runs on tt_transformers across the
+2× P150a mesh. The EAGLE-3 draft head (LlamaForCausalLMEagle3, loaded from
+Tengyunw/qwen3_8b_eagle3) runs on CPU torch via SGLang's standard
+ModelRunner path (gated by SGLANG_TT_SPEC_DRAFT_BACKEND=cpu).
 
 SGLang's `draft_utils.DraftBackendFactory.create_decode_backend` whitelists
-a fixed set of CUDA-centric backends (triton, flashinfer, fa3, etc.). None
-of them work on TT — our paged path uses tt_transformers directly via
-model.forward, bypassing SGLang's attention backend layer.
+a fixed set of CUDA-centric attention backends (triton, flashinfer, fa3,
+etc.). None of those work for our CPU-torch draft. This class plugs into
+that whitelist (via the `"torch_native"` entry added in P3a.2 T2.2; see
+REBASE_TARGETS.md) and satisfies the EAGLE worker's "backend has these
+methods" contract.
 
-This stub satisfies the EAGLE worker's "backend has these methods" contract
-just enough to let boot complete. The draft model's actual attention happens
-inside its own tt_transformers forward pass; the metadata bookkeeping
-SGLang's backends normally do is a no-op here because our paged path
-manages its own kv layout.
+For step >0 of the multi-step draft, `forward` delegates to SGLang's stock
+TorchNativeAttnBackend so the draft's RadixAttention layers have a real
+attention implementation. The per-step kv metadata SGLang's CUDA backends
+normally populate is a no-op here (kv_indptr/kv_indices stay empty);
+SGLang's accept-logic path on TT doesn't dereference them.
 
 Notes:
   - No real cuda-graph state — irrelevant since TT doesn't use cuda graphs.
