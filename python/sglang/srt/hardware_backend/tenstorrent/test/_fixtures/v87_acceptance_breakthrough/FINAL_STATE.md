@@ -94,3 +94,19 @@ Launch with env var:
 ```bash
 podman exec -e SGLANG_TT_EAGLE_TREE_MASK=1 ...  # enable for chat workloads
 ```
+
+## Update v107: auto-detect attempted but loop-detector misfires
+
+Tried per-request runtime loop detection (`SGLANG_TT_EAGLE_TREE_MASK=auto`)
+that tracks consecutive same-token emissions and engages tree-mask when
+count ≥ 2. Empirically does NOT catch the chat-template "OkayOkay" loop
+because the first emission is "Okay," (token A) followed by "Okay"
+(token B) — different token IDs, so the counter never increments past 0.
+
+Final operator-facing recommendation:
+- `/generate` workloads → leave env var unset (or `0`)
+- `/v1/chat/completions` workloads → set `SGLANG_TT_EAGLE_TREE_MASK=1`
+
+Proper unified fix requires per-request mode detection at prefill time,
+which requires SGLang TT path to surface `forward_batch.reqs` to the
+verify hook. Future SGLang-TT interop improvement.
