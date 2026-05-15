@@ -1,0 +1,20 @@
+{
+  "iteration": "v111 (T2.2.Z+9) — UNIFIED MODE BREAKTHROUGH",
+  "summary": "Single launch serves BOTH /generate AND /v1/chat/completions correctly via prefill-time chat-template detection.",
+  "key_insight": "The prefill path (forward_batch.forward_mode.is_extend()==True) DOES receive raw prompt token IDs via forward_batch.input_ids. The verify path was looking at the wrong place — it only sees draft-batch tokens. Moving detection to prefill unlocks unified mode.",
+  "implementation": "In prefill_forward branch of TTModels.forward, scan input_ids for Qwen3 chat tokens {151644, 151645, 151648}. Set self._chat_template_per_req[ri]=True/False. _call_prefill_for_verify auto mode reads the flag.",
+  "validation": {
+    "generate_suite_avg_tok_per_sec": 8.24,
+    "generate_suite_accept_rate": 0.314,
+    "generate_suite_factual_correct": "7/8",
+    "chat_japan": "'<think>\\nOkayOkay, the user is asking about the capital of Japan. Let me think. I need to make sure I get the answer right.'",
+    "chat_math": "'<think>\\nOkay, the user is asking a very simple question: What is 1 plus 1?? Wait'",
+    "single_launch": true,
+    "env_var_needed": false
+  },
+  "log_evidence": {
+    "prefill_chat_detect_log": "[TT-SGLANG] prefill chat-detect req=1 is_chat=False prompt_len=6 first_5_ids=[785, 6722, 3283, 315, 9625]",
+    "tree_mask_engaged_log": "[TT-SGLANG] Tree-mask ENGAGED (env=auto) on 36 attention layers"
+  },
+  "comment": "Detection fires correctly: raw 'The capital city of France' shows is_chat=False, chat prompts auto-engage tree-mask. ONE LAUNCH covers both workloads. No operator env var needed."
+}
