@@ -593,19 +593,23 @@ class TTModels(nn.Module):
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
         if captured_hidden_host is not None:
-            # Real pre-norm hidden state per batch [bs, hidden].
-            # EAGLE-3 with capture_aux_hidden_states=True (Tengyunw/qwen3_8b_eagle3
-            # was trained with layers [2, 18, 33]) expects [N, 3*hidden] input
-            # which triggers the fc projection path in llama_eagle3.py:193.
-            # We don't have access to 3 separate aux layers via the lm_head wrapper,
-            # so triplicate the last-layer hidden state. This routes through
-            # the fc projection (which was trained on 3-aux), giving the draft
-            # SOME projected signal in its expected dimension. Likely still
-            # below 0.5 acceptance (wrong layer choice) but != 0.
+            # Real pre-norm last-layer hidden state per batch [bs, hidden].
+            # Empirically confirmed in v77/v85/v86: spec_accept_rate remains
+            # 0.0 with this signal feed (single, triplicate, or any tile
+            # arrangement). Tengyunw/qwen3_8b_eagle3 was trained with
+            # capture_aux_hidden_states=True on layers [2, 18, 33] of the
+            # Qwen3-8B target — i.e. specific intermediate aux hidden states
+            # concatenated, not the last layer. The TT-device exposes only
+            # the final pre-norm/post-norm hidden state via wrappable Python
+            # callsites; surfacing layers 2/18/33 outputs would require
+            # wrapping each of those tt_transformers decoder layers
+            # individually and orchestrating per-layer host reads — a
+            # multi-hour surgery beyond this iteration's scope. Until then
+            # we feed the last-layer hidden as a single signal; output is
+            # still coherent Qwen3-8B text, just via bonus-only emission.
             hidden_single = captured_hidden_host[:bs].to(_torch.bfloat16)  # [bs, hidden]
-            hidden_triplet = _torch.cat([hidden_single] * 3, dim=-1)  # [bs, 3*hidden]
             hidden_stub = (
-                hidden_triplet
+                hidden_single
                 .unsqueeze(1)
                 .expand(-1, draft_token_num, -1)
                 .reshape(n_verify_tokens, -1)
