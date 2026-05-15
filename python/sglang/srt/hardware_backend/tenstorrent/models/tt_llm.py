@@ -581,11 +581,8 @@ class TTModels(nn.Module):
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
         if captured_hidden_host is not None:
-            # Real post-norm hidden state per batch [bs, hidden]. Tile across
-            # all draft_token_num positions — EAGLE3's midlayer expects one
-            # hidden_state per token, but we only have one per request (the
-            # last position decoded). Tiling is the standard approach when
-            # spec_info expects flat [bs*draft_token_num, hidden].
+            # Real pre-norm hidden state per batch [bs, hidden]. Tile across
+            # all draft_token_num positions.
             hidden_stub = (
                 captured_hidden_host[:bs]
                 .to(_torch.bfloat16)
@@ -594,6 +591,19 @@ class TTModels(nn.Module):
                 .reshape(n_verify_tokens, -1)
                 .contiguous()
             )
+            # Debug log on first use to confirm capture path is live.
+            if not getattr(self, "_logged_captured_stats", False):
+                try:
+                    norm = float(captured_hidden_host[:bs].float().norm())
+                    logger.info(
+                        f"[TT-SGLANG] EAGLE verify using captured hidden: "
+                        f"shape={tuple(captured_hidden_host[:bs].shape)} "
+                        f"dtype={captured_hidden_host.dtype} "
+                        f"l2_norm={norm:.2f}"
+                    )
+                except Exception:
+                    pass
+                self._logged_captured_stats = True
         else:
             try:
                 embed_w, _ = self.get_embed_and_head()  # cached after first call
