@@ -192,9 +192,9 @@ def _tt_verify_tree_greedy(
     pr = predicts.reshape(-1).cpu().clone()
 
     for bx in range(batch_size):
-        last_accepted = int(ri[bx, 0].item())
-        ai[bx, 0] = last_accepted
-        num_accepted = 0
+        last_accept = int(ri[bx, 0].item())
+        ai[bx, 0] = last_accept
+        num_accept = 0
         cur_index = 0
 
         for _j in range(1, num_spec):
@@ -202,20 +202,20 @@ def _tt_verify_tree_greedy(
             while cur_index != -1:
                 draft_index = int(ri[bx, cur_index].item())
                 draft_tok = int(cand[bx, cur_index].item())
-                target_tok = int(tp[last_accepted].item())
+                target_tok = int(tp[last_accept].item())
                 if draft_tok == target_tok:
-                    pr[last_accepted] = target_tok
-                    num_accepted += 1
-                    ai[bx, num_accepted] = draft_index
-                    last_accepted = draft_index
+                    pr[last_accept] = target_tok
+                    num_accept += 1
+                    ai[bx, num_accept] = draft_index
+                    last_accept = draft_index
                     break
                 else:
                     cur_index = int(rns[bx, cur_index].item())
             if cur_index == -1:
                 break
 
-        an[bx] = num_accepted
-        pr[last_accepted] = int(tp[last_accepted].item())
+        an[bx] = num_accept
+        pr[last_accept] = int(tp[last_accept].item())
 
     accept_index.copy_(ai.to(accept_index.dtype))
     accept_token_num.copy_(an.to(accept_token_num.dtype))
