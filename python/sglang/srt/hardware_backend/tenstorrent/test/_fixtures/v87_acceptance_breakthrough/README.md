@@ -3,10 +3,17 @@
 ## Quick Start
 
 ```bash
+# /generate smoke (default — 3 factual prompts):
 bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh
+
+# /v1/chat/completions smoke (Tokyo reasoning prompt):
+bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh chat
+
+# Unified-mode demo — single launch, both endpoints exercised in sequence:
+bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh both
 ```
 
-Single launch serves **both** `/generate` and `/v1/chat/completions` correctly.
+Single launch serves **both** `/generate` and `/v1/chat/completions` correctly (v111 prefill-time chat detection auto-engages tree-mask per request).
 
 ## What This Directory Contains
 
@@ -106,17 +113,22 @@ SGLANG_TT_EAGLE_TREE_MASK={auto,0,1}
 ## How to Validate
 
 ```bash
-# Full smoke test (3 prompts, ~30s):
-bash scripts/repro_eagle3_2xp150a.sh
+# /generate smoke (3 prompts, ~30s):
+bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh
 
-# Diverse 8-prompt suite (~2 min):
-python3 /tmp/v95_suite.py     # if /tmp/v95_suite.py exists (check git history)
+# /v1/chat/completions smoke (Tokyo prompt, ~30s):
+bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh chat
 
-# Single chat probe:
+# Unified-mode demo — single launch, both endpoints in sequence (~90s):
+bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh both
+
+# Single chat probe against an already-running server:
 podman exec p3a-ngram bash -lc 'curl -s -X POST http://localhost:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"/models/Qwen3-8B\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of Japan?\"}],\"max_tokens\":200,\"temperature\":0.0}"'
 ```
+
+Historical diverse 8-prompt suite output is captured in `v95_suite_results.json` / `v95_suite_output.txt`; the driver script lived at `/tmp/v95_suite.py` during the v95 iteration and was not checked in.
 
 ## History
 
