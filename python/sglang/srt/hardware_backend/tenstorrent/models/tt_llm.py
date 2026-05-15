@@ -474,15 +474,27 @@ class TTModels(nn.Module):
         try:
             embed_w, _ = self.get_embed_and_head()  # cached after first call
             if embed_w is not None and embed_w.numel() > 0:
-                # flat_input is [bs * draft_token_num], embed_w is [vocab, hidden]
-                ids = flat_input.to(_torch.long).clamp(min=0, max=int(embed_w.shape[0]) - 1)
-                hidden_stub = embed_w[ids].to(_torch.bfloat16)
+                # P3a.2 T2.2.P: use the target's argmax (bonus token) embedding
+                # tiled across all draft_token_num positions per batch. The
+                # bonus is what the target "wants to emit next", and
+                # embed(bonus) is a per-batch signal that should correlate
+                # with the EAGLE-3 draft's expected `prev_hidden` better than
+                # per-position embed(input_ids) (which is just the draft's
+                # speculation). Still NOT the true post-norm hidden_state,
+                # but closer-to-distribution for EAGLE-3's midlayer.
+                vocab_size = int(embed_w.shape[0])
+                bonus_per_batch = logits.argmax(dim=-1).to(_torch.long).clamp(min=0, max=vocab_size - 1)
+                # bonus_per_batch: [bs]; embed → [bs, hidden]; tile → [bs * draft_token_num, hidden]
+                bonus_hidden = embed_w[bonus_per_batch].to(_torch.bfloat16)
+                hidden_stub = bonus_hidden.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(
+                    n_verify_tokens, -1
+                ).contiguous()
             else:
                 hidden_stub = _torch.zeros(
                     (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
                 )
         except Exception as exc:
-            logger.warning(f"verify hidden_states embed-lookup failed ({exc!r}); zeros stub")
+            logger.warning(f"verify hidden_states bonus-embed lookup failed ({exc!r}); zeros stub")
             hidden_stub = _torch.zeros(
                 (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
             )
