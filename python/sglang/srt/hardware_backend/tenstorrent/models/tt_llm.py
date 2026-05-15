@@ -567,41 +567,41 @@ class TTModels(nn.Module):
             return None
 
     def _call_prefill_for_verify(self, forward_batch):
-        """Verify-batch forward (P3a.1 T1.2 v4 + Issue 2 fix).
+        """Verify-batch forward.
 
-        NGRAM STATUS: TODO — operationally usable but not bit-exact.
-        ============================================================
-        This implementation produces correct-shape verify logits and
-        survives concurrent chat-completion traffic, but inherits an
-        architectural gap: tt-metal's `decode_forward` has no
-        tree-attention self-mask, so the input token at position
-        `seq_lens` leaks into output logits via standard causal
-        self-attention. CUDA NGRAM uses flashinfer's
-        `prefill_wrapper_verify` with tree-mask root self-mask to
-        suppress that leak; we cannot replicate this without kernel
-        work in `paged_scaled_dot_product_attention_decode`.
+        Two consumers, in order of historical introduction:
 
-        Measured impact (Llama-3.1-8B-Instruct BFP8, P3a.1 T1.4 suite):
-          - 89/100 byte-exact NGRAM-vs-baseline on diverse prompts
-          - Visible token-doubling artifacts ("$22", "ege gegs sold sold")
-            in some outputs; usually don't affect final-answer
-            extraction on simple benchmarks.
+          1. NGRAM verify (P3a.1) — single decode at `position=seq_lens`
+             with `input=prev_emit`, output logits tiled to [bs*dn, vocab].
+             Siblings always fail acceptance because they compare against
+             the same root argmax → bonus-only semantics. 89/100 byte-exact
+             vs CUDA NGRAM baseline; the gap is tt-metal's missing
+             content-aware tree-mask SDPA (see memory
+             `tenstorrent-p3a-ngram-architectural-limit`).
 
-        Next steps for full correctness:
-          - Implement tree-mask in tt-metal decode SDPA (see
-            `scripts/tt_metal_patches/04-attention-self-mask-flag.patch`
-            for the patch shape — currently blocked on trace-capture
-            pre-allocation plumbing).
-          - OR pivot to EAGLE (P3a.2), which has much higher draft
-            acceptance and so the self-attention leak matters less.
+          2. EAGLE-3 verify (P3a.2 T2.2.W, v92+, CURRENT) — per-position
+             multi-decode (one decode per spec-batch position), capturing
+             real 3-aux-layer hidden states from target layers [2, 18, 33]
+             after each. The captured `[bs*dn, 3*hidden]` tensor feeds
+             EAGLE-3's spec_info.hidden_states. Cost: dn× more decode calls
+             per verify cycle (run with `enable_trace=False` because trace
+             mode deallocates the aux-layer intermediates). v111 added
+             prefill-time chat-template detection so /v1/chat/completions
+             also works in the same launch.
 
-        Per SGLang team guidance 2026-05-13: invest in EAGLE instead.
+        Both paths share the same chain-attention limitation (no
+        content-aware tree-mask SDPA in tt-metal decode → token doublings
+        and, before v111, chat-template repetition loops). The
+        `_skip_self_attention` flag (tt-metal patch 04 / fork commit
+        `8cc0c7acc5`) emulates a root self-mask and is engaged
+        per-request in the EAGLE-3 verify path; it sidesteps the original
+        trace-capture blocker because the EAGLE-3 verify decode runs with
+        trace disabled.
 
-        Implementation: single decode at `position=seq_lens` with
-        `input=prev_emit` (cached per-request to handle concurrent
-        verify batches). Output logits tiled to [bs*dn, vocab] —
-        siblings always fail acceptance because they're compared
-        against the same root argmax, preserving bonus-only semantics.
+        Full content-aware tree-mask SDPA in `paged_scaled_dot_product_attention_decode`
+        would close the remaining gap (e.g., 100/100 byte-exact NGRAM,
+        no token doublings under EAGLE-3) but is multi-file tt-metal
+        kernel work and is out of scope here.
         """
         import torch as _torch
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
