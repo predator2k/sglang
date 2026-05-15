@@ -1,4 +1,12 @@
 #!/bin/bash
+# HISTORICAL — v62 iteration milestone (torch tree-build/verify fallback first
+# unblocked EAGLE boot). For the current production launch, use:
+#   bash scripts/repro_eagle3_2xp150a.sh [generate|chat|both]
+#
+# This script uses pre-tuned spec config (num_steps=5, num_draft_tokens=6)
+# that v94 later found suboptimal — production uses num_steps=1, num_draft_tokens=2.
+# Kept for git history; do not run for production validation.
+#
 # Launch EAGLE-3 (target Qwen3-8B + draft Tengyunw/qwen3_8b_eagle3) on TT,
 # now with the torch tree-build/verify fallback installed via TTTpModelWorker.
 #
