@@ -60,6 +60,25 @@ Local patch files at `python/sglang/srt/hardware_backend/tenstorrent/scripts/tt_
 
 ---
 
+## tt-metal in-fork patches (not for upstream — rebase target only)
+
+These live on the predator2k/tt-metal `tenstorrent-p1` fork as real
+commits. They aren't candidates for upstream submission (Blackhole/P300-
+specific enablement, or SGLang-EAGLE-specific hooks), but each rebase
+of the fork onto a newer tt-metal base must carry them along.
+
+| Path | Commit | Purpose |
+|---|---|---|
+| `models/tt_transformers/tt/device.cpp` (compute_with_storage_grid_size) | `09eab40b87` and follow-ups | P300 / Qwen3-8B grid + LM head workarounds (8 commits total — see memory `tenstorrent-tt-metal-fork.md` for the index) |
+| `models/tt_transformers/tt/model_config.py` (QKV/MLP mem-configs) | (within the 8-commit Blackhole/P300 group) | Blackhole-multichip DRAM fallbacks for WIDTH_SHARDED matmuls |
+| `models/tt_transformers/tt/distributed_norm.py` (`_force_unsharded`) | (within the 8-commit Blackhole/P300 group) | Extended to Blackhole-multichip |
+| `models/tt_transformers/tt/attention.py` (`_skip_self_attention` flag) | `8cc0c7acc5` | EAGLE-3 tree-mask emulation; used by `tt_llm.py:_call_prefill_for_verify` in no-trace path |
+
+Fork: `predator2k/tt-metal`, branch `tenstorrent-p1`, base `89686ee78d`.
+Index of all 12 fork commits in memory entry `tenstorrent-tt-metal-fork`.
+
+---
+
 ## SGLang speculative-worker patches (P3a.0 T0.2, R-P3-3 HIGH)
 
 | File | Lines | Purpose | First landed |

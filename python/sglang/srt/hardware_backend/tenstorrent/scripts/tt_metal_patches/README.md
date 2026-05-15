@@ -41,7 +41,7 @@ done
 
 Patch 03 (`decode_forward`) should be **upstreamed** to Tenstorrent (`tt-metal`
 repository), as it's a real bug affecting any SGLang user of `generator_sglang.py`.
-Track the upstream submission in `REBASE_TARGETS.md`.
+Track the upstream submission in `/REBASE_TARGETS.md` (repo root).
 
 ## Pinned tt-metal commit
 
