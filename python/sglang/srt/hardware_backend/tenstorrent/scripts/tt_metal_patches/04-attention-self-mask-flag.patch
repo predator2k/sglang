@@ -1,29 +1,33 @@
-# P3a.1 T1.4 attempted tt-metal patch — BLOCKED on trace-capture limitation.
+# tt-metal patch — `_skip_self_attention` flag on the attention layer.
 #
-# Goal: add an opt-in `_skip_self_attention` instance flag to the attention
-# layer that, when True, causes `paged_scaled_dot_product_attention_decode`
-# to use cur_pos-1 instead of cur_pos as its attention range bound. This
-# would emulate CUDA NGRAM's tree-mask root self-mask, removing the input
-# token's self-attention contribution from output logits.
+# Goal: add an opt-in `_skip_self_attention` instance flag that, when True,
+# causes `paged_scaled_dot_product_attention_decode` to use cur_pos-1
+# instead of cur_pos as its attention range bound. This emulates a
+# tree-mask root self-mask, removing the input token's self-attention
+# contribution from output logits.
 #
-# Issue: the patch creates the cur_pos-1 tensor via `ttnn.full(...)` inside
-# `forward_decode`, but tt-metal raises:
+# STATUS (v103+): APPLIED on the predator2k/tt-metal `tenstorrent-p1` fork
+# and actively used by EAGLE-3 verify. The original trace-capture blocker
+# below does not affect the EAGLE-3 path because `_call_prefill_for_verify`
+# runs `enable_trace=False` (trace mode deallocates the aux-layer
+# intermediates we need to capture for the EAGLE-3 hidden_states output).
+# EAGLE-3 verify sets `_skip_self_attention=True` per-batch via runtime
+# loop / chat-flag detection in `tt_llm.py:_call_prefill_for_verify`.
+#
+# Historical blocker (preserved for future trace-mode users): allocating
+# the cur_pos-1 tensor via `ttnn.full(...)` inside a traced decode forward
+# raises:
 #
 #   RuntimeError: TT_FATAL ... fd_mesh_command_queue.cpp:590: !trace_id_.has_value()
 #   info: Writes are not supported during trace capture. trace id: 2
 #
-# Decode forward is fully traced for performance; allocating an intermediate
-# tensor inside it isn't allowed. Working around this needs a pre-allocated
-# `cur_pos_minus_one` ttnn buffer threaded through the trace setup, which is
-# multi-file kernel-API work (decode trace plumbing, model.forward signature
-# changes, attention layer init).
+# Trace-mode use would still require a pre-allocated `cur_pos_minus_one`
+# ttnn buffer threaded through the trace setup (decode trace plumbing,
+# model.forward signature, attention init). Not needed for EAGLE-3.
 #
-# Captured here as a roadmap for future work. NOT applied (would crash on first
-# verify forward when the flag is set).
-#
-# Path to 100/100 byte-exact NGRAM-vs-baseline requires this kind of kernel
-# patch, not Python-level changes. See p3a_ngram_t1_4_100_evidence.txt for
-# full architectural analysis.
+# The original P3a.1 NGRAM goal (100/100 byte-exact NGRAM-vs-baseline in
+# trace mode) would still require that plumbing — see
+# p3a_ngram_t1_4_100_evidence.txt for the architectural analysis.
 --- a/models/tt_transformers/tt/attention.py
 +++ b/models/tt_transformers/tt/attention.py
 @@ -703,12 +703,23 @@
