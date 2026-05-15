@@ -110,3 +110,33 @@ Final operator-facing recommendation:
 Proper unified fix requires per-request mode detection at prefill time,
 which requires SGLang TT path to surface `forward_batch.reqs` to the
 verify hook. Future SGLang-TT interop improvement.
+
+## 🎉 v111 BREAKTHROUGH — Unified Mode (2026-05-15)
+
+Prefill-time chat-template detection enables a single launch to serve
+BOTH `/generate` and `/v1/chat/completions` correctly. No env var needed.
+
+The key insight: the **prefill path** (`forward_batch.forward_mode.is_extend()==True`)
+DOES receive raw prompt token IDs via `forward_batch.input_ids`. Earlier
+attempts looked in the verify path which only sees draft-batch tokens.
+
+Implementation in `tt_llm.py:prefill_forward`:
+```python
+CHAT_TOKS = {151644, 151645, 151648}  # Qwen3 <|im_start|>, <|im_end|>, <think>
+chunk = all_ids[off : off + l]  # per-req slice of prompt tokens
+is_chat = any(t in CHAT_TOKS for t in chunk)
+self._chat_template_per_req[int(ri)] = is_chat
+```
+
+Verify auto-mode reads the flag and engages tree-mask only for chat-tagged
+requests. Verified state in a single launch:
+
+| Endpoint | Result |
+|---|---|
+| `/generate` | 8.24 tok/s avg, 7/8 prompts factually correct (no regression) |
+| `/v1/chat/completions` | "the user is asking a very simple question: What is 1 plus 1??" coherent thinking |
+
+Recommended launch (no env var, works for both):
+```bash
+bash scripts/repro_eagle3_2xp150a.sh
+```
