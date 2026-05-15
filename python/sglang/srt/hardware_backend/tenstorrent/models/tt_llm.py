@@ -616,37 +616,56 @@ class TTModels(nn.Module):
         prev_emit = _torch.tensor(prev_emit_list, dtype=_torch.int32).unsqueeze(1)  # [bs,1]
 
         positions_step = positions_per_user[:, 0]  # [bs] = seq_lens
-        padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
-            prev_emit, positions_step, page_table
-        )
-        # P3a.2 T2.2.R: install aux-layer capture (layers [2, mid, N-3])
-        # — what EAGLE-3 was actually trained on. The single-layer pre-norm
-        # capture (T2.2.Q) didn't achieve accept_rate>0 because the draft
-        # expects 3-aux-layer concatenated input.
+
         self._install_aux_layer_capture_once()
-        # Keep the pre-norm capture as fallback in case aux install fails.
         self._install_lm_head_hidden_capture_once()
 
-        # P3a.2 T2.2.Q: trace replay deallocates intermediate ttnn tensors,
-        # so the lm_head-input reference captured during trace compile
-        # becomes invalid after replay (TT_THROW "Tensor is not allocated").
-        # Disable trace for verify so each call freshly allocates the
-        # intermediate, making it readable via ttnn.to_torch(). Cost:
-        # per-call Python overhead through ttnn ops (~5–10× slower than
-        # trace replay). Worth it for getting accept_rate > 0.
-        decode_out = self.tt_model.decode_forward(
-            tokens=padded_tokens,
-            start_pos=padded_positions,
-            page_table=padded_pt,
-            kv_cache=self.kv_caches,
-            enable_trace=False,
-            read_from_device=True,
-        )
-        logits = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
+        # P3a.2 T2.2.W: per-position multi-decode.
+        # Run draft_token_num sequential decodes, one per spec-batch position.
+        # Position 0 uses prev_emit; positions 1..dtn-1 use draft proposed
+        # tokens. After each decode, capture the 3-aux-layer hidden state
+        # for that position. This gives us REAL per-position hidden states
+        # instead of tiling the bonus position across all dtn positions
+        # (which caused v87-v91 double-token artifacts even with various
+        # perturbation schemes — the dominant bonus_aux signal washed out
+        # any perturbation we tried).
+        #
+        # Cost: draft_token_num× more decode_forward calls per verify
+        # cycle. With dtn=6 and prior verify=~150ms/decode, each verify
+        # cycle takes ~900ms. Net throughput depends on whether the
+        # quality boost in accept_rate compensates.
+        per_pos_aux = []  # list of [bs, 3*hidden] tensors
+        per_pos_logits = []  # list of [bs, vocab] tensors
 
-        # T2.2.R: prefer the 3-aux-layer concat (matches EAGLE-3 training).
-        # Falls back to single-layer pre-norm capture if aux unavailable.
-        captured_aux_concat = self._read_captured_aux_concat_host(bs)
+        for i in range(draft_token_num):
+            if i == 0:
+                token_i = prev_emit  # [bs, 1] — the bonus
+            else:
+                token_i = tokens_per_user[:, i : i + 1]  # [bs, 1] — draft @ pos i
+            pos_i = (positions_step + i).to(_torch.int32)  # [bs]
+            padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
+                token_i, pos_i, page_table
+            )
+            decode_out_i = self.tt_model.decode_forward(
+                tokens=padded_tokens_i,
+                start_pos=padded_positions_i,
+                page_table=padded_pt_i,
+                kv_cache=self.kv_caches,
+                enable_trace=False,
+                read_from_device=True,
+            )
+            logits_i = decode_out_i[0][:bs].squeeze(1)  # [bs, vocab]
+            aux_i = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
+            per_pos_logits.append(logits_i)
+            per_pos_aux.append(aux_i)
+
+        # logits-per-position: stack to [bs, dtn, vocab]
+        logits_per_pos = _torch.stack(per_pos_logits, dim=1)  # [bs, dtn, vocab]
+        # logits[:, 0] is what we use to update prev_emit cache (bonus position).
+        logits = per_pos_logits[0]
+        # T2.2.W: aux concat is the LAST position's aux (used as fallback if
+        # per-position assembly fails); per_pos_aux carries all dtn entries.
+        captured_aux_concat = per_pos_aux[0]
         captured_hidden_host = self._read_captured_hidden_host(bs)
         # Update per-request prev_emit token cache for the next verify cycle.
         try:
@@ -658,7 +677,9 @@ class TTModels(nn.Module):
         except Exception as exc:
             logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
         vocab = logits.shape[-1]
-        tiled = logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, vocab)
+        # T2.2.W: real per-position logits laid out as [bs*dtn, vocab].
+        # Position 0 = bonus (logits[0]), positions 1..dtn-1 = drafts.
+        tiled = logits_per_pos.reshape(bs * draft_token_num, vocab)
         # P3a.2 EAGLE-3: eagle_worker.verify (eagle_worker.py:958) sets
         # spec_info.hidden_states = logits_output.hidden_states so the draft
         # can re-feed accepted-token hidden states next round. The TT device
@@ -671,54 +692,52 @@ class TTModels(nn.Module):
         # last-layer hidden states), but degrades gracefully — vs zeros,
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
-        if captured_aux_concat is not None:
-            # T2.2.T: real 3-aux-layer concat at position 0 + position-specific
-            # token-embed perturbation at positions 1..dtn-1. v88 (T2.2.S)
-            # zeroed non-bonus positions to break v87's repetition loop, but
-            # zeros are uninformative for accepted drafts' next-round feed
-            # (those positions get no signal and reproduce token-pair
-            # repetition). Add a small embed-derived perturbation so each
-            # position has DIFFERENT hidden state — breaks the same-state
-            # echo while keeping the bonus signal load-bearing.
-            try:
-                embed_w, _ = self.get_embed_and_head()
-                has_embed = embed_w is not None and embed_w.numel() > 0
-            except Exception:
-                embed_w = None
-                has_embed = False
+        # T2.2.W: assemble per-position aux concat. Each position has its
+        # own real captured 3-aux-layer hidden state from running the
+        # target decode at that position. No perturbation needed — these
+        # are the real signals the EAGLE-3 draft was trained on.
+        all_per_pos_valid = all(a is not None for a in per_pos_aux)
+        if all_per_pos_valid:
             hidden_stub = _torch.zeros(
                 (n_verify_tokens, 3 * self.config.hidden_size),
                 dtype=_torch.bfloat16,
             )
             for b in range(bs):
-                # Position 0 (bonus): real captured aux concat
+                for i in range(draft_token_num):
+                    hidden_stub[b * draft_token_num + i] = per_pos_aux[i][b]
+            if not getattr(self, "_logged_per_pos_aux", False):
+                logger.info(
+                    f"[TT-SGLANG] EAGLE verify PER-POSITION AUX: "
+                    f"{draft_token_num} positions × shape "
+                    f"{tuple(per_pos_aux[0].shape)} each (true per-pos hidden)"
+                )
+                self._logged_per_pos_aux = True
+        elif captured_aux_concat is not None:
+            # Fallback: tile last-position aux + cumulative embed perturb.
+            try:
+                embed_w, _ = self.get_embed_and_head()
+                has_embed = embed_w is not None and embed_w.numel() > 0
+            except Exception:
+                has_embed = False
+                embed_w = None
+            hidden_stub = _torch.zeros(
+                (n_verify_tokens, 3 * self.config.hidden_size),
+                dtype=_torch.bfloat16,
+            )
+            for b in range(bs):
                 hidden_stub[b * draft_token_num] = captured_aux_concat[b]
                 if has_embed:
                     vocab_size = int(embed_w.shape[0])
-                    # Positions 1..dtn-1: CUMULATIVE embed perturbation
-                    # (T2.2.V). Each position i gets the captured bonus_aux
-                    # plus a cumulative sum of embed(draft_tokens[0..i]).
-                    # This gives every position a UNIQUE signal that builds
-                    # context-like information: position 1 sees one token's
-                    # embed, position 2 sees two, etc. Breaks the symmetry
-                    # that produced v90's doubling.
                     cum_embed = _torch.zeros(self.config.hidden_size, dtype=_torch.bfloat16)
                     for i in range(1, draft_token_num):
                         tok_id = int(flat_input[b * draft_token_num + i].item())
                         tok_id = max(0, min(tok_id, vocab_size - 1))
                         embed_vec = embed_w[tok_id].to(_torch.bfloat16)
-                        cum_embed = cum_embed + embed_vec  # accumulate
+                        cum_embed = cum_embed + embed_vec
                         embed_triplet = _torch.cat([cum_embed] * 3, dim=-1)
                         hidden_stub[b * draft_token_num + i] = (
                             captured_aux_concat[b] + 0.1 * embed_triplet
                         )
-            if not getattr(self, "_logged_aux_concat", False):
-                logger.info(
-                    f"[TT-SGLANG] EAGLE verify AUX+perturb: "
-                    f"pos0=captured (shape {tuple(captured_aux_concat.shape)}), "
-                    f"pos1..{draft_token_num-1}=bonus_aux+0.05*embed(token)"
-                )
-                self._logged_aux_concat = True
         elif captured_hidden_host is not None:
             # Fallback: single-layer pre-norm hidden_state. Empirically
             # bound at accept_rate=0 (v77-v86) — kept only so the pipeline
