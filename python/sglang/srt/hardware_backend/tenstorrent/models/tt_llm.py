@@ -637,27 +637,59 @@ class TTModels(nn.Module):
         per_pos_aux = []  # list of [bs, 3*hidden] tensors
         per_pos_logits = []  # list of [bs, vocab] tensors
 
-        for i in range(draft_token_num):
-            if i == 0:
-                token_i = prev_emit  # [bs, 1] — the bonus
-            else:
-                token_i = tokens_per_user[:, i : i + 1]  # [bs, 1] — draft @ pos i
-            pos_i = (positions_step + i).to(_torch.int32)  # [bs]
-            padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
-                token_i, pos_i, page_table
-            )
-            decode_out_i = self.tt_model.decode_forward(
-                tokens=padded_tokens_i,
-                start_pos=padded_positions_i,
-                page_table=padded_pt_i,
-                kv_cache=self.kv_caches,
-                enable_trace=False,
-                read_from_device=True,
-            )
-            logits_i = decode_out_i[0][:bs].squeeze(1)  # [bs, vocab]
-            aux_i = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
-            per_pos_logits.append(logits_i)
-            per_pos_aux.append(aux_i)
+        # P3a.2 T2.2.Z+4: tree-mask emulation via _skip_self_attention.
+        # Set the flag on every attention layer so decode's SDPA uses
+        # cur_pos-1 as the kv read bound, excluding the just-written
+        # input token from self-attention. This breaks the chat-template
+        # "OkayOkay..." self-reinforcement on /v1/chat/completions.
+        # The attention.py patch was previously blocked on trace-capture
+        # allocator, but we use enable_trace=False here so the
+        # `ttnn.full(...)` inside attention works.
+        _attn_layers = []
+        try:
+            for layer in self.tt_model.model[0].layers:
+                inner = getattr(layer, "_orig", layer)  # unwrap our capture wrapper
+                a = getattr(inner, "attention", None)
+                if a is not None:
+                    _attn_layers.append(a)
+                    a._skip_self_attention = True
+            if _attn_layers and not getattr(self, "_logged_skip_self_attn", False):
+                logger.info(
+                    f"[TT-SGLANG] Enabled _skip_self_attention on "
+                    f"{len(_attn_layers)} attention layers for verify "
+                    f"(tree-mask emulation)"
+                )
+                self._logged_skip_self_attn = True
+        except Exception as exc:
+            logger.warning(f"[TT-SGLANG] tree-mask flag wire-up failed: {exc!r}")
+
+        try:
+            for i in range(draft_token_num):
+                if i == 0:
+                    token_i = prev_emit  # [bs, 1] — the bonus
+                else:
+                    token_i = tokens_per_user[:, i : i + 1]  # [bs, 1] — draft @ pos i
+                pos_i = (positions_step + i).to(_torch.int32)  # [bs]
+                padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
+                    token_i, pos_i, page_table
+                )
+                decode_out_i = self.tt_model.decode_forward(
+                    tokens=padded_tokens_i,
+                    start_pos=padded_positions_i,
+                    page_table=padded_pt_i,
+                    kv_cache=self.kv_caches,
+                    enable_trace=False,
+                    read_from_device=True,
+                )
+                logits_i = decode_out_i[0][:bs].squeeze(1)  # [bs, vocab]
+                aux_i = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
+                per_pos_logits.append(logits_i)
+                per_pos_aux.append(aux_i)
+        finally:
+            # Always clear the flag — other code paths (regular decode for
+            # actual generation) should NOT use tree-mask.
+            for a in _attn_layers:
+                a._skip_self_attention = False
 
         # logits-per-position: stack to [bs, dtn, vocab]
         logits_per_pos = _torch.stack(per_pos_logits, dim=1)  # [bs, dtn, vocab]
