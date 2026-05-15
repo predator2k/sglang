@@ -593,11 +593,19 @@ class TTModels(nn.Module):
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
         if captured_hidden_host is not None:
-            # Real pre-norm hidden state per batch [bs, hidden]. Tile across
-            # all draft_token_num positions.
+            # Real pre-norm hidden state per batch [bs, hidden].
+            # EAGLE-3 with capture_aux_hidden_states=True (Tengyunw/qwen3_8b_eagle3
+            # was trained with layers [2, 18, 33]) expects [N, 3*hidden] input
+            # which triggers the fc projection path in llama_eagle3.py:193.
+            # We don't have access to 3 separate aux layers via the lm_head wrapper,
+            # so triplicate the last-layer hidden state. This routes through
+            # the fc projection (which was trained on 3-aux), giving the draft
+            # SOME projected signal in its expected dimension. Likely still
+            # below 0.5 acceptance (wrong layer choice) but != 0.
+            hidden_single = captured_hidden_host[:bs].to(_torch.bfloat16)  # [bs, hidden]
+            hidden_triplet = _torch.cat([hidden_single] * 3, dim=-1)  # [bs, 3*hidden]
             hidden_stub = (
-                captured_hidden_host[:bs]
-                .to(_torch.bfloat16)
+                hidden_triplet
                 .unsqueeze(1)
                 .expand(-1, draft_token_num, -1)
                 .reshape(n_verify_tokens, -1)
