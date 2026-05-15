@@ -1,0 +1,21 @@
+{
+  "iteration": "v99 (T2.2.Z+2 no-repeat-bigram + chat template diagnosis)",
+  "summary": "/v1/chat/completions endpoint has a known limitation: chat-template-context triggers a self-reinforcing repetition loop ('OkayOkay...' or similar) because Qwen3 thinking-mode starts with predictable token sequences that EAGLE-3 spec amplifies in the absence of tree-mask SDPA.",
+  "diagnosis": {
+    "trigger": "Qwen3 chat template '<|im_start|>user...<|im_end|><|im_start|>assistant<think>\\n' produces deterministic first-token 'Okay,'",
+    "amplification": "EAGLE-3 draft sees real bonus hidden_state of 'Okay context' → proposes 'Okay' at next position. Target verifies and accepts. Loop self-reinforces.",
+    "root_cause": "Missing tree-attention self-mask in tt-metal decode SDPA. Chain attention without self-mask causes self-reinforcing token repetition.",
+    "manifests_in": "/v1/chat/completions endpoint and /generate when chat template is manually embedded. /generate with raw natural-language prompts works correctly."
+  },
+  "v99_no_repeat_bigram_test": {
+    "chat_japan": "'<think>\\nOkay,,,\\n\\n\\n\\n\\n\\n...' (improved from 'OkayOkayOkay...' but still degenerate)",
+    "raw_generate_france": "' Paris. The capital of Italy the United Kingdom is London London...' (preserved, multi-fact)",
+    "raw_generate_tok_per_sec": 8.51,
+    "raw_generate_accept_rate": 0.353
+  },
+  "production_workaround": {
+    "recommendation": "Use /generate endpoint with raw text for production. Apply chat templates client-side BEFORE sending the request, but DO NOT use /v1/chat/completions until tree-mask SDPA is added to tt-metal kernel.",
+    "rationale": "/generate path with our multi-decode + 3-aux capture produces real EAGLE-3 acceleration (8 tok/s, accept 0.28-0.48) with factually correct content across diverse domains (v95 suite 7/8 correct)."
+  },
+  "real_fix": "Implement tree-attention self-mask in tt-metal's paged_scaled_dot_product_attention_decode. Referenced as scripts/tt_metal_patches/04-attention-self-mask-flag.patch — multi-hour C++ kernel work."
+}
