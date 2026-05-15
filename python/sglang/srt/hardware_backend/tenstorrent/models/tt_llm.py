@@ -662,28 +662,43 @@ class TTModels(nn.Module):
             # tree-mask immediately. Otherwise rely on loop detector.
             try:
                 CHAT_TOKS = {151644, 151645}
+                # forward_batch.req_to_token_pool.req_to_token is [n_reqs, max_ctx_len]
+                # — KV slot ID per token position. We also need the token IDs.
+                # The simplest source: forward_batch.input_ids contains the
+                # CURRENT verify batch tokens, not the historical prompt.
+                # Instead look at req_to_token_pool's actual tokens via the
+                # req objects (forward_batch.reqs).
                 for r in req_indices:
                     ri = int(r)
                     if ri in self._chat_template_per_req:
                         continue
-                    # Look up actual KV-allocated tokens for this req
+                    is_chat = False
                     req_obj = None
-                    if hasattr(forward_batch, "reqs"):
+                    if hasattr(forward_batch, "reqs") and forward_batch.reqs:
                         for rq in forward_batch.reqs:
                             if int(getattr(rq, "req_pool_idx", -1)) == ri:
                                 req_obj = rq
                                 break
-                    is_chat = False
                     if req_obj is not None:
-                        for attr in ("origin_input_ids", "input_ids", "fill_ids"):
+                        for attr in ("origin_input_ids", "input_ids", "fill_ids", "prompt_tokens"):
                             ids = getattr(req_obj, attr, None)
                             if ids is not None:
                                 try:
-                                    is_chat = any(int(t) in CHAT_TOKS for t in list(ids)[:64])
-                                    break
+                                    is_chat = any(int(t) in CHAT_TOKS for t in list(ids)[:128])
+                                    if is_chat:
+                                        break
                                 except Exception:
                                     pass
                     self._chat_template_per_req[ri] = is_chat
+                    if not getattr(self, "_logged_chat_detect", False):
+                        attrs = []
+                        if req_obj is not None:
+                            attrs = [a for a in dir(req_obj) if not a.startswith("_")][:25]
+                        logger.info(
+                            f"[TT-SGLANG] chat-detect req={ri} is_chat={is_chat} "
+                            f"req_obj_type={type(req_obj).__name__} attrs={attrs}"
+                        )
+                        self._logged_chat_detect = True
             except Exception as exc:
                 logger.warning(f"[TT-SGLANG] chat-template detection failed: {exc!r}")
             _tree_mask_on = any(
