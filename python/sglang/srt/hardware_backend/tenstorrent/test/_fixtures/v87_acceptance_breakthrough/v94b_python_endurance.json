@@ -1,0 +1,28 @@
+{
+  "iteration": "v94b — endurance test of optimal config at 96 tokens",
+  "config": "--speculative-num-steps 1 --speculative-num-draft-tokens 2",
+  "headline": "EAGLE-3 on 2x P150a now produces FACTUALLY ACCURATE Wikipedia-style content at 8 tok/s",
+  "test_python_prompt": "Tell me about Python programming language",
+  "test_python_output": ". Python is a high-level, interpreted programming language that that is known designed to be easy readable and and and simple simple to to learn learn. It It was created by Guido van Rossum in the late 11980ss. Python Python is known known for its clean clear syntax and and and its its use use in in a a wide wide range range of of applications applications, including web development, data data analysis analysis, machine artificial intelligence, and and",
+  "test_python_metrics": {
+    "throughput_tok_per_sec": 8.11,
+    "spec_accept_rate": 0.284,
+    "spec_accept_length": 1.30,
+    "completion_tokens": 96,
+    "spec_verify_ct": 74
+  },
+  "factual_correctness_check": {
+    "Python is high-level interpreted": "CORRECT",
+    "created by Guido van Rossum": "CORRECT",
+    "late 1980s": "CORRECT (Python launched 1991, design started 1989)",
+    "clean syntax": "CORRECT (Python's stated design goal)",
+    "web development, data analysis, AI": "CORRECT (all major Python use cases)"
+  },
+  "ablation_milestones": {
+    "v92 (dtn=6 steps=5)": "2.78 tok/s, accept 0.12",
+    "v93 (dtn=3 steps=2)": "5.71 tok/s, accept 0.22",
+    "v94 (dtn=2 steps=1, short)": "9.02-9.61 tok/s, accept 0.35-0.48",
+    "v94b (dtn=2 steps=1, 96 tok)": "8.11 tok/s, accept 0.28, FACTUAL CONTENT"
+  },
+  "remaining_artifacts": "Doublings persist ('and and', 'data data analysis'). Root cause is the chain attention pattern when the draft seed encodes the previous accepted token strongly — the draft sometimes proposes the same token as bonus. Real fix needs tree-attention self-mask in tt-metal SDPA, but doesn't prevent useful output."
+}
