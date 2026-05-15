@@ -25,23 +25,30 @@ podman exec \
     --disable-cuda-graph --enable-metrics'
 ```
 
-## What works
-- `/generate` endpoint with raw text prompts
-- 8/8 diverse prompts in v95 suite produce factually correct content
-- 96-token sustained generation: factually accurate Python facts
-  ("Guido van Rossum, late 1980s, web/data/AI")
-- Reproducibility: bit-exact across server restarts
+## What works (v111-v113, unified mode)
+- **Single launch serves both endpoints.** Prefill-time chat-template
+  detection auto-engages tree-mask per-request when Qwen3 chat tokens
+  `{151644, 151645, 151648}` appear in `input_ids` — see the v111
+  BREAKTHROUGH section below for the implementation.
+- `/generate`: 7/8 diverse prompts in v95 suite produce factually correct
+  content (~8.24 tok/s avg). 96-token sustained generation produces
+  factually accurate Python facts ("Guido van Rossum, late 1980s, …").
+- `/v1/chat/completions`: full reasoning chain reaches the correct
+  factual answer (v113 demo: "What is the capital of Japan?" → Tokyo).
+- Reproducibility: bit-exact across server restarts.
 
-## Known limitation
-`/v1/chat/completions` endpoint produces self-reinforcing repetition
-loops ("OkayOkay...") on Qwen3 because chat template's deterministic
-`<think>\nOkay,` start triggers EAGLE-3 spec doublings amplified by
-chain attention without tree-mask.
-
-**Workaround**: use `/generate` and apply chat templates client-side.
-
-**Real fix** (future, multi-hour tt-metal C++ kernel work): tree-attention
-self-mask in `paged_scaled_dot_product_attention_decode`.
+## Remaining known limitations
+- **Token doublings** ("the the", "Tokyo Tokyo") still appear in output.
+  Doesn't break semantic correctness. Root cause is chain-attention
+  without per-position content-aware tree-mask SDPA; a real kernel
+  patch in `paged_scaled_dot_product_attention_decode` would fix this.
+  Out of session scope.
+- **Throughput** is bounded by ~draft_token_num× decode calls per
+  verify cycle. Multi-decode is required for real per-position
+  hidden states; trace-mode is incompatible with the aux-layer
+  capture pattern. Recovering trace-speed would require adding
+  aux-hidden as a persistent output in tt-metal's prefill trace
+  machinery (analog of `process_hidden_states_after_prefill_trace`).
 
 ## Key implementation pieces
 | File | What it does |
