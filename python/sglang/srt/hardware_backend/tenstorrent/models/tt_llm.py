@@ -676,17 +676,29 @@ class TTModels(nn.Module):
             # layers [2, mid, N-3]. This is the exact input shape and
             # semantics EAGLE-3 was trained on. EAGLE-3's midlayer will
             # apply its fc projection (3*hidden→hidden) before consuming.
-            hidden_stub = (
-                captured_aux_concat
-                .unsqueeze(1)
-                .expand(-1, draft_token_num, -1)
-                .reshape(n_verify_tokens, -1)
-                .contiguous()
+            #
+            # T2.2.S: place the real captured hidden ONLY at position 0
+            # (the bonus position), and zero out positions 1..dtn-1. The
+            # EAGLE draft uses hidden_states[accept_index] — accept_index[0]
+            # is always the bonus, others are accepted-draft slots. Tiling
+            # the same hidden everywhere creates a self-reinforcing loop
+            # (draft proposes same token → accepted → fed back → repeats),
+            # which produced v87's repetition artifact. By zeroing
+            # non-bonus slots, only the bonus position carries the real
+            # signal; accepted-draft positions go to zero hidden, which
+            # is a no-info signal rather than a same-signal echo.
+            hidden_stub = _torch.zeros(
+                (n_verify_tokens, 3 * self.config.hidden_size),
+                dtype=_torch.bfloat16,
             )
+            # Position 0 of each batch gets the real captured aux concat.
+            for b in range(bs):
+                hidden_stub[b * draft_token_num] = captured_aux_concat[b]
             if not getattr(self, "_logged_aux_concat", False):
                 logger.info(
-                    f"[TT-SGLANG] EAGLE verify using AUX CONCAT: "
-                    f"shape={tuple(captured_aux_concat.shape)} (3 layers)"
+                    f"[TT-SGLANG] EAGLE verify using AUX CONCAT at pos 0 only: "
+                    f"shape={tuple(captured_aux_concat.shape)} (3 layers, "
+                    f"non-bonus positions zeroed to break repetition loop)"
                 )
                 self._logged_aux_concat = True
         elif captured_hidden_host is not None:
