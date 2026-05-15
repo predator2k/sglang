@@ -1,0 +1,60 @@
+{
+  "iteration": "v114 — TTFT / TPOT measurements",
+  "summary": "Captured per-request TTFT and TPOT (excl. TTFT) via streaming /generate. TTFT ~80ms across all probes (Qwen3-8B prefill on short prompts). TPOT 104-135 ms/tok (= 7.4-9.6 tok/s), dominated by per-position multi-decode (dtn=2 → 2 decode_forward per verify cycle); inversely tracks spec_accept_rate.",
+  "config": "--speculative-num-steps 1 --speculative-num-draft-tokens 2 (v94 optimal); EAGLE-3 target Qwen3-8B on 2x P150a + Tengyunw/qwen3_8b_eagle3 draft on CPU torch",
+  "probe_method": "Streaming /generate with temperature=0.0; TTFT = wall-clock from request send to first SSE chunk; TPOT = (e2e_latency - TTFT) / (completion_tokens - 1)",
+  "results": [
+    {
+      "prompt": "The capital of Japan is",
+      "prompt_tokens": 5,
+      "completion_tokens": 16,
+      "ttft_s": 0.081,
+      "e2e_s_client": 1.639,
+      "e2e_s_server": 1.634,
+      "tpot_s_excl_ttft": 0.104,
+      "client_tok_per_s_e2e": 9.76,
+      "tpot_inv_tok_per_s": 9.63,
+      "spec_accept_rate": 0.5,
+      "spec_accept_length": 1.6
+    },
+    {
+      "prompt": "World War 2 ended in",
+      "prompt_tokens": 6,
+      "completion_tokens": 16,
+      "ttft_s": 0.081,
+      "e2e_s_client": 2.113,
+      "e2e_s_server": 2.112,
+      "tpot_s_excl_ttft": 0.135,
+      "client_tok_per_s_e2e": 7.57,
+      "tpot_inv_tok_per_s": 7.38,
+      "spec_accept_rate": 0.154,
+      "spec_accept_length": 1.231
+    },
+    {
+      "prompt": "Tell me about Python programming language",
+      "prompt_tokens": 6,
+      "completion_tokens": 32,
+      "ttft_s": 0.08,
+      "e2e_s_client": 4.227,
+      "e2e_s_server": 4.226,
+      "tpot_s_excl_ttft": 0.134,
+      "client_tok_per_s_e2e": 7.57,
+      "tpot_inv_tok_per_s": 7.47,
+      "spec_accept_rate": 0.192,
+      "spec_accept_length": 1.231
+    }
+  ],
+  "prometheus_aggregate": {
+    "sglang_gen_throughput": 0.153,
+    "sglang_spec_accept_rate": 0.2,
+    "sglang_spec_accept_length": 1.2,
+    "note": "Aggregate spec_accept_rate=0.2 matches v94 numbers; gen_throughput is requests/sec across the 3 probes (~1 req per 6.5 s on average given run intermixed with warmup)."
+  },
+  "interpretation": {
+    "ttft_floor_ms": 80,
+    "ttft_floor_breakdown": "Prefill for 5-6 prompt tokens at Qwen3-8B BF16 on 2x P150a (paged path, trace-mode prefill). Stable across probes because prompt is short and prefill bucket is the small one.",
+    "tpot_range_ms": "104-135",
+    "tpot_breakdown": "Each verify cycle = 2 decode_forward calls (dtn=2, multi-decode). Per-cycle wall-time ~150-170ms. Tokens per cycle = spec_accept_length (1.2-1.6). TPOT = per_cycle_ms / accept_length.",
+    "speedup_path": "Trace-mode aux-hidden persistence (analog of process_hidden_states_after_prefill_trace) could collapse the 2x decode_forward back to 1, halving TPOT toward ~50-65 ms/tok (15-20 tok/s). Out of session scope."
+  }
+}
