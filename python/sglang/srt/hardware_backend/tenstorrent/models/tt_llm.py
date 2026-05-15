@@ -1319,6 +1319,12 @@ def _create_tt_model_class(
             }
             tt_backend_class = backend_classes[backend_class_name]
 
+            # Tenstorrent-p1: DRAM prefetcher (decode-stage weight prefetch)
+            # opt-in via SGLANG_TT_USE_PREFETCHER. Forwarded to tt-metal's
+            # initialize_sglang_text_transformer; only takes effect when the
+            # model is in `VERIFIED_MODEL_CONFIGS` and dims fit the
+            # is_prefetcher_supported() L1/CB checks. Default off.
+            _use_prefetcher = os.environ.get("SGLANG_TT_USE_PREFETCHER", "0") == "1"
             self.tt_model = tt_backend_class.initialize_sglang_model(
                 config,
                 self.mesh_device,
@@ -1326,6 +1332,7 @@ def _create_tt_model_class(
                 self.max_seq_len,
                 tt_data_parallel=self.tt_data_parallel,
                 optimizations=self.optimizations,
+                use_prefetcher=_use_prefetcher,
             )
             logger.info(f"{backend_class_name}.initialize_sglang_model executed")
             self.allocate_on_device()

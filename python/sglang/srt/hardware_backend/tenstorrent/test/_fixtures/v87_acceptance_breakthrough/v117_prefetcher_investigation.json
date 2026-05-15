@@ -1,0 +1,41 @@
+{
+  "iteration": "v117 — DRAM Prefetcher investigation for Qwen3 on Blackhole",
+  "summary": "Investigated enabling tt-metal's DRAM Prefetcher (decode-stage weight prefetch — hides weight load latency behind compute) for Qwen3 models in our SGLang plugin path. Plumbing landed both sides (sglang env-gate + tt-metal fork additions), but two hard blockers prevent it from actually running for Qwen3-1.7B on P300_X2 today.",
+  "motivation": "Tenstorrent's PERF.md shows Llama-3.1-8B on single P150 at 33.6 tok/s. Llama gets Prefetcher in tt-metal demos; Qwen3 doesn't (demo gate: 'Llama' in hf_dir AND '8B' in hf_dir). Qwen3-1.7B currently at 45.9 tok/s, ~8% below the 50+ goal — prefetcher would likely close that gap.",
+  "changes_landed_gated_off": {
+    "tt_metal_fork": {
+      "commit": "ba0d960ec7",
+      "files": [
+        "models/tt_transformers/tt/prefetcher.py — VERIFIED_MODEL_CONFIGS adds Qwen3-1.7B (dim=2048 hidden=6144) and Qwen3-8B (dim=4096 hidden=12288). Both are dimensionally smaller than already-verified Llama equivalents.",
+        "models/tt_transformers/tt/generator_sglang.py — initialize_sglang_text_transformer + 4x initialize_sglang_model classmethods now accept use_prefetcher=False default; when True and is_prefetcher_supported passes, constructs Prefetcher per submesh and threads it to ModelArgs + Transformer."
+      ]
+    },
+    "sglang_plugin": {
+      "files": [
+        "python/sglang/srt/hardware_backend/tenstorrent/models/tt_llm.py — initialize_sglang_model call reads SGLANG_TT_USE_PREFETCHER env (default 0); when 1, passes use_prefetcher=True through."
+      ]
+    }
+  },
+  "blocker_1_MUX_clamp": {
+    "trigger": "Launch with SGLANG_TT_USE_PREFETCHER=1 only.",
+    "error": "TT_FATAL Tensix cores {[0-0], [0-3], [0-7], [0-9], [7-1], [7-4], [7-6], [7-9]} specified in sub device must be within device grid [0-0 - 11-7]",
+    "root_cause": "prefetcher_config.yaml's Blackhole sender_rows include 9; our P3a.2 MUX dispatch clamp limits worker grid to rows 0-7. Cores at row 9 are no longer worker cores under MUX.",
+    "options": [
+      "Disable MUX clamp for the no-spec path (breaks Qwen3-8B / 2-chip kernel placement; we relied on this for EAGLE-3 boot).",
+      "Provide a custom sender/receiver mapping override to ttnn that stays within rows 0-7. The Prefetcher constructor accepts receiver_mapping_override.",
+      "Wait for tt-metal to fold MUX-aware Blackhole grids into prefetcher_config.yaml."
+    ]
+  },
+  "blocker_2_L1_buffer_clash": {
+    "trigger": "Launch with SGLANG_TT_USE_PREFETCHER=1 AND SGLANG_TT_DISPATCH=legacy (no MUX clamp, full grid available).",
+    "error": "TT_THROW: Statically allocated circular buffers in program 66 clash with L1 buffers on core range [0-0 - 0-0]. L1 buffer allocated at 710400 and static circular buffer region ends at 733696",
+    "root_cause": "Prefetcher reserves L1 CB memory on core (0,0); when the model's norm op tries to allocate its own L1 region on the same core, it overlaps the prefetcher's static CB region.",
+    "options": [
+      "Use tt-metal's sub_device API explicitly to partition L1 between prefetcher and model ops.",
+      "Move prefetcher senders to cores not used by norm (sender rows that aren't (0,0)).",
+      "Coordinate via sub_device_id which the model already passes (model.py line 771: subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None) — but the static CB allocation appears to skip the sub_device awareness."
+    ]
+  },
+  "verdict": "Path forward requires either a custom prefetcher core mapping that fits the MUX-clamped 12x8 grid AND avoids L1 clashes with norm ops, or upstream tt-metal coordination of CB allocation through sub_device. Both are multi-hour focused engineering tasks against tt-metal kernel/L1 internals. Not feasible in a 15-min cron iteration.",
+  "default_unchanged": "SGLANG_TT_USE_PREFETCHER defaults to 0; no behavior change for production launches. The plumbing is left in place so the follow-up work can land without re-doing this scaffolding."
+}
