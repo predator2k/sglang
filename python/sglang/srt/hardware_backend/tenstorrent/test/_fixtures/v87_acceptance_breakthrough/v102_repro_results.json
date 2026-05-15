@@ -1,0 +1,82 @@
+[
+  {
+    "category": "factual",
+    "prompt": "The capital of Japan is",
+    "output": " Tokyo, and the capital capital of of the Tokyo capital of of the capital capital of the the capital of of the capital of of the capital capital of the the",
+    "tok_per_sec": 9.325225377410607,
+    "accept_rate": 0.47619047619047616,
+    "accept_length": 1.5238095238095237,
+    "verify_ct": 21,
+    "completion_tokens": 32
+  },
+  {
+    "category": "factual",
+    "prompt": "The largest planet in our solar system is",
+    "output": " __________. The The largest planet in our solar system is __________. The The largest planet planet in our our solar solar solar system system is is __ __",
+    "tok_per_sec": 8.395213637586718,
+    "accept_rate": 0.2916666666666667,
+    "accept_length": 1.3333333333333333,
+    "verify_ct": 24,
+    "completion_tokens": 32
+  },
+  {
+    "category": "math",
+    "prompt": "1 + 1 = ",
+    "output": "2, 22 + 11 = 33,  ",
+    "tok_per_sec": 8.936229502977989,
+    "accept_rate": 0.45454545454545453,
+    "accept_length": 1.4545454545454546,
+    "verify_ct": 11,
+    "completion_tokens": 16
+  },
+  {
+    "category": "recipe",
+    "prompt": "To make scrambled eggs, you need",
+    "output": " 2 eggs, 11 tablespoon of milk, and 11/2 teaspoon of salt salt.  If1.  How many eggs would you need to to make  110 batches of scrambled scrambled eggs eggs?",
+    "tok_per_sec": 7.737886117016292,
+    "accept_rate": 0.23684210526315788,
+    "accept_length": 1.263157894736842,
+    "verify_ct": 38,
+    "completion_tokens": 48
+  },
+  {
+    "category": "history",
+    "prompt": "World War 2 ended in",
+    "output": " 1945.. The United States and the Soviet Soviet Union were the two super superpowerspowers. The The United States States was a capitalist country",
+    "tok_per_sec": 7.700418265202323,
+    "accept_rate": 0.24,
+    "accept_length": 1.28,
+    "verify_ct": 25,
+    "completion_tokens": 32
+  },
+  {
+    "category": "tech",
+    "prompt": "Python is a programming language that",
+    "output": " is used for a wide range of applications applications, from web development to data analysis science. It is known known for its simple readability and and simplicity simplicity, which which makes it it a a great choice for beginners beginners. Python Python is also",
+    "tok_per_sec": 8.255521512977605,
+    "accept_rate": 0.34285714285714286,
+    "accept_length": 1.3714285714285714,
+    "verify_ct": 35,
+    "completion_tokens": 48
+  },
+  {
+    "category": "code",
+    "prompt": "def fibonacci(n):\n    if n <",
+    "output": " 0:\n        raise ValueError ValueError(\"Negative numbers are not allowed allowed\")\n\")\n    elif n == == 00:\n        return return 00\n",
+    "tok_per_sec": 8.183570768128636,
+    "accept_rate": 0.2916666666666667,
+    "accept_length": 1.3333333333333333,
+    "verify_ct": 24,
+    "completion_tokens": 32
+  },
+  {
+    "category": "story",
+    "prompt": "Once upon a time, there lived a clever fox who",
+    "output": " loved to play tricks on others. One day, he sawared that there was a big big, round, red apple in the center center of the a circular orchard. He He decided to go go and get it. But But there",
+    "tok_per_sec": 7.342067190316744,
+    "accept_rate": 0.175,
+    "accept_length": 1.2,
+    "verify_ct": 40,
+    "completion_tokens": 48
+  }
+]
