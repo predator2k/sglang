@@ -51,18 +51,27 @@ Open questions to resolve before implementing:
 
 Estimated win: TPOT ~104ms → ~55–70ms (15–20 tok/s).
 
-### B. Deferred batched aux read with ttnn.clone (MODERATE IMPACT)
+### B. Deferred batched aux read with ttnn.clone (MODERATE IMPACT) — **DONE in v114b**
 
 Current wrapper reads each layer-output to host inline, blocking the
 next layer. Replace inline `to_torch` with `ttnn.clone(out)` (device-to-
 device, fast), and read all 3 cloned tensors at the end of
 `decode_forward`. Eliminates the inline serialization.
 
-Risk: the cloned device tensors must outlive `decode_forward`. ttnn's
-ref-counted allocator should preserve them as long as Python holds a
-reference, but worth probing.
+**Status: shipped as commit `5b1018226` (default on; opt out via
+SGLANG_TT_EAGLE_DEFERRED_AUX=0).** Measured against the same 3-prompt
+probe (v114b_deferred_aux.json):
 
-Estimated win: TPOT ~104ms → ~85–95ms (10.5–11.7 tok/s).
+| Prompt | Baseline tok/s | Path B tok/s | Δ |
+|---|---|---|---|
+| Japan | 9.76 | 10.03 | +2.8% |
+| WW2 | 7.57 | 7.77 | +2.6% |
+| Python | 7.57 | 7.82 | +3.3% |
+
+accept_rate preserved EXACTLY across all 3 probes (0.5 / 0.154 / 0.192).
+Smaller win than originally estimated — the inline `to_torch` host-sync
+turned out to be ~3-5 ms per layer, not the 5-10 ms initially assumed.
+The reorganization is still correctness-stable, so it's pure free win.
 
 ### C. Trace-compatible aux capture in tt-metal trace machinery (LARGE)
 
