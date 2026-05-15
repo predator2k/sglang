@@ -374,13 +374,6 @@ class TTModels(nn.Module):
                     _w._parent = parent
                     _w._orig = orig
                 def __call__(_w, x, *args, **kwargs):
-                    if not getattr(_w._parent, "_first_norm_call_logged", False):
-                        logger.info(
-                            f"[TT-SGLANG] pre-norm wrapper FIRST call: "
-                            f"args_len={len(args)} kwargs_keys={list(kwargs.keys())} "
-                            f"mode={kwargs.get('mode', '<missing>')}"
-                        )
-                        _w._parent._first_norm_call_logged = True
                     try:
                         import ttnn as _ttnn_local
                         try:
@@ -389,6 +382,13 @@ class TTModels(nn.Module):
                         except Exception:
                             host = _ttnn_local.to_torch(x)
                         _w._parent._captured_hidden_host = host
+                        if not getattr(_w._parent, "_first_norm_call_logged", False):
+                            logger.info(
+                                f"[TT-SGLANG] pre-norm wrapper FIRST call: "
+                                f"shape={tuple(host.shape)} dtype={host.dtype} "
+                                f"mode={kwargs.get('mode', '<missing>')}"
+                            )
+                            _w._parent._first_norm_call_logged = True
                     except Exception as _exc:
                         if not getattr(_w._parent, "_norm_capture_warned", False):
                             logger.warning(f"[TT-SGLANG] pre-norm capture failed: {_exc!r}")
@@ -411,26 +411,34 @@ class TTModels(nn.Module):
             self._lm_head_hidden_capture_installed = False
 
     def _read_captured_hidden_host(self, bs):
-        """Return the captured pre-lm-head hidden state as a host torch
-        tensor of shape [bs, hidden_size], or None if unavailable.
-
-        The wrapper reads the ttnn tensor to host inside its __call__ so the
-        captured value is already a torch tensor by the time we read it
-        here. Shape variants seen so far: [bs, 1, hidden], [1, 1, bs, hidden],
-        [num_devices, 1, 1, bs, hidden] (concatenated across mesh).
-        """
+        """Return the captured pre-norm hidden state as a host torch tensor
+        of shape [bs, hidden_size], or None if unavailable."""
         import torch as _torch
         host = getattr(self, "_captured_hidden_host", None)
         if host is None:
             return None
         try:
+            orig_shape = tuple(host.shape)
             # Squeeze all-singleton leading dims.
             while host.dim() > 2 and host.shape[0] == 1:
                 host = host.squeeze(0)
             if host.dim() == 3 and host.shape[1] == 1:
                 host = host.squeeze(1)
             if host.dim() >= 2 and host.shape[-1] == self.config.hidden_size:
+                if not getattr(self, "_logged_read_path", False):
+                    logger.info(
+                        f"[TT-SGLANG] read captured hidden: orig={orig_shape} → "
+                        f"final={tuple(host.shape)} → slice[:bs={bs}]"
+                    )
+                    self._logged_read_path = True
                 return host[:bs].to(_torch.bfloat16).contiguous()
+            if not getattr(self, "_logged_read_path", False):
+                logger.warning(
+                    f"[TT-SGLANG] captured hidden shape mismatch: "
+                    f"orig={orig_shape} reduced={tuple(host.shape)} "
+                    f"expected last dim={self.config.hidden_size}"
+                )
+                self._logged_read_path = True
             return None
         except Exception as exc:
             logger.warning(f"[TT-SGLANG] reshape captured hidden failed: {exc!r}")
