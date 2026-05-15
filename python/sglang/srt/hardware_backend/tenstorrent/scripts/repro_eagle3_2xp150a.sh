@@ -17,7 +17,7 @@
 #    Tokyo. But wait..."
 #   Correctly answers Tokyo with reasoning chain.
 
-set -euo pipefail
+set -uo pipefail  # NOT -e: pkill/tt-smi return nonzero on harmless conditions
 
 MODE=${1:-generate}
 TREE_MASK_ENV=""
