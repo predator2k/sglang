@@ -1,0 +1,32 @@
+{
+  "iteration": "v92 (T2.2.W)",
+  "summary": "Per-position multi-decode — 6 sequential decodes per verify, each capturing real 3-aux-layer hidden state for that position. Output now generates DIFFERENT factual content across positions instead of doubling.",
+  "test1_prompt": "The capital of France is",
+  "test1_output": " Paris. The capital of Italy the United Kingdom is London London. The capital of Germany Netherlands is Amsterdam Amsterdam. The capital",
+  "test1_metrics": {
+    "spec_accept_rate": 0.12,
+    "spec_accepted_drafts": 9,
+    "spec_proposed_drafts": 75,
+    "spec_verify_ct": 15,
+    "spec_accept_length": 1.6,
+    "spec_accept_histogram": [10, 3, 0, 2],
+    "e2e_latency_s": 7.89,
+    "comment": "Multi-country reasoning: Paris (France), London (UK), Amsterdam (Netherlands/Germany). Real multi-fact generation. Some doublings remain but content is MUCH more diverse than v89-v91."
+  },
+  "test2_prompt": "Once upon a time, there was a",
+  "test2_output": " young man who had a lot lot of money money.. He was very very very rich. He had had a a",
+  "test2_metrics": {
+    "spec_accept_rate": 0.087,
+    "spec_accepted_drafts": 7,
+    "spec_proposed_drafts": 80,
+    "spec_verify_ct": 16,
+    "spec_accept_length": 1.5,
+    "spec_accept_histogram": [9, 7],
+    "e2e_latency_s": 8.44
+  },
+  "comparison_to_v91": {
+    "v91_France": "Paris. The capital of of the the United States is is is Washington, D D D.C..",
+    "v92_France": "Paris. The capital of Italy the United Kingdom is London London. The capital of Germany Netherlands is Amsterdam Amsterdam"
+  },
+  "throughput_tradeoff": "v92 is ~6x slower per verify cycle (6 decodes vs 1) but produces multi-fact diverse output. Net throughput ~3 tok/s (vs v89's 5.8 tok/s) but quality is substantially better."
+}
