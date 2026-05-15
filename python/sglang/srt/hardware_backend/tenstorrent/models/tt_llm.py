@@ -376,9 +376,17 @@ class TTModels(nn.Module):
                 def __call__(_w, x, *args, **kwargs):
                     try:
                         import ttnn as _ttnn_local
+                        import torch as _torch_local
+                        # The hidden state is TP-sharded across num_devices
+                        # devices along the hidden dim. Read each device's
+                        # shard, concat to recover full [..., hidden].
                         try:
-                            shards = _ttnn_local.get_device_tensors(x)
-                            host = _ttnn_local.to_torch(shards[0])
+                            shards = list(_ttnn_local.get_device_tensors(x))
+                            per_dev = [_ttnn_local.to_torch(s) for s in shards]
+                            if len(per_dev) > 1:
+                                host = _torch_local.cat(per_dev, dim=-1)
+                            else:
+                                host = per_dev[0]
                         except Exception:
                             host = _ttnn_local.to_torch(x)
                         _w._parent._captured_hidden_host = host
