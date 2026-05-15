@@ -1,0 +1,32 @@
+{
+  "iteration": "v115 — no-spec baseline vs EAGLE-3 spec, head-to-head measurement",
+  "summary": "EAGLE-3 spec is currently 3x SLOWER than the no-spec baseline on the same hardware/config. The per-verify-cycle cost (2 decode_forward at enable_trace=False) exceeds the speedup from accepted drafts. The current implementation is architecturally net-negative; only path A (single prefill_forward per verify cycle) can flip the sign.",
+  "config_common": "Qwen3-8B target on 2x P150a (paged path, SGLang/tt_transformers_paged backend, --max-running-requests 1 --context-length 2048 --mem-fraction-static 0.5 --attention-backend torch_native --disable-cuda-graph)",
+  "no_spec_baseline": {
+    "config_delta": "no --speculative-* flags; no draft model",
+    "ttft_ms": "47-51",
+    "tpot_ms": "36",
+    "tok_per_s": 27.8,
+    "evidence": [
+      {"prompt": "The capital of Japan is",                     "tok_per_s": 27.19},
+      {"prompt": "World War 2 ended in",                        "tok_per_s": 27.34},
+      {"prompt": "Tell me about Python programming language",   "tok_per_s": 27.57}
+    ]
+  },
+  "eagle3_spec_current": {
+    "config_delta": "--speculative-algorithm EAGLE3 --speculative-eagle-topk 1 --speculative-num-steps 1 --speculative-num-draft-tokens 2; CPU draft Tengyunw/qwen3_8b_eagle3; path B (deferred aux read) default-on",
+    "ttft_ms": "76-83",
+    "tpot_ms": "101-132",
+    "tok_per_s_avg_3prompt": 9.21,
+    "tok_per_s_avg_8prompt": 7.99,
+    "evidence_ref": "v114b_deferred_aux.json + v114c_suite_pathB.json"
+  },
+  "delta": {
+    "tpot_ratio_spec_over_baseline": "~3x slower",
+    "tok_per_s_ratio": "~0.30x (8 tok/s vs 27.8 tok/s)",
+    "interpretation": "EAGLE-3 is supposed to ACCELERATE decoding by accepting multiple tokens per target-model forward call. Our implementation has 2 forward calls per verify cycle (multi-decode for per-position aux capture) at enable_trace=False (no trace replay because the Python aux-capture wrapper is trace-incompatible). Per-cycle cost ~150ms vs baseline ~36ms/decode. Even with accept_length=1.5, TPOT = 150/1.5 = 100ms = 10 tok/s, worse than baseline 36ms = 27.8 tok/s."
+  },
+  "to_beat_baseline_we_need": "1 decode per verify cycle (matching baseline cost) + accept_length >= 1.0. This is exactly path A from v114_tpot_analysis: single prefill_forward producing all dn positions at once. Estimated 15-25 tok/s depending on dn and acceptance, finally net-positive vs baseline.",
+  "why_path_A_not_yet_attempted": "tt_transformers' prefill_forward_text returns last-token logits only (line 501 of generator.py: output_tensor shape [bs, 1, vocab]). Per-position logits for verify require either (a) a fork modification to add return_all_logits flag, or (b) host-side lm_head matmul (~125-250ms on CPU per cycle for Qwen3-8B = NET LOSS). Path (a) is multi-file tt-metal Python work that needs isolated testing against the working v111-v113 state.",
+  "what_50_tok_s_means": "Tenstorrent's own serving demos hitting 50+ tok/s likely use raw tt-metal generator directly (no SGLang scheduler), smaller models (1.7B vs 8B), or more chips. On 2x P150a + Qwen3-8B through SGLang plumbing the raw baseline measures 27.8 tok/s. The 50 tok/s ceiling is real but partly attributable to SGLang vs raw-tt-metal overhead, not just spec implementation."
+}
