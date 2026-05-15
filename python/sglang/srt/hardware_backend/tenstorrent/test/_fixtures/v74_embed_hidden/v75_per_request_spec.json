@@ -1,0 +1,16 @@
+{
+  "rid": "adcbba2880544be79d18da1f6d6d04c8",
+  "prompt": "Say hi.",
+  "output": " I'm a new user. Welcome to the community! How can I help you",
+  "spec_accept_rate": 0.0,
+  "spec_accept_length": 1.0666666666666667,
+  "spec_accepted_drafts": 0,
+  "spec_proposed_drafts": 75,
+  "spec_verify_ct": 15,
+  "spec_accept_histogram": [15],
+  "completion_tokens": 16,
+  "e2e_latency_s": 2.546694723998371,
+  "endpoint": "/generate",
+  "log_metrics": true,
+  "notes": "EAGLE-3 verify pipeline IS running. Draft proposes 75 tokens across 15 verify cycles, 0 accepted. Confirms hidden_states stub is the bottleneck, not the pipeline. accept_length=1.067 because the histogram entry for 0-accept cycles bumps the average slightly above 1.0 bonus-only mean."
+}
