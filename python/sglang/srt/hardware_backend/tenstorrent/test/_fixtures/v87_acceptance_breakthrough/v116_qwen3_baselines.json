@@ -1,0 +1,46 @@
+{
+  "iteration": "v116 — Qwen3 baseline matrix (no spec)",
+  "summary": "Mapped Qwen3-8B and Qwen3-1.7B baselines on 2x P150a through SGLang/tt_transformers_paged, plus a single-chip (1,1) probe to test if TP=2 cross-chip comm is the bottleneck. Qwen3-1.7B baseline = 45.9 tok/s, much closer to the 50+ tok/s target; Qwen3-8B is hard-bounded by tt-metal's own 33.6 tok/s ceiling on Llama-3.1-8B P150 single-chip ref, with SGLang overhead bringing us to 27 tok/s. Single-chip layout for Qwen3-8B = same 27 tok/s; TP=2 cross-chip overhead is NOT the bottleneck on this size model.",
+  "test_setup": "no spec; --max-running-requests 1 --context-length 2048 --mem-fraction-static 0.5 --attention-backend torch_native --disable-cuda-graph --enable-metrics; streaming /generate probe (ttft_probe.py)",
+  "results": [
+    {
+      "config": "Qwen3-8B, 2x P150a (default mesh)",
+      "ttft_ms_range": "47-51",
+      "tpot_ms": 36,
+      "tok_per_s_avg": 27.4,
+      "note": "Reference baseline. Matches v115."
+    },
+    {
+      "config": "Qwen3-8B, 1x P150a (DEVICE_MESH_SHAPE=1,1 SGLANG_TT_DISPATCH=legacy)",
+      "ttft_ms_range": "55-59",
+      "tpot_ms": 36,
+      "tok_per_s_avg": 26.8,
+      "note": "TP=2 cross-chip overhead is NOT the bottleneck. Single chip same speed, slightly worse TTFT (more cold-start)."
+    },
+    {
+      "config": "Qwen3-1.7B, 2x P150a (default mesh)",
+      "ttft_ms_range": "23-26",
+      "tpot_ms": 22,
+      "tok_per_s_avg": 45.75,
+      "note": "1.6x TPOT speedup vs 8B; 2x TTFT improvement. Within striking distance of the 50+ tok/s target."
+    }
+  ],
+  "tt_metal_reference_perf": {
+    "source": "/home/mhnie/tt-metal-sglang/models/tt_transformers/PERF.md",
+    "Llama-3.1-8B_P150_single": "33.6 t/s/u, 76ms TTFT",
+    "Llama-3.1-8B_P100_single": "29.5 t/s/u, 84ms TTFT",
+    "Llama-3.2-3B_N300_dual": "68.0 t/s/u, 39ms TTFT",
+    "Llama-3.2-1B_N150_single": "87.8 t/s/u, 26ms TTFT",
+    "interpretation": "tt-metal PERF.md does not list Qwen3-1.7B specifically. Llama-3.2-3B on dual-Wormhole N300 (68 t/s) is the closest comparable; our 45.9 t/s for Qwen3-1.7B on dual-Blackhole P300 is somewhat lower, partly because P150's per-chip throughput on similar models (Llama-3.1-8B P150=33.6) is lower than the analogous Wormhole + TP setup."
+  },
+  "verdict_goal_1": {
+    "goal": "Beat tt's offering with no-spec",
+    "qwen3_8b_status": "27.4 tok/s; SGLang ceiling near tt-metal ref 33.6 minus ~6ms SGLang overhead per token. Will require SGLang-side per-token cost reduction OR tt-metal kernel speedup to beat tt-metal's own ref.",
+    "qwen3_1p7b_status": "45.9 tok/s; close to 50 tok/s. Achievable via per-token SGLang overhead reduction OR larger context buckets / different mem-fraction."
+  },
+  "next_steps": [
+    "For goal 1 with Qwen3-1.7B: profile SGLang per-token overhead, try --max-running-requests > 1 to amortize scheduling cost, or test --enable-prefix-cache for repeated prefills.",
+    "For goal 2 (spec > no-spec): EAGLE-3 path A (single prefill_forward) needed; current spec is 8 tok/s vs 27.4 baseline for 8B. Qwen3-1.7B has no published EAGLE-3 draft on HF (Tengyunw/qwen3_8b_eagle3 is 8B-specific).",
+    "Try EnablePersistentKernelCache + warm cache (memory tenstorrent-perf-knobs documents 40x cold-start win; may also help post-warmup decode)."
+  ]
+}
