@@ -1,0 +1,18 @@
+{
+  "rid": "55f3a6e8fac849fb9f0a4a1f0fe26907",
+  "prompt": "Hi",
+  "output": ", I'm trying to find the derivative of of of of the the function function",
+  "spec_accept_rate": 0.1,
+  "spec_accept_length": 1.6,
+  "spec_accepted_drafts": 5,
+  "spec_proposed_drafts": 50,
+  "spec_verify_ct": 10,
+  "spec_accept_histogram": [7, 2, 0, 1],
+  "completion_tokens": 16,
+  "e2e_latency_s": 2.105,
+  "config": "EAGLE3 topk=1 num_steps=5 num_draft_tokens=6",
+  "draft_path": "Tengyunw/qwen3_8b_eagle3",
+  "target_path": "/models/Qwen3-8B",
+  "hardware": "2x Tenstorrent Blackhole p150a (P300_X2 MUX)",
+  "notes": "First non-zero acceptance on 2x P150a. Captured 3 aux hidden states from target layers [2, 18, 33] via Python wrappers on tt_transformers decoder layers, concatenated as [bs, 3*hidden=12288], fed to EAGLE-3 draft. Output is repetitive due to per-position hidden tiling (we capture only the bonus position's hidden state, then tile across draft_token_num positions); fixing this requires capturing the FULL extend-batch hidden state across all positions in the verify forward."
+}
