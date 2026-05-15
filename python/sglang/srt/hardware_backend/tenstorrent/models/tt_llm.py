@@ -352,6 +352,86 @@ class TTModels(nn.Module):
         else:
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
 
+    def _install_aux_layer_capture_once(self):
+        """Wrap target decoder layers [2, mid, N-3] to capture their OUTPUT
+        ttnn tensors (read to host inside each wrapper's __call__) so we can
+        concatenate the three aux hidden states as [N, 3*hidden] — what
+        EAGLE-3 was actually trained on. set_eagle3_layers_to_capture log
+        already confirms these are the layer_ids the EAGLE-3 draft expects.
+        """
+        if getattr(self, "_aux_layer_capture_installed", False):
+            return
+        try:
+            inner = self.tt_model.model[0]
+            num_layers = len(inner.layers)
+            # Match SGLang's default for EAGLE-3:
+            #   layer_ids = [2, num_layers // 2, num_layers - 3]
+            self._aux_layer_ids = [2, num_layers // 2, num_layers - 3]
+            self._captured_aux_layer_host = {i: None for i in self._aux_layer_ids}
+
+            def _make_wrapper(parent, orig, layer_id):
+                class _LayerCaptureWrapper:
+                    def __call__(_w, *args, **kwargs):
+                        out = orig(*args, **kwargs)
+                        try:
+                            import ttnn as _ttnn_local
+                            import torch as _torch_local
+                            shards = list(_ttnn_local.get_device_tensors(out))
+                            per_dev = [_ttnn_local.to_torch(s) for s in shards]
+                            host = _torch_local.cat(per_dev, dim=-1) if len(per_dev) > 1 else per_dev[0]
+                            parent._captured_aux_layer_host[layer_id] = host
+                            if not getattr(parent, f"_logged_layer_{layer_id}", False):
+                                logger.info(
+                                    f"[TT-SGLANG] aux layer {layer_id} captured: "
+                                    f"shape={tuple(host.shape)} dtype={host.dtype}"
+                                )
+                                setattr(parent, f"_logged_layer_{layer_id}", True)
+                        except Exception as _exc:
+                            if not getattr(parent, f"_warned_layer_{layer_id}", False):
+                                logger.warning(
+                                    f"[TT-SGLANG] aux layer {layer_id} capture failed: {_exc!r}"
+                                )
+                                setattr(parent, f"_warned_layer_{layer_id}", True)
+                        return out
+                    def __getattr__(_w, name):
+                        return getattr(orig, name)
+                return _LayerCaptureWrapper()
+
+            inner.layers = [
+                _make_wrapper(self, layer, i) if i in self._aux_layer_ids else layer
+                for i, layer in enumerate(inner.layers)
+            ]
+            self._aux_layer_capture_installed = True
+            logger.info(
+                f"[TT-SGLANG] Installed aux-layer capture on layers={self._aux_layer_ids} "
+                f"(of {num_layers} total)"
+            )
+        except Exception as exc:
+            logger.warning(f"[TT-SGLANG] aux-layer capture install failed: {exc!r}")
+            self._aux_layer_capture_installed = False
+
+    def _read_captured_aux_concat_host(self, bs):
+        """Concatenate the 3 captured aux-layer hidden states as [bs, 3*hidden]."""
+        import torch as _torch
+        layer_ids = getattr(self, "_aux_layer_ids", None)
+        if not layer_ids:
+            return None
+        captured = getattr(self, "_captured_aux_layer_host", {})
+        per_layer = []
+        for lid in layer_ids:
+            host = captured.get(lid)
+            if host is None:
+                return None
+            while host.dim() > 2 and host.shape[0] == 1:
+                host = host.squeeze(0)
+            if host.dim() == 3 and host.shape[1] == 1:
+                host = host.squeeze(1)
+            if host.dim() < 2 or host.shape[-1] != self.config.hidden_size:
+                return None
+            per_layer.append(host[:bs].to(_torch.bfloat16))
+        out = _torch.cat(per_layer, dim=-1).contiguous()  # [bs, 3*hidden]
+        return out
+
     def _install_lm_head_hidden_capture_once(self):
         """Wrap the target's final-norm to save its INPUT (pre-norm last-layer
         hidden state) before the norm op consumes it. EAGLE-3's midlayer
@@ -539,14 +619,12 @@ class TTModels(nn.Module):
         padded_tokens, padded_positions, padded_pt = self._pad_decode_batch(
             prev_emit, positions_step, page_table
         )
-        # P3a.2 T2.2.Q: install a lazy lm_head wrapper that captures the
-        # pre-lm-head (= post-norm last-layer hidden state) ttnn tensor on
-        # the first decode call. The wrapper is Python-only (no ttnn op)
-        # so it doesn't change the trace; on subsequent trace replays the
-        # captured tensor's memory address is reused by tt-metal's trace
-        # engine, so reading it via ttnn.to_torch() yields the latest
-        # hidden state. This is the input that EAGLE-3's draft midlayer
-        # was trained on — substituting it should bring accept_rate > 0.
+        # P3a.2 T2.2.R: install aux-layer capture (layers [2, mid, N-3])
+        # — what EAGLE-3 was actually trained on. The single-layer pre-norm
+        # capture (T2.2.Q) didn't achieve accept_rate>0 because the draft
+        # expects 3-aux-layer concatenated input.
+        self._install_aux_layer_capture_once()
+        # Keep the pre-norm capture as fallback in case aux install fails.
         self._install_lm_head_hidden_capture_once()
 
         # P3a.2 T2.2.Q: trace replay deallocates intermediate ttnn tensors,
@@ -566,8 +644,9 @@ class TTModels(nn.Module):
         )
         logits = decode_out[0][:bs].squeeze(1)  # [bs, vocab]
 
-        # Read back the captured post-norm hidden state (may be None on first
-        # call before trace replayed, or if wrapper failed to install).
+        # T2.2.R: prefer the 3-aux-layer concat (matches EAGLE-3 training).
+        # Falls back to single-layer pre-norm capture if aux unavailable.
+        captured_aux_concat = self._read_captured_aux_concat_host(bs)
         captured_hidden_host = self._read_captured_hidden_host(bs)
         # Update per-request prev_emit token cache for the next verify cycle.
         try:
@@ -592,22 +671,29 @@ class TTModels(nn.Module):
         # last-layer hidden states), but degrades gracefully — vs zeros,
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
-        if captured_hidden_host is not None:
-            # Real pre-norm last-layer hidden state per batch [bs, hidden].
-            # Empirically confirmed in v77/v85/v86: spec_accept_rate remains
-            # 0.0 with this signal feed (single, triplicate, or any tile
-            # arrangement). Tengyunw/qwen3_8b_eagle3 was trained with
-            # capture_aux_hidden_states=True on layers [2, 18, 33] of the
-            # Qwen3-8B target — i.e. specific intermediate aux hidden states
-            # concatenated, not the last layer. The TT-device exposes only
-            # the final pre-norm/post-norm hidden state via wrappable Python
-            # callsites; surfacing layers 2/18/33 outputs would require
-            # wrapping each of those tt_transformers decoder layers
-            # individually and orchestrating per-layer host reads — a
-            # multi-hour surgery beyond this iteration's scope. Until then
-            # we feed the last-layer hidden as a single signal; output is
-            # still coherent Qwen3-8B text, just via bonus-only emission.
-            hidden_single = captured_hidden_host[:bs].to(_torch.bfloat16)  # [bs, hidden]
+        if captured_aux_concat is not None:
+            # T2.2.R: real 3-aux-layer concat [bs, 3*hidden] from target
+            # layers [2, mid, N-3]. This is the exact input shape and
+            # semantics EAGLE-3 was trained on. EAGLE-3's midlayer will
+            # apply its fc projection (3*hidden→hidden) before consuming.
+            hidden_stub = (
+                captured_aux_concat
+                .unsqueeze(1)
+                .expand(-1, draft_token_num, -1)
+                .reshape(n_verify_tokens, -1)
+                .contiguous()
+            )
+            if not getattr(self, "_logged_aux_concat", False):
+                logger.info(
+                    f"[TT-SGLANG] EAGLE verify using AUX CONCAT: "
+                    f"shape={tuple(captured_aux_concat.shape)} (3 layers)"
+                )
+                self._logged_aux_concat = True
+        elif captured_hidden_host is not None:
+            # Fallback: single-layer pre-norm hidden_state. Empirically
+            # bound at accept_rate=0 (v77-v86) — kept only so the pipeline
+            # remains coherent if aux wrappers fail to install.
+            hidden_single = captured_hidden_host[:bs].to(_torch.bfloat16)
             hidden_stub = (
                 hidden_single
                 .unsqueeze(1)
