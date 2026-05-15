@@ -1,0 +1,27 @@
+{
+  "iteration": "v90 (0.5x fixed) and v91 (cumulative 0.1x) — character-identical outputs",
+  "finding": "perturbation magnitude doesn't materially affect output because the captured bonus_aux signal (L2 ~1434) dominates any embed-derived perturbation (max ~30). Both produce same generation, confirming the ceiling of perturbation-based approaches.",
+  "v90_test_france": {
+    "output": " Paris. The capital of of the the United States is is is Washington, D D D.C.. The The capital",
+    "accept_rate": 0.12,
+    "accepted_drafts": 9,
+    "verify_ct": 15,
+    "accept_length": 1.6,
+    "histogram": [8, 5, 2]
+  },
+  "v91_test_france": {
+    "output": " Paris. The capital of of the the United States is is is Washington, D D D.C.. The The capital",
+    "accept_rate": 0.12,
+    "accepted_drafts": 9,
+    "verify_ct": 15,
+    "accept_length": 1.6,
+    "histogram": [8, 5, 2],
+    "note": "character-identical to v90"
+  },
+  "v91_test_story": {
+    "output": " young man who had a a lot of of of money. He was very rich rich rich rich rich. He He had",
+    "accept_rate": 0.107,
+    "histogram": [11, 2, 1, 0, 1]
+  },
+  "conclusion": "Doublings are intrinsic to single-bonus-position decode + tile. Quality ceiling reached for this approach. Next: multi-position decode for true per-position hidden states."
+}
