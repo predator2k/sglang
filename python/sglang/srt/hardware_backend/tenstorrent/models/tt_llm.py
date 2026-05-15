@@ -648,22 +648,36 @@ class TTModels(nn.Module):
         # 0=force off, "auto"=use detector, default).
         if not hasattr(self, "_consec_same_count_per_req"):
             self._consec_same_count_per_req = {}
+        if not hasattr(self, "_first_emit_per_req"):
+            self._first_emit_per_req = {}
         _env = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "auto")
         if _env == "1":
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — runtime loop detection (threshold=1)
-            # T2.2.Z+7: threshold=1 (catch FIRST same-token repeat).
-            # Chat-template loop forms at cycle 2 (bonus = Okay both
-            # cycles). Setting threshold=1 engages tree-mask at cycle 3,
-            # potentially early enough to recover. Trade-off: any natural
-            # bigram repetition in /generate (rare for greedy decode but
-            # not impossible) also triggers tree-mask which may hurt.
-            _tree_mask_on = any(
-                self._consec_same_count_per_req.get(int(r), 0) >= 1
-                for r in req_indices
-            )
+        else:  # "auto" — chat-mode detection via first-emitted-token
+            # T2.2.Z+8: detect chat mode by first emit token. Qwen3 chat
+            # template (with thinking) opens with `<think>\n` (tokens
+            # 151648, 198). After the first verify cycle emits this, we
+            # know subsequent cycles will be in chat-thinking mode and
+            # engage tree-mask. For /generate, the first emit is a
+            # regular content token (e.g., "Paris", "Tokyo") and
+            # tree-mask stays off → /generate quality preserved.
+            #
+            # Qwen3 special tokens to watch for in first emit:
+            #   151644 <|im_start|>, 151645 <|im_end|>, 151648 <think>
+            QWEN3_CHAT_FIRST_TOKS = {151644, 151645, 151648}
+            _tree_mask_on = False
+            for r in req_indices:
+                ri = int(r)
+                first_tok = self._first_emit_per_req.get(ri, None)
+                if first_tok is not None and first_tok in QWEN3_CHAT_FIRST_TOKS:
+                    _tree_mask_on = True
+                    break
+                # Also engage on detected repetition (safety net)
+                if self._consec_same_count_per_req.get(ri, 0) >= 1:
+                    _tree_mask_on = True
+                    break
         _attn_layers = []
         if _tree_mask_on:
             try:
@@ -742,9 +756,11 @@ class TTModels(nn.Module):
                 else:
                     self._consec_same_count_per_req[ri] = 0
                 self._prev_emit_per_req[ri] = int(tok)
-                self._verify_count_per_req[ri] = (
-                    self._verify_count_per_req.get(ri, 0) + 1
-                )
+                # Record the FIRST emit per request for chat-mode detection.
+                # Subsequent emits don't update it (only the first verify
+                # cycle's bonus matters for chat-vs-raw classification).
+                if ri not in self._first_emit_per_req:
+                    self._first_emit_per_req[ri] = int(tok)
         except Exception as exc:
             logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
         vocab = logits.shape[-1]
