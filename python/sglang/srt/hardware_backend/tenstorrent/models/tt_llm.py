@@ -637,26 +637,28 @@ class TTModels(nn.Module):
         per_pos_aux = []  # list of [bs, 3*hidden] tensors
         per_pos_logits = []  # list of [bs, vocab] tensors
 
-        # P3a.2 T2.2.Z+4: tree-mask emulation via _skip_self_attention.
-        # OPT-IN via env var SGLANG_TT_EAGLE_TREE_MASK=1. When enabled,
-        # decode SDPA uses cur_pos-1 as the kv read bound, excluding the
-        # just-written input token from self-attention. This breaks the
-        # chat-template "OkayOkay..." self-reinforcement on
-        # /v1/chat/completions. HOWEVER, it also degrades /generate
-        # quality severely (raw text outputs become "Tokyo\n![]( 2024年")
-        # because the target loses track of just-emitted context for
-        # non-loopy prompts. Trade-off:
-        #
-        #   SGLANG_TT_EAGLE_TREE_MASK=0 (default): /generate works well,
-        #     /v1/chat/completions produces OkayOkay loop.
-        #   SGLANG_TT_EAGLE_TREE_MASK=1: /v1/chat/completions produces
-        #     coherent (slightly noisy) thinking, /generate produces
-        #     degenerate output.
-        #
-        # Proper fix is per-request mode detection, deferred. For now,
-        # the env var lets operators pick which endpoint to optimize for.
+        # P3a.2 T2.2.Z+5: tree-mask emulation via _skip_self_attention,
+        # gated by RUNTIME LOOP DETECTION per request. The flag breaks
+        # the chat-template "OkayOkay..." loop but degrades raw-generate.
+        # Heuristic: track consecutive-same-token count per request via
+        # self._consec_same_count_per_req. When count >= threshold, the
+        # request is loop-stuck — enable tree-mask for that batch.
+        # Otherwise leave it off (preserves raw-generate quality).
+        # Also honor SGLANG_TT_EAGLE_TREE_MASK env override (1=force on,
+        # 0=force off, "auto"=use detector, default).
+        if not hasattr(self, "_consec_same_count_per_req"):
+            self._consec_same_count_per_req = {}
+        _env = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "auto")
+        if _env == "1":
+            _tree_mask_on = True
+        elif _env == "0":
+            _tree_mask_on = False
+        else:  # "auto" — runtime loop detector
+            _tree_mask_on = any(
+                self._consec_same_count_per_req.get(int(r), 0) >= 2
+                for r in req_indices
+            )
         _attn_layers = []
-        _tree_mask_on = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "0") == "1"
         if _tree_mask_on:
             try:
                 for layer in self.tt_model.model[0].layers:
@@ -665,9 +667,9 @@ class TTModels(nn.Module):
                     if a is not None:
                         _attn_layers.append(a)
                         a._skip_self_attention = True
-                if _attn_layers and not getattr(self, "_logged_skip_self_attn", False):
+                if not getattr(self, "_logged_skip_self_attn", False):
                     logger.info(
-                        f"[TT-SGLANG] Tree-mask ENABLED via env var "
+                        f"[TT-SGLANG] Tree-mask ENGAGED (env={_env}) "
                         f"on {len(_attn_layers)} attention layers"
                     )
                     self._logged_skip_self_attn = True
@@ -718,12 +720,22 @@ class TTModels(nn.Module):
         captured_aux_concat = per_pos_aux[0]
         captured_hidden_host = self._read_captured_hidden_host(bs)
         # Update per-request prev_emit token cache for the next verify cycle.
+        # T2.2.Z+5: also track consecutive-same count so the tree-mask
+        # loop-detector knows when a request is stuck.
         try:
             argmax_tokens = logits.argmax(dim=-1).tolist()
             if not isinstance(argmax_tokens, list):
                 argmax_tokens = [argmax_tokens]
             for req_idx, tok in zip(req_indices, argmax_tokens):
-                self._prev_emit_per_req[int(req_idx)] = int(tok)
+                ri = int(req_idx)
+                prev = self._prev_emit_per_req.get(ri, None)
+                if prev is not None and prev == int(tok):
+                    self._consec_same_count_per_req[ri] = (
+                        self._consec_same_count_per_req.get(ri, 0) + 1
+                    )
+                else:
+                    self._consec_same_count_per_req[ri] = 0
+                self._prev_emit_per_req[ri] = int(tok)
         except Exception as exc:
             logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
         vocab = logits.shape[-1]
