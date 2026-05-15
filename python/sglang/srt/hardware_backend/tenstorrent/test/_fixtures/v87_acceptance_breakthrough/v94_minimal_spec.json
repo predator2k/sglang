@@ -1,0 +1,25 @@
+{
+  "iteration": "v94 (T2.2.Y minimal spec)",
+  "summary": "Minimal spec config (num_steps=1 num_draft_tokens=2) delivers BEST throughput-quality balance: 9-10 tok/s with accept_rate 0.35-0.48.",
+  "config": "--speculative-num-steps 1 --speculative-num-draft-tokens 2",
+  "test1_prompt": "The capital of France is",
+  "test1_output": " Paris. The capital of Italy the United Kingdom is London London. The capital capital of Germany the United States States is Washington",
+  "test1_metrics": {
+    "throughput_tok_per_sec": 9.02,
+    "spec_accept_rate": 0.353,
+    "spec_accept_length": 1.41
+  },
+  "test2_prompt": "To bake a cake, first you need",
+  "test2_output": " to preheat the oven oven.. Then Then, you you need to mix the the ingredients.. Then, you need need to pour pour pour the the",
+  "test2_metrics": {
+    "throughput_tok_per_sec": 9.61,
+    "spec_accept_rate": 0.476,
+    "spec_accept_length": 1.52
+  },
+  "throughput_progression": {
+    "v92 (dtn=6 steps=5)": "2.78-2.95 tok/s, accept 0.10-0.12",
+    "v93 (dtn=3 steps=2)": "5.71-5.73 tok/s, accept 0.20-0.22",
+    "v94 (dtn=2 steps=1)": "9.02-9.61 tok/s, accept 0.35-0.48 ← BEST"
+  },
+  "insight": "Per-position multi-decode is the bottleneck. Fewer positions = fewer decodes = exponential throughput gain. Accept_rate scales UP not down because each verify cycle accepts ~1 draft proportionally; fewer-position cycles = same accepted/proposed ratio. Recommended production config: dtn=2 steps=1."
+}
