@@ -648,36 +648,26 @@ class TTModels(nn.Module):
         # 0=force off, "auto"=use detector, default).
         if not hasattr(self, "_consec_same_count_per_req"):
             self._consec_same_count_per_req = {}
-        if not hasattr(self, "_first_emit_per_req"):
-            self._first_emit_per_req = {}
         _env = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "auto")
         if _env == "1":
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — chat-mode detection via first-emitted-token
-            # T2.2.Z+8: detect chat mode by first emit token. Qwen3 chat
-            # template (with thinking) opens with `<think>\n` (tokens
-            # 151648, 198). After the first verify cycle emits this, we
-            # know subsequent cycles will be in chat-thinking mode and
-            # engage tree-mask. For /generate, the first emit is a
-            # regular content token (e.g., "Paris", "Tokyo") and
-            # tree-mask stays off → /generate quality preserved.
+        else:  # "auto" — runtime loop detector (no chat-template detect)
+            # T2.2.Z+8 first-emit chat-mode detection REVERTED: the chat
+            # template's special tokens (<|im_start|>=151644, <think>=151648)
+            # are part of the PROMPT, not the generated output. By the time
+            # we read first_emit_per_req, the model has already emitted
+            # "Okay," (the first content token), not the chat marker. We
+            # can't differentiate chat from raw via the verify-output stream.
             #
-            # Qwen3 special tokens to watch for in first emit:
-            #   151644 <|im_start|>, 151645 <|im_end|>, 151648 <think>
-            QWEN3_CHAT_FIRST_TOKS = {151644, 151645, 151648}
-            _tree_mask_on = False
-            for r in req_indices:
-                ri = int(r)
-                first_tok = self._first_emit_per_req.get(ri, None)
-                if first_tok is not None and first_tok in QWEN3_CHAT_FIRST_TOKS:
-                    _tree_mask_on = True
-                    break
-                # Also engage on detected repetition (safety net)
-                if self._consec_same_count_per_req.get(ri, 0) >= 1:
-                    _tree_mask_on = True
-                    break
+            # Falling back to runtime loop detection at threshold=1. Doesn't
+            # catch chat loop on first cycle but provides safety net for
+            # any mid-generation pathological repetition.
+            _tree_mask_on = any(
+                self._consec_same_count_per_req.get(int(r), 0) >= 1
+                for r in req_indices
+            )
         _attn_layers = []
         if _tree_mask_on:
             try:
