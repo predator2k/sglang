@@ -1,10 +1,17 @@
 #!/bin/bash
 # Pinned tt-metal image (P2a.1+, plugin-absorbed paged path, built locally):
 #   localhost/local-tt-metal:dev (sha256:973e972bddf5)
-#   - built from tt-metal commit 89686ee7 (UMD bump 2026-05-12)
+#   - built from tt-metal base commit 89686ee7 (UMD bump 2026-05-12)
 #   - UMD-compatible with host KMD 2.8.0 / FW 19.6.0
 #   - contains generator_sglang.py + tt_transformers
-# Build context: /home/mhnie/tt-metal/ with `podman build -f dockerfile/Dockerfile --target release-models`
+# Build context: /home/mhnie/tt-metal-sglang (the fork at predator2k/tt-metal,
+#   branch tenstorrent-p1; base commit 89686ee7 + 12 fork commits including
+#   the 8 Blackhole P300 patches required for EAGLE-3 boot). See memory
+#   `tenstorrent-tt-metal-fork`. Build cmd:
+#   podman build -f dockerfile/Dockerfile --target release-models.
+#   IMPORTANT: do not rebuild from the non-fork /home/mhnie/tt-metal — the
+#   8 Blackhole patches have no patch-file fallback and EAGLE-3 will fail
+#   to boot on P300.
 #
 # Pinned tt-metal image (Phase 0 / P1-simple-path testing):
 #   ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-55fd115-aa4ae1e
