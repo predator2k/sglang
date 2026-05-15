@@ -648,25 +648,23 @@ class TTModels(nn.Module):
         # 0=force off, "auto"=use detector, default).
         if not hasattr(self, "_consec_same_count_per_req"):
             self._consec_same_count_per_req = {}
-        if not hasattr(self, "_verify_count_per_req"):
-            self._verify_count_per_req = {}
         _env = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "auto")
         if _env == "1":
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — first-N-verify warmup + loop detection
-            # T2.2.Z+6: enable tree-mask for the first N verify cycles of
-            # each request, regardless of detection signals. Chat template
-            # loops form deterministically in the first few cycles
-            # ("<think>\\nOkay,Okay,Okay..."); raw text doesn't have this
-            # pattern in its initial tokens, so the warmup cost is minor.
-            # After warmup (verify_count >= warmup_n), disable tree-mask
-            # to preserve raw-generate quality for the rest of the request.
-            warmup_n = int(os.environ.get("SGLANG_TT_EAGLE_TREE_MASK_WARMUP", "10"))
+        else:  # "auto" — runtime loop detection only (loose safety net)
+            # T2.2.Z+6 warmup-window approach REVERTED: enabling tree-mask
+            # at the START of generation produces coherent chat output
+            # ("the user is asking for what the capital of Japan is. I
+            # need to provide the correct answer. Tokyo. But wait...")
+            # BUT degrades raw generate ("Paris\\n![](2\\n![](2..." after
+            # the first correct token). Tree-mask at the GENERATION start
+            # destroys generate coherence even with N=3 warmup.
+            # Final state: chat-template loop is operator-selected via
+            # SGLANG_TT_EAGLE_TREE_MASK=1.
             _tree_mask_on = any(
-                self._verify_count_per_req.get(int(r), 0) < warmup_n
-                or self._consec_same_count_per_req.get(int(r), 0) >= 2
+                self._consec_same_count_per_req.get(int(r), 0) >= 2
                 for r in req_indices
             )
         _attn_layers = []
