@@ -648,21 +648,25 @@ class TTModels(nn.Module):
         # 0=force off, "auto"=use detector, default).
         if not hasattr(self, "_consec_same_count_per_req"):
             self._consec_same_count_per_req = {}
+        if not hasattr(self, "_verify_count_per_req"):
+            self._verify_count_per_req = {}
         _env = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "auto")
         if _env == "1":
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — runtime loop detector with threshold=2 same tokens
-            # The chat-template request detection via forward_batch.reqs
-            # didn't work (reqs list is empty at verify time on TT path).
-            # Fall back to runtime loop detection only: when a request
-            # emits the same token 2+ times in a row, engage tree-mask
-            # to break the cycle. Cost: chat-template loops still start
-            # producing 2-3 'OkayOkay' tokens before tree-mask engages,
-            # but the model recovers afterward. /generate is preserved.
+        else:  # "auto" — first-N-verify warmup + loop detection
+            # T2.2.Z+6: enable tree-mask for the first N verify cycles of
+            # each request, regardless of detection signals. Chat template
+            # loops form deterministically in the first few cycles
+            # ("<think>\\nOkay,Okay,Okay..."); raw text doesn't have this
+            # pattern in its initial tokens, so the warmup cost is minor.
+            # After warmup (verify_count >= warmup_n), disable tree-mask
+            # to preserve raw-generate quality for the rest of the request.
+            warmup_n = int(os.environ.get("SGLANG_TT_EAGLE_TREE_MASK_WARMUP", "10"))
             _tree_mask_on = any(
-                self._consec_same_count_per_req.get(int(r), 0) >= 2
+                self._verify_count_per_req.get(int(r), 0) < warmup_n
+                or self._consec_same_count_per_req.get(int(r), 0) >= 2
                 for r in req_indices
             )
         _attn_layers = []
@@ -743,6 +747,9 @@ class TTModels(nn.Module):
                 else:
                     self._consec_same_count_per_req[ri] = 0
                 self._prev_emit_per_req[ri] = int(tok)
+                self._verify_count_per_req[ri] = (
+                    self._verify_count_per_req.get(ri, 0) + 1
+                )
         except Exception as exc:
             logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
         vocab = logits.shape[-1]
