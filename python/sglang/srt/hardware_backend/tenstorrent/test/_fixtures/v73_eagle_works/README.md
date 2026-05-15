@@ -1,4 +1,20 @@
-# EAGLE-3 on 2× P150a — Working v73 (2026-05-15)
+# EAGLE-3 on 2× P150a — Working v73 (2026-05-15) — **HISTORICAL**
+
+> **Superseded by v87 → v94 → v111-v113.** This fixture captures the
+> initial end-to-end EAGLE-3 boot milestone (real chat completions, but
+> accept_rate ≈ 0 because hidden_states was a bf16-zero stub). Subsequent
+> iterations unblocked acceptance (v87: 3-aux-layer capture), found the
+> optimal spec config (v94: `num_steps=1 num_draft_tokens=2`, 9.6 tok/s),
+> and added unified-mode prefill-time chat-template detection (v111).
+>
+> For current production launch and the canonical EAGLE-3 example, use:
+> ```
+> bash python/sglang/srt/hardware_backend/tenstorrent/scripts/repro_eagle3_2xp150a.sh [generate|chat|both]
+> ```
+> Maintainer guide: `python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/v87_acceptance_breakthrough/README.md`.
+>
+> The launch config shown below uses the pre-v94 spec tuning
+> (`num_steps=5 num_draft_tokens=6`); don't copy it for production use.
 
 End-to-end EAGLE-3 speculative decoding on 2× Tenstorrent Blackhole P150a
 producing real Qwen3-8B chat completions.
