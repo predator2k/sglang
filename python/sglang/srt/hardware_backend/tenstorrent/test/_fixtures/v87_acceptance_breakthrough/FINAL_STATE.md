@@ -77,7 +77,9 @@ self-mask in `paged_scaled_dot_product_attention_decode`.
 - v99_chat_template_limitation.json — chat issue documented
 - FINAL_STATE.md — this document
 
-## Update (v103): tree-mask env-var-gated workaround for chat
+## Update (v103): tree-mask env-var-gated workaround for chat — **SUPERSEDED by v111**
+
+> The v103/v107 env-var recommendations below are kept for historical context. The current operator guidance is: **launch with no tree-mask env var; prefill-time auto-detection (v111) handles chat vs generate per-request.** See the "v111 BREAKTHROUGH" section.
 
 `SGLANG_TT_EAGLE_TREE_MASK=1` enables tree-mask SDPA via the
 `_skip_self_attention` flag (patch already applied to tt-metal
@@ -103,13 +105,13 @@ count ≥ 2. Empirically does NOT catch the chat-template "OkayOkay" loop
 because the first emission is "Okay," (token A) followed by "Okay"
 (token B) — different token IDs, so the counter never increments past 0.
 
-Final operator-facing recommendation:
+**Historical** operator-facing recommendation (pre-v111):
 - `/generate` workloads → leave env var unset (or `0`)
 - `/v1/chat/completions` workloads → set `SGLANG_TT_EAGLE_TREE_MASK=1`
 
-Proper unified fix requires per-request mode detection at prefill time,
-which requires SGLang TT path to surface `forward_batch.reqs` to the
-verify hook. Future SGLang-TT interop improvement.
+This was made obsolete by v111 (per-request prefill-time detection). The
+env var still works as a debug-time override (`0`/`1`/`auto`); production
+launches should leave it unset and rely on auto-detection.
 
 ## 🎉 v111 BREAKTHROUGH — Unified Mode (2026-05-15)
 
