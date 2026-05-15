@@ -67,6 +67,76 @@ class TTTpModelWorker(TpModelWorker):
             "tt_worker_dispatch",
             extra={"paged_mode": self._paged_mode},
         )
+
+        # P3a.2 EAGLE-3: register draft model classes that SGLang's
+        # auto-registration missed due to the layers.utils circular import
+        # at TT plugin load time. By now all SGLang modules are settled.
+        try:
+            from sglang.srt.models.registry import ModelRegistry
+            if "LlamaForCausalLMEagle3" not in ModelRegistry.models:
+                from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
+                ModelRegistry.models["LlamaForCausalLMEagle3"] = LlamaForCausalLMEagle3
+                logger.info("Late-registered LlamaForCausalLMEagle3 for EAGLE-3 draft")
+        except Exception as exc:
+            logger.warning(f"EAGLE-3 late registration failed: {exc!r}")
+
+        # P3a.2 EAGLE-3: SGLang's RotaryEmbedding picks a fallback kernel
+        # path when none of (cuda, cpu, xpu, npu, musa, mps) is detected.
+        # On TT, all those flags are False, so RotaryEmbedding tries to
+        # import `vllm._custom_ops.rotary_embedding` which is absent.
+        # Forcing `_is_cpu = True` on the base module steers Python init to
+        # the native-torch forward path; runtime forward dispatches based
+        # on tensor device (CPU torch handles the draft model fine).
+        try:
+            import sglang.srt.layers.rotary_embedding.base as _rope_base
+            _rope_base._is_cpu = True
+            logger.info("Forced rotary_embedding._is_cpu=True (TT: route to native torch)")
+        except Exception as exc:
+            logger.warning(f"RotaryEmbedding _is_cpu patch failed: {exc!r}")
+
+        # P3a.2 EAGLE-3: SGLang's llama.set_embed (used to share embedding
+        # weights between target and EAGLE-3 draft) hard-codes
+        # torch.cuda.synchronize() / empty_cache(). On a TT-only build
+        # (torch without CUDA) those raise "Torch not compiled with CUDA".
+        # Replace them with no-ops globally — CUDA isn't available so
+        # there's nothing to sync.
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                torch.cuda.synchronize = lambda *a, **k: None
+                torch.cuda.empty_cache = lambda *a, **k: None
+                logger.info("Stubbed torch.cuda.synchronize/empty_cache (no CUDA available)")
+        except Exception as exc:
+            logger.warning(f"torch.cuda stub failed: {exc!r}")
+
+        # P3a.2 EAGLE-3: SGLang's CPU draft path triggers torch.compile()
+        # (e.g. on apply_rotary_emb), and inductor calls
+        # triton.compiler.compiler.triton_key which is missing in our
+        # triton-cpu install. Disable dynamo/inductor entirely so models
+        # run as plain eager PyTorch.
+        try:
+            import torch._dynamo
+            torch._dynamo.config.disable = True
+            import os
+            os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+            logger.info("Disabled torch._dynamo/inductor (TT: triton-cpu lacks triton_key)")
+        except Exception as exc:
+            logger.warning(f"torch._dynamo disable failed: {exc!r}")
+
+        # P3a.2 EAGLE-3: SGLang's tree-build + verify CUDA C++ ops live in
+        # sgl_kernel (not installed on a TT-only image). Inject torch
+        # fallbacks into eagle_utils' module namespace so
+        # `sgl_build_tree_kernel_efficient` resolves at line ~138 of
+        # eagle_utils.py and verify_tree_greedy_func dispatches to a real
+        # impl on TT instead of silently no-op'ing.
+        try:
+            from sglang.srt.hardware_backend.tenstorrent.tt_eagle_kernels import (
+                install_tt_eagle_kernels,
+            )
+            install_tt_eagle_kernels()
+        except Exception as exc:
+            logger.warning(f"TT EAGLE kernel fallback install failed: {exc!r}")
+
         super().__init__(**kwargs)
 
     def _init_model_runner(self):

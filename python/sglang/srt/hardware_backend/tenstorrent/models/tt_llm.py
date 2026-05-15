@@ -295,7 +295,27 @@ class TTModels(nn.Module):
                     self._prev_emit_per_req[int(req_idx)] = int(tok)
             except Exception as exc:
                 logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
-            return LogitsProcessorOutput(next_token_logits=squeezed)
+            # P3a.2 EAGLE-3: SGLang's eagle_worker reads
+            # logits_output.hidden_states and stuffs it into
+            # EagleDraftInput.hidden_states for the draft model. The TT
+            # generator surfaces only final logits, not mid-layer hidden
+            # states; we provide a zero placeholder shaped [N, hidden_size]
+            # so the draft forward doesn't crash on a None .shape access.
+            # The draft will then produce garbage proposals (every token
+            # rejected by verify), but the EAGLE harness runs end-to-end.
+            extra = {}
+            if getattr(self, "capture_aux_hidden_states", False):
+                # EAGLE-3 draft concatenates `embeds` (shape [N_input_tokens,
+                # hidden_size]) with hidden_states along dim=-1. The draft
+                # expects the same N row count, not the squeezed batch size.
+                # Draft weights are bfloat16, so match that dtype.
+                n_tokens = int(forward_batch.input_ids.shape[0])
+                hidden = _torch.zeros(
+                    (n_tokens, self.config.hidden_size),
+                    dtype=_torch.bfloat16,
+                )
+                extra["hidden_states"] = hidden
+            return LogitsProcessorOutput(next_token_logits=squeezed, **extra)
 
         elif forward_batch.forward_mode.is_decode():  # decode mode
             tokens = forward_batch.input_ids.unsqueeze(
@@ -439,7 +459,20 @@ class TTModels(nn.Module):
             logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
         vocab = logits.shape[-1]
         tiled = logits.unsqueeze(1).expand(-1, draft_token_num, -1).reshape(-1, vocab)
-        return LogitsProcessorOutput(next_token_logits=tiled)
+        # P3a.2 EAGLE-3: eagle_worker.verify (eagle_worker.py:958) sets
+        # spec_info.hidden_states = logits_output.hidden_states so the draft
+        # can re-feed accepted-token hidden states next round. Provide a
+        # bfloat16 zero stub of shape [bs*draft_token_num, hidden_size] so
+        # `batch.spec_info.hidden_states[accept_index]` in eagle_info.verify
+        # (eagle_info.py:566) doesn't crash on NoneType. Functionally the
+        # target's hidden states aren't extractable from the TT device with
+        # the current paged path, so the draft's re-feed quality is degraded;
+        # this is the same trade-off as the extend-mode stub.
+        n_verify_tokens = bs * draft_token_num
+        hidden_stub = _torch.zeros(
+            (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
+        )
+        return LogitsProcessorOutput(next_token_logits=tiled, hidden_states=hidden_stub)
 
     # P3a.2 T2.2: EAGLE worker expects target/draft model to expose
     # embed/lm_head tensors for weight tying. tt_transformers keeps these on
@@ -450,8 +483,62 @@ class TTModels(nn.Module):
     # but EAGLE's standard tie-weights path isn't strictly required for the
     # draft to function; it'll use its own loaded weights independently).
     def get_embed_and_head(self):
+        """Return host-side embed and lm_head weights for EAGLE weight tying.
+
+        SGLang's eagle_worker calls this on the target so it can pass the
+        embed (and optionally lm_head) tensor into the EAGLE draft via
+        set_embed/set_embed_and_head. tt_transformers keeps these weights
+        on the TT device, so we lazily load the host copy from the HF
+        checkpoint at /models/<target>/model.safetensors* the first time
+        this is called. Cached on the instance afterwards.
+        """
         import torch as _torch
-        return _torch.empty(0), _torch.empty(0)
+        if getattr(self, "_cached_embed_head", None) is not None:
+            return self._cached_embed_head
+
+        from sglang.srt.server_args import get_global_server_args
+        model_path = get_global_server_args().model_path
+        embed_w = None
+        head_w = None
+        try:
+            import os
+            from safetensors import safe_open
+            # HuggingFace stores embed at "model.embed_tokens.weight" and
+            # lm_head at "lm_head.weight" (or shares it with embed when
+            # tie_word_embeddings=True).
+            for fname in sorted(os.listdir(model_path)):
+                if not fname.endswith(".safetensors"):
+                    continue
+                with safe_open(os.path.join(model_path, fname), framework="pt", device="cpu") as f:
+                    keys = set(f.keys())
+                    if embed_w is None and "model.embed_tokens.weight" in keys:
+                        embed_w = f.get_tensor("model.embed_tokens.weight")
+                    if head_w is None and "lm_head.weight" in keys:
+                        head_w = f.get_tensor("lm_head.weight")
+                if embed_w is not None and head_w is not None:
+                    break
+            if head_w is None and embed_w is not None:
+                # tie_word_embeddings=True case
+                head_w = embed_w
+            if embed_w is None:
+                logger.warning(
+                    f"get_embed_and_head: no embed weight found in {model_path}; "
+                    "falling back to empty tensor (EAGLE draft may break)"
+                )
+                embed_w = _torch.empty(0)
+                head_w = _torch.empty(0)
+            else:
+                logger.info(
+                    f"get_embed_and_head: loaded embed={tuple(embed_w.shape)} "
+                    f"head={tuple(head_w.shape)} from {model_path}"
+                )
+        except Exception as exc:
+            logger.warning(f"get_embed_and_head: HF load failed ({exc!r}); using empty placeholder")
+            embed_w = _torch.empty(0)
+            head_w = _torch.empty(0)
+
+        self._cached_embed_head = (embed_w, head_w)
+        return embed_w, head_w
 
     def set_embed_and_head(self, embed, head):
         # No-op: draft model already has its own weights from tt_transformers.
@@ -466,6 +553,29 @@ class TTModels(nn.Module):
     @property
     def hot_token_id(self):
         return None  # EAGLE3 hot-token filter not applicable here
+
+    def set_eagle3_layers_to_capture(self, layer_ids=None):
+        """EAGLE-3 aux hidden-state capture stub for the TT backend.
+
+        SGLang's ModelRunner.init_aux_hidden_state_capture() calls this on the
+        target model so it knows which layer-level hidden states to expose to
+        the EAGLE-3 draft. The TT generator runs the full forward inside
+        tt-metal and only surfaces final logits at the SGLang boundary, so we
+        cannot currently capture mid-layer hidden states. Store the requested
+        layer IDs for diagnostics and accept the call so boot proceeds; the
+        draft will receive None for aux hidden states and SGLang's eagle_worker
+        falls back to using the final hidden state.
+        """
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = getattr(self.config, "num_hidden_layers", None)
+            if num_layers:
+                layer_ids = [2, num_layers // 2, num_layers - 3]
+        self.eagle3_layers_to_capture = layer_ids
+        logger.info(
+            f"[TT-SGLANG] set_eagle3_layers_to_capture: layer_ids={layer_ids} "
+            "(stub — TT generator surfaces only final logits)"
+        )
 
     def allocate_on_device(self):  # function aloocating kv cache
         """
