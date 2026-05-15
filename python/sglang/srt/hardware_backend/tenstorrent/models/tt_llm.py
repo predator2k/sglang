@@ -648,14 +648,47 @@ class TTModels(nn.Module):
         # 0=force off, "auto"=use detector, default).
         if not hasattr(self, "_consec_same_count_per_req"):
             self._consec_same_count_per_req = {}
+        if not hasattr(self, "_chat_template_per_req"):
+            self._chat_template_per_req = {}
         _env = os.environ.get("SGLANG_TT_EAGLE_TREE_MASK", "auto")
         if _env == "1":
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — runtime loop detector
+        else:  # "auto" — chat-template detection + runtime loop detector
+            # Detect chat template by looking for Qwen3's <|im_start|>
+            # (151644) or <|im_end|> (151645) tokens in the request's
+            # input. If present, this is a chat-template request → engage
+            # tree-mask immediately. Otherwise rely on loop detector.
+            try:
+                CHAT_TOKS = {151644, 151645}
+                for r in req_indices:
+                    ri = int(r)
+                    if ri in self._chat_template_per_req:
+                        continue
+                    # Look up actual KV-allocated tokens for this req
+                    req_obj = None
+                    if hasattr(forward_batch, "reqs"):
+                        for rq in forward_batch.reqs:
+                            if int(getattr(rq, "req_pool_idx", -1)) == ri:
+                                req_obj = rq
+                                break
+                    is_chat = False
+                    if req_obj is not None:
+                        for attr in ("origin_input_ids", "input_ids", "fill_ids"):
+                            ids = getattr(req_obj, attr, None)
+                            if ids is not None:
+                                try:
+                                    is_chat = any(int(t) in CHAT_TOKS for t in list(ids)[:64])
+                                    break
+                                except Exception:
+                                    pass
+                    self._chat_template_per_req[ri] = is_chat
+            except Exception as exc:
+                logger.warning(f"[TT-SGLANG] chat-template detection failed: {exc!r}")
             _tree_mask_on = any(
-                self._consec_same_count_per_req.get(int(r), 0) >= 2
+                self._chat_template_per_req.get(int(r), False)
+                or self._consec_same_count_per_req.get(int(r), 0) >= 2
                 for r in req_indices
             )
         _attn_layers = []
