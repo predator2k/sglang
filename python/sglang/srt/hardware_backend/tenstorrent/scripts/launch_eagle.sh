@@ -1,4 +1,14 @@
 #!/bin/bash
+# HISTORICAL — T2.2.L iteration milestone (first EAGLE 2-model cohost boot).
+# For current production launch, use:
+#   bash scripts/repro_eagle3_2xp150a.sh [generate|chat|both]
+#
+# This script targets vanilla EAGLE (not EAGLE3) with Qwen3-1.7B as the draft;
+# that draft hits the WO sharding blocker on TT (see memory entry
+# `tenstorrent-eagle-wo-sharding-blocker.md`). Spec config (num_steps=5,
+# num_draft_tokens=6) is also the pre-v94 suboptimal tuning. Kept for git
+# history; do not run for production validation.
+#
 # Launch the EAGLE 2-model cohost smoke for SGLang-on-Tenstorrent.
 #
 # Pre-conditions captured from the P3a.2 boot-iteration log (see
