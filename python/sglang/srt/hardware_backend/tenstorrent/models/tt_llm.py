@@ -295,6 +295,40 @@ class TTModels(nn.Module):
                     self._prev_emit_per_req[int(req_idx)] = int(tok)
             except Exception as exc:
                 logger.warning(f"[TT-SGLANG] prev_emit cache update skipped: {exc}")
+
+            # P3a.2 T2.2.Z+9: detect chat-template prompts here in prefill
+            # (the only path that sees raw prompt token IDs). If the input_ids
+            # contain Qwen3 chat-template markers (<|im_start|>, <|im_end|>,
+            # <think>), tag the request so the EAGLE verify path can engage
+            # tree-mask automatically.
+            try:
+                if not hasattr(self, "_chat_template_per_req"):
+                    self._chat_template_per_req = {}
+                CHAT_TOKS = {151644, 151645, 151648}
+                # input_ids is [total_new_tokens] flat. Use extend_seq_lens
+                # to slice per-request. For batch=1 the whole tensor is one req.
+                all_ids = forward_batch.input_ids.tolist()
+                ext_lens = (
+                    forward_batch.extend_seq_lens.tolist()
+                    if forward_batch.extend_seq_lens is not None
+                    else [len(all_ids)]
+                )
+                req_indices_pf = forward_batch.req_pool_indices.tolist()
+                off = 0
+                for ri, l in zip(req_indices_pf, ext_lens):
+                    chunk = all_ids[off : off + l]
+                    is_chat = any(t in CHAT_TOKS for t in chunk)
+                    self._chat_template_per_req[int(ri)] = is_chat
+                    if not getattr(self, "_logged_prefill_chat_detect", False):
+                        logger.info(
+                            f"[TT-SGLANG] prefill chat-detect req={ri} "
+                            f"is_chat={is_chat} prompt_len={l} "
+                            f"first_5_ids={chunk[:5]} last_5_ids={chunk[-5:]}"
+                        )
+                        self._logged_prefill_chat_detect = True
+                    off += l
+            except Exception as exc:
+                logger.warning(f"[TT-SGLANG] prefill chat-detect failed: {exc!r}")
             # P3a.2 EAGLE-3: SGLang's eagle_worker reads
             # logits_output.hidden_states and stuffs it into
             # EagleDraftInput.hidden_states for the draft model. The TT
@@ -653,19 +687,15 @@ class TTModels(nn.Module):
             _tree_mask_on = True
         elif _env == "0":
             _tree_mask_on = False
-        else:  # "auto" — runtime loop detector (no chat-template detect)
-            # T2.2.Z+8 first-emit chat-mode detection REVERTED: the chat
-            # template's special tokens (<|im_start|>=151644, <think>=151648)
-            # are part of the PROMPT, not the generated output. By the time
-            # we read first_emit_per_req, the model has already emitted
-            # "Okay," (the first content token), not the chat marker. We
-            # can't differentiate chat from raw via the verify-output stream.
-            #
-            # Falling back to runtime loop detection at threshold=1. Doesn't
-            # catch chat loop on first cycle but provides safety net for
-            # any mid-generation pathological repetition.
+        else:  # "auto" — prefill-set chat flag + runtime loop safety net
+            # T2.2.Z+9: chat detection happens in PREFILL (the only path
+            # that sees raw prompt token IDs). Prefill scans input_ids for
+            # Qwen3 chat-template tokens and sets _chat_template_per_req[ri].
+            # Here we just read the flag.
+            chat_per_req = getattr(self, "_chat_template_per_req", {})
             _tree_mask_on = any(
-                self._consec_same_count_per_req.get(int(r), 0) >= 1
+                chat_per_req.get(int(r), False)
+                or self._consec_same_count_per_req.get(int(r), 0) >= 1
                 for r in req_indices
             )
         _attn_layers = []
