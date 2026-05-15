@@ -672,33 +672,47 @@ class TTModels(nn.Module):
         # which leaves the draft no signal at all.
         n_verify_tokens = bs * draft_token_num
         if captured_aux_concat is not None:
-            # T2.2.R: real 3-aux-layer concat [bs, 3*hidden] from target
-            # layers [2, mid, N-3]. This is the exact input shape and
-            # semantics EAGLE-3 was trained on. EAGLE-3's midlayer will
-            # apply its fc projection (3*hidden→hidden) before consuming.
-            #
-            # T2.2.S: place the real captured hidden ONLY at position 0
-            # (the bonus position), and zero out positions 1..dtn-1. The
-            # EAGLE draft uses hidden_states[accept_index] — accept_index[0]
-            # is always the bonus, others are accepted-draft slots. Tiling
-            # the same hidden everywhere creates a self-reinforcing loop
-            # (draft proposes same token → accepted → fed back → repeats),
-            # which produced v87's repetition artifact. By zeroing
-            # non-bonus slots, only the bonus position carries the real
-            # signal; accepted-draft positions go to zero hidden, which
-            # is a no-info signal rather than a same-signal echo.
+            # T2.2.T: real 3-aux-layer concat at position 0 + position-specific
+            # token-embed perturbation at positions 1..dtn-1. v88 (T2.2.S)
+            # zeroed non-bonus positions to break v87's repetition loop, but
+            # zeros are uninformative for accepted drafts' next-round feed
+            # (those positions get no signal and reproduce token-pair
+            # repetition). Add a small embed-derived perturbation so each
+            # position has DIFFERENT hidden state — breaks the same-state
+            # echo while keeping the bonus signal load-bearing.
+            try:
+                embed_w, _ = self.get_embed_and_head()
+                has_embed = embed_w is not None and embed_w.numel() > 0
+            except Exception:
+                embed_w = None
+                has_embed = False
             hidden_stub = _torch.zeros(
                 (n_verify_tokens, 3 * self.config.hidden_size),
                 dtype=_torch.bfloat16,
             )
-            # Position 0 of each batch gets the real captured aux concat.
             for b in range(bs):
+                # Position 0 (bonus): real captured aux concat
                 hidden_stub[b * draft_token_num] = captured_aux_concat[b]
+                if has_embed:
+                    vocab_size = int(embed_w.shape[0])
+                    # Positions 1..dtn-1: bonus_aux + 0.05 * embed(token_at_pos)
+                    # triplicated to fill 3*hidden, where token_at_pos is the
+                    # draft's proposed token at that position. Tiny perturbation
+                    # magnitude — large enough to break symmetry, small enough
+                    # to not destroy the captured signal.
+                    for i in range(1, draft_token_num):
+                        tok_id = int(flat_input[b * draft_token_num + i].item())
+                        tok_id = max(0, min(tok_id, vocab_size - 1))
+                        embed_vec = embed_w[tok_id].to(_torch.bfloat16)  # [hidden]
+                        embed_triplet = _torch.cat([embed_vec] * 3, dim=-1)  # [3*hidden]
+                        hidden_stub[b * draft_token_num + i] = (
+                            captured_aux_concat[b] + 0.05 * embed_triplet
+                        )
             if not getattr(self, "_logged_aux_concat", False):
                 logger.info(
-                    f"[TT-SGLANG] EAGLE verify using AUX CONCAT at pos 0 only: "
-                    f"shape={tuple(captured_aux_concat.shape)} (3 layers, "
-                    f"non-bonus positions zeroed to break repetition loop)"
+                    f"[TT-SGLANG] EAGLE verify AUX+perturb: "
+                    f"pos0=captured (shape {tuple(captured_aux_concat.shape)}), "
+                    f"pos1..{draft_token_num-1}=bonus_aux+0.05*embed(token)"
                 )
                 self._logged_aux_concat = True
         elif captured_hidden_host is not None:
