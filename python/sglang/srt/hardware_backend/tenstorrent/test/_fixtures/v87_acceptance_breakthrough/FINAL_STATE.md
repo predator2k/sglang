@@ -76,3 +76,21 @@ self-mask in `paged_scaled_dot_product_attention_decode`.
 - v95_suite_results.json + v95_suite_output.txt — 8-prompt suite
 - v99_chat_template_limitation.json — chat issue documented
 - FINAL_STATE.md — this document
+
+## Update (v103): tree-mask env-var-gated workaround for chat
+
+`SGLANG_TT_EAGLE_TREE_MASK=1` enables tree-mask SDPA via the
+`_skip_self_attention` flag (patch already applied to tt-metal
+attention.py). Trade-off depending on workload:
+
+| Env value | /generate | /v1/chat/completions |
+|---|---|---|
+| `0` (default) | Works ("Paris. The capital of Italy...") | Broken (OkayOkay loop) |
+| `1` | Broken ("Tokyo\n![]( 2024年") | Works ("OkayOkay, the user is asking about the capital of Japan. Let me think.") |
+
+Proper fix would be per-request mode detection.
+
+Launch with env var:
+```bash
+podman exec -e SGLANG_TT_EAGLE_TREE_MASK=1 ...  # enable for chat workloads
+```
