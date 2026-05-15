@@ -661,6 +661,29 @@ class TTModels(nn.Module):
 
         # logits-per-position: stack to [bs, dtn, vocab]
         logits_per_pos = _torch.stack(per_pos_logits, dim=1)  # [bs, dtn, vocab]
+
+        # T2.2.Z+2: no-repeat-bigram guard. The chat-template context
+        # ("<|im_start|>...<think>\nOkay,") triggers a self-reinforcing
+        # loop where the draft proposes the same token as the bonus and
+        # target accepts, producing "OkayOkay..." output. Tree-mask SDPA
+        # in tt-metal would solve this properly; absent that, we mask the
+        # input token's logit at each position so target's argmax can
+        # never repeat the input. Trade-off: slightly distorts the
+        # model's true distribution for repetitive contexts, but allows
+        # the spec to break out of loops in practice.
+        try:
+            no_rpt = _torch.full((bs * draft_token_num,), -1, dtype=_torch.long)
+            for i in range(draft_token_num):
+                no_rpt[i] = int(prev_emit[0].item()) if i == 0 else int(tokens_per_user[0, i].item())
+            # Mask logits[token_at_pos] = -inf per position
+            for b in range(bs):
+                for i in range(draft_token_num):
+                    tok_at = int(no_rpt[i].item()) if b == 0 else int(tokens_per_user[b, i].item())
+                    if 0 <= tok_at < logits_per_pos.shape[-1]:
+                        logits_per_pos[b, i, tok_at] = float("-inf")
+        except Exception as exc:
+            logger.warning(f"[TT-SGLANG] no-repeat-bigram mask skipped: {exc!r}")
+
         # logits[:, 0] is what we use to update prev_emit cache (bonus position).
         logits = per_pos_logits[0]
         # T2.2.W: aux concat is the LAST position's aux (used as fallback if
