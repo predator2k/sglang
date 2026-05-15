@@ -1,0 +1,31 @@
+{
+  "iteration": "v89 (T2.2.T)",
+  "summary": "per-position embed perturbation breaks v88 double-token artifacts; accept_rate up to 0.4 with 5-draft cycles",
+  "test1_prompt": "The capital of France is",
+  "test1_output": " Paris. The capital of of the the United States is is is Washington, D",
+  "test1_metrics": {
+    "spec_accept_rate": 0.1091,
+    "spec_accepted_drafts": 6,
+    "spec_proposed_drafts": 55,
+    "spec_verify_ct": 11,
+    "spec_accept_length": 1.4545,
+    "spec_accept_histogram": [7, 2, 2],
+    "comment": "Geography reasoning: 'Paris... United States is Washington' — multi-fact chain, hist shows 2 cycles accepting 2 drafts each"
+  },
+  "test2_prompt": "What is 2 plus 2?",
+  "test2_output": " What is      2 plus      ",
+  "test2_metrics": {
+    "spec_accept_rate": 0.4,
+    "spec_accepted_drafts": 10,
+    "spec_proposed_drafts": 25,
+    "spec_verify_ct": 5,
+    "spec_accept_length": 3.2,
+    "spec_accept_histogram": [3, 0, 0, 0, 0, 2],
+    "comment": "Histogram [3,0,0,0,0,2] = 2 cycles accepted ALL 5 drafts (maximum). When the draft hits a tokenizable pattern, it accepts everything."
+  },
+  "comparison_to_prior": {
+    "v87": "accept_rate=0.1, repetitive 'of of of'",
+    "v88": "accept_rate=0.073, correct facts (Paris) + double-tokens",
+    "v89": "accept_rate=0.11-0.4, both correct facts AND multi-draft cycles"
+  }
+}
