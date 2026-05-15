@@ -1,0 +1,31 @@
+{
+  "iteration": "v114b — path B (deferred aux read via ttnn.clone) measurements",
+  "summary": "Validates the deferred-aux-read optimization (v114_tpot_analysis path B). Replaces inline `to_torch` in aux-capture wrapper with `ttnn.clone(out)` (device-to-device) and reads cloned tensors after decode_forward returns. Inline host-sync no longer blocks subsequent layers.",
+  "config": "EAGLE-3 target Qwen3-8B on 2x P150a + Tengyunw/qwen3_8b_eagle3 draft on CPU torch; --speculative-num-steps 1 --speculative-num-draft-tokens 2; SGLANG_TT_EAGLE_DEFERRED_AUX=1",
+  "comparison_baseline": "v114_ttft_tpot.json (env unset)",
+  "results": [
+    {
+      "prompt": "The capital of Japan is",
+      "completion_tokens": 16,
+      "baseline": {"ttft_s": 0.081, "tpot_s_excl_ttft": 0.104, "tok_per_s_e2e": 9.76, "accept_rate": 0.5},
+      "path_b":   {"ttft_s": 0.083, "tpot_s_excl_ttft": 0.101, "tok_per_s_e2e": 10.03, "accept_rate": 0.5},
+      "delta_tok_per_s_pct": 2.8
+    },
+    {
+      "prompt": "World War 2 ended in",
+      "completion_tokens": 16,
+      "baseline": {"ttft_s": 0.081, "tpot_s_excl_ttft": 0.135, "tok_per_s_e2e": 7.57, "accept_rate": 0.154},
+      "path_b":   {"ttft_s": 0.076, "tpot_s_excl_ttft": 0.132, "tok_per_s_e2e": 7.77, "accept_rate": 0.154},
+      "delta_tok_per_s_pct": 2.6
+    },
+    {
+      "prompt": "Tell me about Python programming language",
+      "completion_tokens": 32,
+      "baseline": {"ttft_s": 0.080, "tpot_s_excl_ttft": 0.134, "tok_per_s_e2e": 7.57, "accept_rate": 0.192},
+      "path_b":   {"ttft_s": 0.079, "tpot_s_excl_ttft": 0.129, "tok_per_s_e2e": 7.82, "accept_rate": 0.192},
+      "delta_tok_per_s_pct": 3.3
+    }
+  ],
+  "verdict": "ACCEPTED. accept_rate preserved EXACTLY across all 3 probes (0.5/0.154/0.192). TPOT improvement 2-5 ms/tok (2-3%). No correctness regression. Path B becomes default in v115 (opt-out via SGLANG_TT_EAGLE_DEFERRED_AUX=0).",
+  "next_steps_unchanged": "Paths A (single prefill_forward) and C (trace-compatible aux capture in tt-metal) remain unattempted; each carries higher risk and requires focused session. See v114_tpot_analysis.md."
+}

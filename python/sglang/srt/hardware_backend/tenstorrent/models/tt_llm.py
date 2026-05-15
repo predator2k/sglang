@@ -403,6 +403,16 @@ class TTModels(nn.Module):
             self._aux_layer_ids = [2, num_layers // 2, num_layers - 3]
             self._captured_aux_layer_host = {i: None for i in self._aux_layer_ids}
 
+            # Deferred-aux-read optimization (path B in v114_tpot_analysis):
+            # store a device-side `ttnn.clone(out)` and skip the inline
+            # `to_torch`. The host read happens later in
+            # `_finalize_aux_capture()` after decode_forward returns, so the
+            # inline host-sync no longer blocks subsequent layers.
+            # Default on; opt out with SGLANG_TT_EAGLE_DEFERRED_AUX=0.
+            # Validated v114b: accept_rate preserved exactly vs baseline
+            # across 3 probes; TPOT improved 2-5 ms/tok (2-3%).
+            self._captured_aux_layer_device = {i: None for i in self._aux_layer_ids}
+
             def _make_wrapper(parent, orig, layer_id):
                 class _LayerCaptureWrapper:
                     def __call__(_w, *args, **kwargs):
@@ -410,14 +420,26 @@ class TTModels(nn.Module):
                         try:
                             import ttnn as _ttnn_local
                             import torch as _torch_local
-                            shards = list(_ttnn_local.get_device_tensors(out))
-                            per_dev = [_ttnn_local.to_torch(s) for s in shards]
-                            host = _torch_local.cat(per_dev, dim=-1) if len(per_dev) > 1 else per_dev[0]
-                            parent._captured_aux_layer_host[layer_id] = host
+                            if os.environ.get("SGLANG_TT_EAGLE_DEFERRED_AUX", "1") != "0":
+                                # Defer host read: clone device tensor so it
+                                # survives downstream layers; read in batch
+                                # after the full forward returns.
+                                parent._captured_aux_layer_device[layer_id] = (
+                                    _ttnn_local.clone(out)
+                                )
+                            else:
+                                shards = list(_ttnn_local.get_device_tensors(out))
+                                per_dev = [_ttnn_local.to_torch(s) for s in shards]
+                                host = _torch_local.cat(per_dev, dim=-1) if len(per_dev) > 1 else per_dev[0]
+                                parent._captured_aux_layer_host[layer_id] = host
                             if not getattr(parent, f"_logged_layer_{layer_id}", False):
+                                _shape = (
+                                    "deferred"
+                                    if os.environ.get("SGLANG_TT_EAGLE_DEFERRED_AUX", "1") != "0"
+                                    else f"shape={tuple(parent._captured_aux_layer_host[layer_id].shape)} dtype={parent._captured_aux_layer_host[layer_id].dtype}"
+                                )
                                 logger.info(
-                                    f"[TT-SGLANG] aux layer {layer_id} captured: "
-                                    f"shape={tuple(host.shape)} dtype={host.dtype}"
+                                    f"[TT-SGLANG] aux layer {layer_id} captured: {_shape}"
                                 )
                                 setattr(parent, f"_logged_layer_{layer_id}", True)
                         except Exception as _exc:
@@ -443,6 +465,38 @@ class TTModels(nn.Module):
         except Exception as exc:
             logger.warning(f"[TT-SGLANG] aux-layer capture install failed: {exc!r}")
             self._aux_layer_capture_installed = False
+
+    def _finalize_aux_capture(self):
+        """Drain deferred device-side aux captures into the host dict.
+
+        Called after `decode_forward` returns when the deferred-aux-read
+        optimization is on (default; opt-out with
+        SGLANG_TT_EAGLE_DEFERRED_AUX=0). Each layer's cloned device
+        tensor is read to host now (out of the layer-chain critical path)
+        and then released so subsequent decodes can re-clone.
+        """
+        if os.environ.get("SGLANG_TT_EAGLE_DEFERRED_AUX", "1") == "0":
+            return
+        import ttnn as _ttnn
+        import torch as _torch
+        dev_map = getattr(self, "_captured_aux_layer_device", None)
+        if not dev_map:
+            return
+        for lid in list(dev_map.keys()):
+            dev_t = dev_map.get(lid)
+            if dev_t is None:
+                continue
+            try:
+                shards = list(_ttnn.get_device_tensors(dev_t))
+                per_dev = [_ttnn.to_torch(s) for s in shards]
+                host = _torch.cat(per_dev, dim=-1) if len(per_dev) > 1 else per_dev[0]
+                self._captured_aux_layer_host[lid] = host
+            except Exception as exc:
+                logger.warning(
+                    f"[TT-SGLANG] deferred aux read for layer {lid} failed: {exc!r}"
+                )
+            finally:
+                dev_map[lid] = None  # release ref
 
     def _read_captured_aux_concat_host(self, bs):
         """Concatenate the 3 captured aux-layer hidden states as [bs, 3*hidden]."""
@@ -733,6 +787,10 @@ class TTModels(nn.Module):
                     enable_trace=False,
                     read_from_device=True,
                 )
+                # Path B (deferred-aux-read, default on): drain device-side
+                # clones into the host dict now that the forward is done.
+                # No-op when SGLANG_TT_EAGLE_DEFERRED_AUX=0.
+                self._finalize_aux_capture()
                 logits_i = decode_out_i[0][:bs].squeeze(1)  # [bs, vocab]
                 aux_i = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
                 per_pos_logits.append(logits_i)
