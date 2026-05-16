@@ -1,0 +1,19 @@
+{
+  "iteration": "v128 — GSM8K 51/300 (17% milestone)",
+  "date": "2026-05-16",
+  "model": "Qwen3-8B",
+  "device": "2xP150a (P300)",
+  "precision": "HIFI (BF16 attn + BFP8 MLP)",
+  "gsm8k": {
+    "correct": 42, "total": 51,
+    "accuracy": "82.4%",
+    "model_card_reference": "~80%",
+    "delta": "+2.4pp",
+    "extract_failures": 9,
+    "garbage_outputs": 0,
+    "tpot_ms": 40.2,
+    "tok_s": 24.9,
+    "server_uptime_min": 47,
+    "stable": true
+  }
+}
