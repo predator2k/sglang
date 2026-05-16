@@ -1,0 +1,29 @@
+{
+  "iteration": "v127 — GSM8K 30/300 (10% milestone)",
+  "date": "2026-05-16",
+  "model": "Qwen3-8B",
+  "device": "2xP150a (P300)",
+  "precision": "HIFI (BF16 attn + BFP8 MLP)",
+  "gsm8k_30_sample": {
+    "correct": 26,
+    "total": 30,
+    "accuracy": "86.7%",
+    "model_card_reference": "~80% (thinking mode)",
+    "delta_vs_reference": "+6.7pp",
+    "avg_tokens_per_response": 1312,
+    "tpot_ms": 40.2,
+    "tok_s": 24.9,
+    "avg_time_per_question_s": 47,
+    "all_outputs_coherent": true,
+    "no_garbage_output": true,
+    "server_uptime_minutes": 27,
+    "failure_analysis": "4/30 failures all have predicted=None (answer extraction issue, not wrong reasoning)"
+  },
+  "performance_summary": {
+    "decode_throughput_tok_s": 24.9,
+    "tpot_ms": 40.2,
+    "ttft_short_prompt_ms": "~50 (after warmup)",
+    "precision": "BF16 attention + BFP8 MLP (HIFI4 fidelity)",
+    "note": "BFP4 MLP produces garbage for Qwen3-8B. HIFI precision required."
+  }
+}
