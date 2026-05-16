@@ -1,10 +1,9 @@
 """Registry + factory for TT execution backends.
 
-Mirror of SGLang's attention_registry.py pattern. P2a ships two real
-backend keys: tt_transformers_single (simple B=1, ported from P1) and a
-placeholder for tt_transformers_paged (Phase 4). tt_xla is a registered
-placeholder so the post-P1 add-a-backend path is a swap rather than a
-Phase-F rewrite.
+Mirror of SGLang's attention_registry.py pattern. Two backend keys are
+registered: tt_transformers_single (simple B=1, ported from P1) and
+tt_transformers_paged (plugin-absorbed paged path). tt_xla uses Pattern A
+(ModelRegistry) instead of an execution backend, so it has no class here.
 
 IMPORTANT: the registry dict MUST be declared before the backend modules
 are imported — their @register_tt_execution_backend(...) decorators fire
@@ -40,9 +39,10 @@ def register_tt_execution_backend(
 # dict. E402 is suppressed here intentionally: the import MUST follow the
 # registry declaration above, otherwise the decorator NameErrors. Don't
 # silence E402 elsewhere — this is the one legitimate place for it.
+# NOTE: tt_xla uses Pattern A (ModelRegistry) and has no execution backend
+# class. Only tt_transformers backends are registered here.
 from sglang.srt.hardware_backend.tenstorrent.execution import (  # noqa: E402, F401
     tt_transformers_backend,
-    tt_xla_backend,
 )
 
 
