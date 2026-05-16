@@ -1,0 +1,50 @@
+{
+  "date": "2026-05-16",
+  "model": "Qwen3-8B",
+  "device": "2xP150a",
+  "results": [
+    {
+      "label": "short: 128in/100out",
+      "input_tokens": 161,
+      "output_tokens": 100,
+      "elapsed_s": 153.13,
+      "tok_s": 0.7,
+      "ttft_approx_s": 94.46,
+      "text_preview": " The document provides a comprehensive overview of the computational power of quantum computers for "
+    },
+    {
+      "label": "short-in/4K-out",
+      "input_tokens": 161,
+      "output_tokens": 4096,
+      "elapsed_s": 151.8,
+      "tok_s": 27.0,
+      "ttft_approx_s": 5.74,
+      "text_preview": " The document discusses the concept of quantum computing and its potential to revolutionize computin"
+    },
+    {
+      "label": "4K-in/short-out",
+      "input_tokens": 2576,
+      "output_tokens": 100,
+      "elapsed_s": 154.38,
+      "tok_s": 0.6,
+      "ttft_approx_s": 148.61,
+      "text_preview": " Be sure to include the following: \n\n1. Summary of the document. \n2. Analysis of the document. \n3. C"
+    },
+    {
+      "label": "4K-in/4K-out",
+      "error": "Remote end closed connection without response"
+    },
+    {
+      "label": "8K-in/short-out",
+      "error": "<urlopen error [Errno 111] Connection refused>"
+    },
+    {
+      "label": "8K-in/4K-out",
+      "error": "<urlopen error [Errno 111] Connection refused>"
+    },
+    {
+      "label": "8K-in/8K-out",
+      "error": "<urlopen error [Errno 111] Connection refused>"
+    }
+  ]
+}
