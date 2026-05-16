@@ -16,9 +16,14 @@
     "N150_target": {"ttft_ms": 51, "tput_user_tok_s": 21, "tput_total_tok_s": 652},
     "N300_functional": {"ttft_ms": 420, "tput_user_tok_s": 4.1, "tput_total_tok_s": 130.3},
     "N300_target": {"ttft_ms": 42, "tput_user_tok_s": 41, "tput_total_tok_s": 1303},
-    "P300_release_spec": "status=FUNCTIONAL, perf_reference=[] (no targets defined yet)",
-    "our_P300_SGLang": {"tput_user_tok_s": 27.4, "decode_ms": 36},
-    "gap_vs_P150_theoretical": "1.35x (37 vs 27.4)"
+    "P300_release_spec_functional": {"ttft_ms": 510, "tput_user_tok_s": 2.1, "tier": "functional"},
+    "P300_release_spec_complete": {"ttft_ms": 102, "tput_user_tok_s": 10.5, "tier": "complete"},
+    "P300_release_spec_target": {"ttft_ms": 51, "tput_user_tok_s": 21.0, "tier": "target"},
+    "P150_theoretical": {"ttft_ms": 30, "tput_user_tok_s": 37, "tput_total_tok_s": 1158, "tier": "theoretical"},
+    "our_P300_SGLang": {"tput_user_tok_s": 28.0, "decode_ms": 36},
+    "our_vs_TT_P300_functional": "13.3x FASTER (28.0 vs 2.1)",
+    "our_vs_TT_P300_target": "1.33x FASTER (28.0 vs 21.0)",
+    "our_vs_TT_P150_theoretical": "1.32x slower (28.0 vs 37)"
   },
   "interpretation": {
     "theoretical_tier": "Aspirational targets from model_performance_reference.json. NOT measured results.",
