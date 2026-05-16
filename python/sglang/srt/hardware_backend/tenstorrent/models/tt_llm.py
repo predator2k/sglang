@@ -377,8 +377,6 @@ class TTModels(nn.Module):
                     read_from_device=True,
                 )
             )
-            logger.debug("tt_model.decode_forward executed")
-            # returns scores for every possible next word and sglang picks the most likely one ( it will become the next token )
             logits = decode_output[0]
             logits = logits[:actual_bsz]  # ignore output of padded requests
             return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
@@ -458,6 +456,18 @@ class TTModels(nn.Module):
                 for i, layer in enumerate(inner.layers)
             ]
             self._aux_layer_capture_installed = True
+            # Invalidate any existing decode trace so the next decode_forward
+            # recaptures WITH the clone ops from the aux wrapper. Without this,
+            # trace replay would skip the clones (captured before wrapper install)
+            # and aux values would be stale.
+            try:
+                for m in self.tt_model.model:
+                    for attr in ("trace_ids", "_trace_state_text"):
+                        if hasattr(m, attr):
+                            setattr(m, attr, None)
+                logger.info("[TT-SGLANG] Invalidated decode trace for aux-capture recapture")
+            except Exception as _te:
+                logger.warning(f"[TT-SGLANG] Trace invalidation failed: {_te!r}")
             logger.info(
                 f"[TT-SGLANG] Installed aux-layer capture on layers={self._aux_layer_ids} "
                 f"(of {num_layers} total)"
@@ -779,12 +789,13 @@ class TTModels(nn.Module):
                 padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
                     token_i, pos_i, page_table
                 )
+                _verify_trace = os.environ.get("SGLANG_TT_VERIFY_TRACE", "1") != "0"
                 decode_out_i = self.tt_model.decode_forward(
                     tokens=padded_tokens_i,
                     start_pos=padded_positions_i,
                     page_table=padded_pt_i,
                     kv_cache=self.kv_caches,
-                    enable_trace=False,
+                    enable_trace=_verify_trace,
                     read_from_device=True,
                 )
                 # Path B (deferred-aux-read, default on): drain device-side

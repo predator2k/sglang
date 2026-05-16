@@ -1,0 +1,33 @@
+{
+  "iteration": "v119 — decode timing breakdown, Qwen3-1.7B on 2×P150a",
+  "date": "2026-05-16",
+  "model": "Qwen3-1.7B",
+  "device": "2×P150a (P300_X2)",
+  "config": "no-spec, --max-running-requests 1, --context-length 2048, enable_trace=True",
+  "decode_timing_ms": {
+    "prep_pad": 0.01,
+    "tt_metal_decode_forward": 21.0,
+    "post_slice": 0.00,
+    "total_in_forward": 21.01
+  },
+  "throughput": {
+    "raw_forward_tok_s": 47.6,
+    "end_to_end_tok_s": 46.8,
+    "sglang_overhead_ms": 0.4,
+    "sglang_overhead_pct": "1.9%"
+  },
+  "reference_comparison": {
+    "llama_3_2_1B_N300_tok_s": 105.9,
+    "llama_3_2_1B_N300_decode_ms": 9.4,
+    "qwen3_1_7B_expected_ms": 16.5,
+    "qwen3_1_7B_expected_tok_s": 60.6,
+    "note": "Expected = Llama N300 × (28/16 layers). Gap of 27% likely from DRAM prefetcher (Llama has it, Qwen3 does not) and model-specific kernel tuning"
+  },
+  "conclusions": [
+    "SGLang scheduler overhead is negligible (0.4ms, 1.9%)",
+    "Bottleneck is 100% tt-metal decode time (21ms/tok)",
+    "DRAM Prefetcher would likely close the 27% gap to expected ceiling",
+    "Prefetcher blocked by L1 CB clash with norm ops (v117 blocker_2)",
+    "MAX_PREFILL_CHUNK_SIZE added for Qwen3-1.7B (128) and Qwen3-8B (64)"
+  ]
+}
