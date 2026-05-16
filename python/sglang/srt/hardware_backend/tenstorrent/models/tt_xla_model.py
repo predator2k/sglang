@@ -14,17 +14,26 @@ tt-xla key constraints discovered during P3b Task 2.1:
   - First invocation per unique input shape triggers JIT compilation (~9s for
     TinyLlama 1.1B on 2x P150a Blackhole).
 
-PJRT plugin compiler workarounds (P3b):
+PJRT plugin compiler workarounds (P3b), HW-validated 2026-05-16:
   - Blocker 1 (ttir.paged_update_cache): When use_cache=False (the naive
     workaround for cache issues), HF calls aten.scatter_.src for internal
     operations, which pjrt-plugin-tt 1.1.0 lowers to ttir.paged_update_cache
     (not implemented). Workaround: use StaticCache with explicit
     cache_position. StaticCache.update() uses index_copy_ (not scatter_),
-    which TT-MLIR lowers correctly. Proven by test_tt_xla_smoke.py.
+    which TT-MLIR lowers correctly. Proven by test_tt_xla_smoke.py and
+    test_tt_xla_e2e.py on 2x P150a Blackhole.
   - Blocker 2 (add_int UInt8): When use_cache=False, HF's internal
     _update_causal_mask creates boolean/UInt8 tensors that Blackhole's add_int
     kernel rejects (only Int32/UInt32/UInt16 supported). Workaround: pass
     an explicit Int32 attention_mask so HF skips its internal mask creation.
+
+Known limitations discovered during HW validation:
+  - pjrt-plugin-tt 1.1.0 triggers INTERNAL error 13 for large StaticCache
+    sizes (>64). The workaround pattern is valid but requires small cache.
+  - torch.compile graph retracing after cache mutation (zero_) fails with
+    error 13; multi-sequence serving needs a single compile trace.
+  - JIT compilation takes ~9s per unique input shape (prefill vs decode);
+    second invocation with cached graph runs in ~0.001s per token.
 """
 
 from __future__ import annotations
