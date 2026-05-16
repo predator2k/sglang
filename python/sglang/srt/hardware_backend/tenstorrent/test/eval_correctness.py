@@ -85,17 +85,18 @@ PROGRAMMING_PROBLEMS = [
 ]
 
 
-def chat(prompt: str, max_tokens: int = 2048, temperature: float = 0.0) -> str:
+def chat(prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str:
+    url = "http://localhost:30000/v1/completions"
     data = json.dumps({
         "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "prompt": prompt + "\n",
         "max_tokens": max_tokens,
         "temperature": temperature,
     }).encode()
-    req = urllib.request.Request(URL, data, HEADERS)
-    with urllib.request.urlopen(req, timeout=120) as r:
+    req = urllib.request.Request(url, data, HEADERS)
+    with urllib.request.urlopen(req, timeout=300) as r:
         resp = json.loads(r.read())
-    return resp["choices"][0]["message"]["content"]
+    return resp["choices"][0]["text"]
 
 
 def eval_translation(problems):
@@ -164,7 +165,7 @@ def main():
 
     # Warmup
     print("\nWarmup...")
-    chat("Hello", max_tokens=10)
+    chat("Hello", max_tokens=5)
 
     all_results = {}
 
