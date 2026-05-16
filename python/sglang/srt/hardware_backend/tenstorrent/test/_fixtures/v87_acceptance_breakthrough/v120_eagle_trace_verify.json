@@ -1,0 +1,43 @@
+{
+  "iteration": "v120 — EAGLE-3 trace-compatible verify on Qwen3-8B, 2×P150a",
+  "date": "2026-05-16",
+  "changes": {
+    "verify_trace": "SGLANG_TT_VERIFY_TRACE=1 (default on) enables enable_trace=True in verify decode loop",
+    "trace_invalidation": "Aux-wrapper install invalidates existing decode trace so recapture includes ttnn.clone() ops",
+    "prefetcher_mux": "generate_mux_safe_sender_receiver_mapping() for Blackhole MUX grid (12x8); is_blackhole() detection; max_row=7 hardcoded",
+    "prefill_chunk_size": "Qwen3-1.7B: 128, Qwen3-8B: 64 added to MAX_PREFILL_CHUNK_SIZE table"
+  },
+  "results": {
+    "qwen3_1_7B_no_spec": {
+      "tok_s": 46.9,
+      "decode_ms": 21.0,
+      "sglang_overhead_ms": 0.4,
+      "note": "SGLang overhead is 1.9% — bottleneck is 100% tt-metal decode"
+    },
+    "qwen3_8B_eagle3_no_trace": {
+      "tok_s": 8.0,
+      "note": "Previous baseline with enable_trace=False in verify"
+    },
+    "qwen3_8B_eagle3_with_trace": {
+      "tok_s": 9.8,
+      "improvement": "+22%",
+      "note": "Trace replay partially helps but CPU draft model dominates verify cycle time"
+    },
+    "qwen3_8B_no_spec_baseline": {
+      "tok_s": 27.4,
+      "note": "v116 measurement"
+    }
+  },
+  "blockers": {
+    "prefetcher_l1_clash": "DRAM prefetcher's global CB clashes with RMSNorm op L1 allocation on receiver/worker cores. MUX clamp fixed (row 9 → 5), but L1 coordination needs tt-metal sub_device API changes.",
+    "reads_during_trace_capture": "TT_FATAL during first aux-capture trace: 'Reads are not supported during trace capture'. Non-fatal — server continues and subsequent replays work.",
+    "eagle_verify_throughput": "9.8 tok/s with trace is still 2.8× slower than no-spec baseline. Root cause: 2 decode calls per verify cycle + CPU draft model latency + prefill-for-verify overhead.",
+    "path_a_single_prefill_verify": "Collapsing to 1 decode per verify cycle requires tt-metal's prefill_forward_text to return per-position logits (currently slices to last token only)."
+  },
+  "tt_perf_reference": {
+    "llama_3_2_1B_N300": "105.9 tok/s",
+    "llama_3_1_8B_P150": "33.6 tok/s",
+    "qwen3_1_7B_expected_ceiling": "~60 tok/s (adjusted for 28 vs 16 layers)",
+    "gap_analysis": "21ms actual vs 16.5ms expected = 27% gap, likely from missing DRAM prefetcher"
+  }
+}
