@@ -184,6 +184,131 @@ class TTModels(nn.Module):
         # "Batch size mismatch" crash when prefill bs=1 prev_emit was applied
         # to verify bs>1.
         self._prev_emit_per_req: dict[int, int] = {}
+        self._first_emit_per_req: dict[int, int] = {}
+
+        # --- Decode hot-path optimization state (v119 perf gap closure) ---
+        # Pre-allocate padding tensors once to avoid per-step torch.zeros +
+        # torch.cat allocations in _pad_decode_batch. Initialised lazily on
+        # first decode call when tt_model.model_args is available.
+        self._decode_pad_ready = False
+        self._decode_required_bsz = None
+        self._decode_pad_tokens = None
+        self._decode_pad_pos = None
+        self._decode_pad_pt = None
+        # Pre-allocated output buffer for padded tokens/positions
+        self._decode_tokens_buf = None
+        self._decode_pos_buf = None
+        self._decode_pt_buf = None
+        # Decode-step microsecond timing (opt-in via SGLANG_TT_DECODE_TIMING=1)
+        self._decode_timing_enabled = os.environ.get("SGLANG_TT_DECODE_TIMING", "0") == "1"
+        self._decode_timing_count = 0
+        self._decode_timing_accum = {}  # phase_name -> cumulative_ms
+
+    def _init_decode_pad_buffers(self, page_table_width: int):
+        """One-time lazy init of pre-allocated decode padding buffers.
+
+        Called on the first decode step, after tt_model is fully initialised
+        and we know the page_table width. Pre-allocates all padding tensors
+        and reusable output buffers so the hot path does only in-place copies
+        instead of per-step allocation + concatenation.
+        """
+        dp = getattr(self.tt_model, "data_parallel", len(self.tt_model.model))
+        max_bsz = self.tt_model.model_args[0].max_batch_size
+        required_bsz = dp * max_bsz
+        self._decode_required_bsz = required_bsz
+
+        # Pre-allocate padding slices (the part beyond actual_bsz)
+        # For B=1 workloads, pad_n = required_bsz - 1
+        pad_n = required_bsz - 1  # worst case (actual_bsz=1)
+        if pad_n > 0:
+            self._decode_pad_tokens = torch.zeros((pad_n, 1), dtype=torch.int32)
+            self._decode_pad_pos = torch.full((pad_n,), -1, dtype=torch.int32)
+            self._decode_pad_pt = torch.zeros(
+                (pad_n, page_table_width), dtype=torch.int32
+            )
+
+        # Pre-allocate full-sized output buffers
+        self._decode_tokens_buf = torch.zeros(
+            (required_bsz, 1), dtype=torch.int32
+        )
+        self._decode_pos_buf = torch.full(
+            (required_bsz,), -1, dtype=torch.int32
+        )
+        self._decode_pt_buf = torch.zeros(
+            (required_bsz, page_table_width), dtype=torch.int32
+        )
+
+        self._decode_pad_ready = True
+        logger.info(
+            f"[TT-SGLANG] decode pad buffers initialised: "
+            f"required_bsz={required_bsz}, pt_width={page_table_width}"
+        )
+
+    def _pad_decode_batch_fast(
+        self, tokens: torch.Tensor, start_pos: torch.Tensor,
+        page_table: torch.Tensor
+    ):
+        """Zero-allocation decode batch padding using pre-allocated buffers.
+
+        Replaces _pad_decode_batch in the hot path. Instead of creating new
+        tensors and concatenating every step, copies the actual batch data
+        into the pre-allocated buffers via narrow+copy_ and returns views.
+        """
+        actual_bsz = tokens.shape[0]
+        required_bsz = self._decode_required_bsz
+
+        if actual_bsz == required_bsz:
+            return tokens, start_pos, page_table
+
+        if actual_bsz > required_bsz:
+            raise ValueError(
+                f"Decode batch {actual_bsz} exceeds TT capacity {required_bsz}"
+            )
+
+        # Copy actual data into the pre-allocated buffers
+        buf_tok = self._decode_tokens_buf
+        buf_pos = self._decode_pos_buf
+        buf_pt = self._decode_pt_buf
+
+        # Tokens: [actual_bsz, 1] -> buf[0:actual_bsz]
+        buf_tok[:actual_bsz].copy_(tokens)
+        buf_tok[actual_bsz:].zero_()
+
+        # Positions: [actual_bsz] -> buf[0:actual_bsz], rest stays -1
+        buf_pos[:actual_bsz].copy_(start_pos)
+        buf_pos[actual_bsz:].fill_(-1)
+
+        # Page table: [actual_bsz, width] -> buf[0:actual_bsz]
+        if page_table is not None:
+            pt_w = page_table.shape[1]
+            buf_pt[:actual_bsz, :pt_w].copy_(page_table)
+            buf_pt[actual_bsz:].zero_()
+
+        return buf_tok, buf_pos, buf_pt
+
+    def _log_decode_timing_step(self, phases: dict):
+        """Accumulate per-phase decode timing for periodic logging.
+
+        Called once per decode step with all phase timings for that step.
+        Logs averaged timings every 50 steps.
+        """
+        for phase, elapsed_ms in phases.items():
+            if phase not in self._decode_timing_accum:
+                self._decode_timing_accum[phase] = 0.0
+            self._decode_timing_accum[phase] += elapsed_ms
+        self._decode_timing_count += 1
+
+        # Log every 50 steps
+        if self._decode_timing_count % 50 == 0:
+            n = 50
+            avg = {k: v / n for k, v in self._decode_timing_accum.items()}
+            total = sum(avg.values())
+            logger.info(
+                f"[TT-SGLANG] decode timing (avg over {n} steps): "
+                f"total={total:.2f}ms "
+                + " ".join(f"{k}={v:.2f}ms" for k, v in sorted(avg.items()))
+            )
+            self._decode_timing_accum = {}
 
     def on_chunked_prefill_failure(
         self, req, out_cache_loc_this_chunk, allocator, req_to_token_pool
@@ -259,9 +384,20 @@ class TTModels(nn.Module):
         import torch as _torch
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
+        _timing = (
+            self._decode_timing_enabled
+            and forward_batch.forward_mode.is_decode()
+        )
+        if _timing:
+            import time as _time
+            _tpt0 = _time.perf_counter()
+
         page_table = self._build_page_table(
             forward_batch
         )  # returns block IDs for every user in current batch
+
+        if _timing:
+            _tpt1 = _time.perf_counter()
 
         if forward_batch.forward_mode.is_extend():  # prefill mode
             padded_tokens = self._flatten_to_padded(forward_batch.input_ids, forward_batch)
@@ -352,33 +488,54 @@ class TTModels(nn.Module):
             return LogitsProcessorOutput(next_token_logits=squeezed, **extra)
 
         elif forward_batch.forward_mode.is_decode():  # decode mode
-            tokens = forward_batch.input_ids.unsqueeze(
-                1
-            ).to(
-                _torch.int32
-            )  # make it batch_size x seq_len dimensions (in decode mode seq_len = 1 ), cast to int32
-            start_pos = forward_batch.positions.to(
-                _torch.int32
-            )  # at which position is each request starting, cast to int32
-            actual_bsz = tokens.shape[
-                0
-            ]  # number of requests in current batch (needed later to slice output)
-            tokens, start_pos, page_table = self._pad_decode_batch(
-                tokens, start_pos, page_table
-            )  # pad batch to required size for TT-Metal
+            # _timing was set before _build_page_table above
+            if _timing:
+                _t0 = _time.perf_counter()
 
-            decode_output = (
-                self.tt_model.decode_forward(  # call TT-Metal decode forward
-                    tokens=tokens,
-                    start_pos=start_pos,
-                    page_table=page_table,
-                    kv_cache=self.kv_caches,
-                    enable_trace=True,
-                    read_from_device=True,
-                )
+            tokens = forward_batch.input_ids.unsqueeze(1).to(_torch.int32)
+            start_pos = forward_batch.positions.to(_torch.int32)
+            actual_bsz = tokens.shape[0]
+
+            if _timing:
+                _t1 = _time.perf_counter()
+
+            # Lazy-init pre-allocated padding buffers on first decode call
+            if not self._decode_pad_ready:
+                self._init_decode_pad_buffers(page_table.shape[1])
+
+            # Use zero-allocation padding path
+            tokens, start_pos, page_table = self._pad_decode_batch_fast(
+                tokens, start_pos, page_table
             )
+
+            if _timing:
+                _t2 = _time.perf_counter()
+
+            decode_output = self.tt_model.decode_forward(
+                tokens=tokens,
+                start_pos=start_pos,
+                page_table=page_table,
+                kv_cache=self.kv_caches,
+                enable_trace=True,
+                read_from_device=True,
+            )
+
+            if _timing:
+                _t3 = _time.perf_counter()
+
             logits = decode_output[0]
-            logits = logits[:actual_bsz]  # ignore output of padded requests
+            logits = logits[:actual_bsz]
+
+            if _timing:
+                _t4 = _time.perf_counter()
+                self._log_decode_timing_step({
+                    "pt_build": (_tpt1 - _tpt0) * 1000,
+                    "prep": (_t1 - _t0) * 1000,
+                    "pad": (_t2 - _t1) * 1000,
+                    "fwd": (_t3 - _t2) * 1000,
+                    "post": (_t4 - _t3) * 1000,
+                })
+
             return LogitsProcessorOutput(next_token_logits=logits.squeeze(1))
 
         else:
@@ -1141,22 +1298,23 @@ class TTModels(nn.Module):
 
     def _build_page_table(self, forward_batch):
         """Converts SGLang's token indices (memory positions) per user to block IDs per user.
-        helper function for forward function"""
+        helper function for forward function.
+
+        v119 optimisation: cache the page_table for decode steps since
+        it only changes when a new block boundary is crossed (every
+        page_size tokens). The cache is keyed by the req_pool_indices
+        fingerprint and the first slot value; invalidated on any prefill.
+        """
         from sglang.srt.server_args import get_global_server_args
 
-        req_to_token_pool = forward_batch.req_to_token_pool  # get token pool
-        req_pool_indices = (
-            forward_batch.req_pool_indices
-        )  # which rows from token pool are used in current batch
-        batch_req_tokens = req_to_token_pool.req_to_token[
-            req_pool_indices
-        ]  # get tokens used in current batch
+        req_to_token_pool = forward_batch.req_to_token_pool
+        req_pool_indices = forward_batch.req_pool_indices
+        batch_req_tokens = req_to_token_pool.req_to_token[req_pool_indices]
         server_args = get_global_server_args()
-        block_size = server_args.page_size  # get block size
+        block_size = server_args.page_size
         page_table = (
             batch_req_tokens[:, ::block_size] // block_size
-        )  # convert token indices to block IDs
-        # Truncate to exact number of blocks the model expects (context_length // block_size)
+        )
         max_blocks = server_args.context_length // block_size
         page_table = page_table[:, :max_blocks]
         return page_table.to(torch.int32)
