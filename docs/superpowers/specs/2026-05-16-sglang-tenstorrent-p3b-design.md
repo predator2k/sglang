@@ -49,41 +49,47 @@ SGLANG_TT_EXECUTION_BACKEND=tt_xla                 (new in P3b)
 
 User chooses explicitly. No auto-detection or fallback.
 
-### 3.2 Backend Interface
+### 3.2 Two Integration Patterns
 
-Both backends implement `TTExecutionBackend` (defined in `execution/base.py`):
+The codebase has two distinct integration patterns. Understanding both is critical for tt-xla design.
+
+**Pattern A: ModelRegistry path (tt_transformers_paged, the production default)**
+- `tp_worker.py` detects `tt_transformers_paged` and calls `super()._init_model_runner()` 
+- SGLang's standard `ModelRunner` loads a class from `ModelRegistry` (e.g., `TenstorrentQwenForCausalLM`)
+- That class (`TTModels` in `tt_llm.py`) owns the tt_transformers Generator, mesh device, and forward logic
+- The `TTExecutionBackend` ABC is NOT used in this path
+
+**Pattern B: ABC path (tt_transformers_single, legacy B=1)**
+- `tp_worker.py` detects non-paged mode and calls `_init_model_runner_simple()`
+- Opens a `MeshDeviceCtx`, passes `mesh_device` to a `TTExecutionBackend` subclass
+- The backend owns model loading and forward dispatch
+- Currently only used for the legacy single-request path
+
+**tt-xla follows Pattern A (ModelRegistry).** Rationale: Pattern A is the production path with full SGLang integration (batching, scheduling, sampling). Pattern B is legacy and limited to greedy sampling. The tt-xla wrapper class registers in `ModelRegistry` just like the tt_transformers classes.
 
 ```python
-class TTExecutionBackend(abc.ABC):
-    @abc.abstractmethod
-    def __init__(self, model_path, mesh_device, *, max_seq_len, max_batch_size, token_to_kv_pool) -> None: ...
-
-    @abc.abstractmethod
-    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput: ...
-
-    @abc.abstractmethod
-    def shutdown(self) -> None: ...
+class TenstorrentXLAGenericCausalLM(nn.Module):
+    """Generic wrapper: loads any HF CausalLM, compiles via torch_xla.
+    Registered in ModelRegistry. Follows the same interface as TTModels:
+    __init__(config, ...) and forward(forward_batch) -> LogitsProcessorOutput.
+    """
 ```
-
-The tt-xla backend implements this same 3-method ABC. It does NOT go through `TTModels` or `Generator` — it has its own model loading path that wraps a stock HuggingFace model compiled via `torch_xla`.
 
 ### 3.3 Model Registry for tt-xla
 
-The current `registry.py` maps HF architecture names to TT-specific model classes (`TenstorrentLlamaForCausalLM`, etc.). For tt-xla, a single generic wrapper class handles any HF model:
+The current `registry.py` maps HF architecture names to TT-specific model classes (`TenstorrentLlamaForCausalLM`, etc.). For tt-xla, a single generic wrapper class handles any HF model.
 
-```python
-class TenstorrentXLAGenericCausalLM(TTExecutionBackend):
-    """Generic wrapper: loads any HF CausalLM, compiles via torch_xla."""
-```
-
-The registry gains a fallback: if `SGLANG_TT_EXECUTION_BACKEND=tt_xla` and no architecture-specific TT class exists, use `TenstorrentXLAGenericCausalLM`. This avoids per-model registrations while still allowing architecture-specific optimizations later.
+The registry gains a fallback: when `SGLANG_TT_EXECUTION_BACKEND=tt_xla`, `register_tt_models()` registers `TenstorrentXLAGenericCausalLM` for ALL known HF architectures (via a wildcard). This avoids per-model registrations while still allowing architecture-specific optimizations later.
 
 ### 3.4 tt-xla Device Management
 
 tt-xla uses the PJRT interface, which manages its own device initialization separate from ttnn's `MeshDevice`. Key implications:
 - tt-xla and tt_transformers CANNOT share the same `mesh_device` — they use different device APIs
 - Only one backend active per server process (enforced by existing `SGLANG_TT_EXECUTION_BACKEND` switch)
-- The `TTXLAExecutionBackend.__init__` initializes the PJRT device directly, bypassing `BaseMetalDeviceRunner`
+- `tp_worker.py` needs a three-way dispatch:
+  - `tt_transformers_paged` → existing paged path (Pattern A, opens ttnn mesh via TTModels)
+  - `tt_transformers_single` → legacy simple path (Pattern B, opens ttnn mesh via MeshDeviceCtx)
+  - `tt_xla` → new XLA path (Pattern A, but skips ttnn mesh init; PJRT device init happens inside `TenstorrentXLAGenericCausalLM.__init__`)
 - Shared utilities in `tt_utils.py` are limited to: HF token setup, thread limits, device visibility env vars
 
 ### 3.5 File Map
@@ -92,9 +98,10 @@ tt-xla uses the PJRT interface, which manages its own device initialization sepa
 | Path | Change |
 |------|--------|
 | `execution/tt_xla_backend.py` | Full implementation (currently stub) |
-| `models/registry.py` | Add tt-xla fallback registration |
+| `models/registry.py` | Add tt-xla wildcard registration |
 | `models/tt_utils.py` | Extract shared device utilities (HF token, thread limits) from `BaseMetalDeviceRunner` |
-| `scripts/bootstrap_container.sh` | Reference new container image; preserve old image tag |
+| `tp_worker.py` | Add three-way dispatch: paged / simple / xla |
+| `scripts/bootstrap_container.sh` | Add `TT_METAL_IMAGE_TAG` env var support (currently hardcoded to `dev`) |
 
 **New files:**
 | Path | Responsibility |
@@ -116,7 +123,7 @@ Before rebasing, verify the target commit's compatibility:
 
 ### 4.2 Patch Audit
 
-Our fork has 20 patches on `89686ee78d`. For each, determine:
+Our fork has ~20 commits on `89686ee78d` (12 real commits + 4 legacy patch files applied at container startup + P3a-era additions). For each, determine:
 - **Drop** — upstream fixed the same issue
 - **Cherry-pick** — still needed (SGLang-specific integration code)
 - **Adapt** — needed but conflicts with upstream changes
@@ -188,13 +195,15 @@ Implement `execution/tt_xla_backend.py`:
 - `forward()` handles both prefill and decode modes via `forward_batch.forward_mode`
 - **First-request compilation latency**: document expected wait time; consider AOT compilation or graph caching if torch_xla supports it
 
-**Known limitation:** Without paged attention, tt-xla serving has no cache reuse, no prefix sharing, and fixed max sequence length allocation. Multi-turn chat and batch sizes >1 will be memory-inefficient. This is acceptable for P3b; paged attention via tt-xla is a P3c concern.
+**Known limitations:**
+- Without paged attention, tt-xla serving has no cache reuse, no prefix sharing, and fixed max sequence length allocation. Multi-turn chat and batch sizes >1 will be memory-inefficient. Paged attention via tt-xla is a P3c concern.
+- tt-xla follows Pattern A (ModelRegistry path) which supports full SGLang sampling (temperature, top-k/p, etc.). The legacy Pattern B (ABC simple path) is greedy-only and is NOT used for tt-xla.
 
 ### 5.3 First Model Serving (Week 7)
 
 Pick a model NOT in tt_transformers as the proof case:
-- Primary candidate: **Phi-4** (14B) — verify it fits in 2×P150a DRAM first (14B × 2 bytes BF16 = ~28 GB; 2× P150a = ~56 GB total; should fit without KV cache pressure)
-- Fallback: **Gemma-3-4B** (smaller, more likely to work)
+- Primary candidate: **Phi-4** (14B) — verify it fits in 2×P150a DRAM first (weights: 14B × 2 bytes BF16 = ~28 GB; contiguous KV cache at 2048 seq_len adds several GB; activations ~2 GB; total ~35 GB against ~56 GB available — tight but plausible). If memory is insufficient, reduce max_seq_len or switch to fallback.
+- Fallback: **Gemma-3-4B** (smaller, fits easily)
 
 Serve end-to-end via SGLang with tt-xla backend. Verify correct output, basic throughput, no crashes over 10 minutes.
 
@@ -210,15 +219,15 @@ One non-tt_transformers model serving correctly via SGLang + tt-xla on P150a. Th
 
 These are required for P3b exit:
 
-1. **Second tt-xla model** (stretch from Track 2): bring up one more model via tt-xla
-2. **Cross-backend comparison**: run Qwen3-8B on both tt_transformers and tt-xla, document perf/quality tradeoff
-3. **Model compatibility matrix**: table of model × backend × device -> throughput, correctness, status
-4. **6-hour soak test** on tt_transformers backend (schedule explicitly: 6h wall-clock + 2h for debugging)
+1. **Cross-backend comparison**: run Qwen3-8B on both tt_transformers and tt-xla, document perf/quality tradeoff
+2. **Model compatibility matrix**: table of model × backend × device -> throughput, correctness, status
+3. **6-hour soak test** on tt_transformers backend (schedule explicitly: 6h wall-clock + 2h for debugging)
 
 ### 6.2 Stretch Goals (Week 10+)
 
 These improve the product but are NOT required for P3b exit:
 
+- Second tt-xla model (beyond the one required in Track 2)
 - 6-hour soak test on tt-xla backend
 - DRAM prefetcher on rebased tt-metal
 - EAGLE spec decoding with BFP4
