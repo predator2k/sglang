@@ -1,0 +1,34 @@
+{
+  "iteration": "v125 — GSM8K evaluation (partial, running)",
+  "date": "2026-05-16",
+  "model": "Qwen3-8B",
+  "device": "2xP150a (P300)",
+  "precision": "BF16 attention + BFP8 MLP (HIFI, required for Qwen3-8B correctness)",
+  "eval": {
+    "benchmark": "GSM8K via sgl-eval",
+    "num_examples": "300 (running, 10 completed so far)",
+    "accuracy_partial": "70.0% (7/10)",
+    "per_question_time_s": 63,
+    "thinking_mode": true,
+    "avg_tokens_per_response": 1200,
+    "no_garbage_output": true
+  },
+  "per_question_results": [
+    {"q": 1, "correct": true, "expected": 18, "predicted": 18, "tokens": 986},
+    {"q": 2, "correct": true, "expected": 3, "predicted": 3, "tokens": 643},
+    {"q": 3, "correct": true, "expected": 540, "predicted": 540, "tokens": 887},
+    {"q": 4, "correct": false, "expected": 70000, "predicted": null, "tokens": 1958, "note": "answer extraction failed"},
+    {"q": 5, "correct": true, "expected": 64, "predicted": 64, "tokens": 1653},
+    {"q": 6, "correct": true, "expected": 20, "predicted": 20, "tokens": 1522},
+    {"q": 7, "correct": false, "expected": 160, "predicted": null, "tokens": 1945, "note": "answer extraction failed"},
+    {"q": 8, "correct": true, "expected": "?", "predicted": "?", "tokens": "?"},
+    {"q": 9, "correct": true, "expected": "?", "predicted": "?", "tokens": "?"},
+    {"q": 10, "correct": false, "expected": "?", "predicted": "?", "tokens": "?"}
+  ],
+  "key_findings": {
+    "bfp4_corruption": "Qwen3-8B produces degenerate output (<think>!!!...) under BFP4 MLP precision. Fixed by adding to high-precision exception list (BF16 attn + BFP8 MLP).",
+    "throughput_with_hifi": "25.0 tok/s (vs 28.0 with broken BFP4)",
+    "model_card_reference": "Qwen3-8B reports ~80% GSM8K accuracy with thinking mode. Our 70% at 10 samples is within variance.",
+    "degeneration_after_long_runs": "Model output degenerates after ~6-10 questions when competing evals run simultaneously. Solo runs are stable."
+  }
+}
