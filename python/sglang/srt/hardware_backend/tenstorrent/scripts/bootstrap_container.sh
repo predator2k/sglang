@@ -50,8 +50,8 @@
 
 set -euo pipefail
 
-NAME="p3a-ngram"
-IMAGE="localhost/local-tt-metal:dev"
+NAME="${TT_CONTAINER_NAME:-p3a-ngram}"
+IMAGE="localhost/local-tt-metal:${TT_METAL_IMAGE_TAG:-dev}"
 HOST_SGLANG="/home/mhnie/sglang"
 HOST_MODELS="/home/mhnie/tt-models"
 
