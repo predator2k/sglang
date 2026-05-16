@@ -10,10 +10,13 @@ interface as TTModels in tt_llm.py.
 tt-xla key constraints discovered during P3b Task 2.1:
   - torch.compile(backend="tt") is REQUIRED -- naive model.to(xla_device)
     produces inf logits.
-  - StaticCache is required for generation; DynamicCache triggers recompilation.
   - SPMD mode (xr.use_spmd()) enables multi-device tensor parallelism.
   - First invocation per unique input shape triggers JIT compilation (~9s for
     TinyLlama 1.1B on 2x P150a Blackhole).
+  - ttir.paged_update_cache is NOT supported by TT-MLIR, so StaticCache on
+    the XLA device causes scatter lowering failures. Workaround: run without
+    KV cache (use_cache=False), reprocessing the full sequence each step.
+    This is O(n^2) in sequence length but avoids the compiler limitation.
 """
 
 from __future__ import annotations
@@ -34,6 +37,10 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
     SGLang's ModelRunner calls forward(input_ids, positions, forward_batch)
     and expects a LogitsProcessorOutput.
+
+    KV cache is managed externally by tracking the full token history on CPU.
+    Each forward pass reprocesses the entire sequence (no device-side cache)
+    to avoid ttir.paged_update_cache lowering failure in TT-MLIR.
     """
 
     def __init__(
@@ -48,7 +55,6 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         import torch_xla.core.xla_model as xm
         import torch_xla.runtime as xr
         from transformers import AutoModelForCausalLM
-        from transformers.cache_utils import StaticCache
 
         self.config = config
         model_path = getattr(config, "_name_or_path", None)
@@ -66,11 +72,13 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         )
 
         # Load HF model in bfloat16, then compile with tt backend.
+        # use_cache=False: avoid StaticCache scatter ops that TT-MLIR cannot
+        # lower (ttir.paged_update_cache not implemented).
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            use_cache=True,
+            use_cache=False,
         )
         self.hf_model.eval()
         self.hf_model = self.hf_model.to(self.device)
@@ -88,42 +96,27 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         except Exception:
             self.max_cache_len = 2048
 
-        # Allocate a StaticCache on device. tt-xla requires StaticCache
-        # to avoid recompilation on every forward.
-        num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        head_dim = config.hidden_size // config.num_attention_heads
-
-        self.static_cache = StaticCache(
-            config=config,
-            max_batch_size=1,
-            max_cache_len=self.max_cache_len,
-            device="cpu",
-            dtype=torch.bfloat16,
-        )
-        self.static_cache.early_initialization(
-            batch_size=1,
-            num_heads=num_kv_heads,
-            head_dim=head_dim,
-            dtype=torch.bfloat16,
-            device="cpu",
-        )
-        # Move cache to XLA device.
-        for layer in self.static_cache.layers:
-            layer.keys = layer.keys.to(self.device)
-            layer.values = layer.values.to(self.device)
-
-        # Track current cache position for decode steps.
-        self._cache_position = 0
-
-        # Pre-allocate attention mask for max_cache_len.
-        self._full_attn_mask = torch.zeros(
-            (1, self.max_cache_len), dtype=torch.long
-        ).to(self.device)
+        # CPU-side token history for full-sequence recompute.
+        # Each forward pass sends the entire accumulated token sequence
+        # to the compiled model.
+        self._token_history: list[int] = []
 
         logger.info(
-            f"[TT-XLA] StaticCache allocated: max_cache_len={self.max_cache_len}, "
-            f"num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+            f"[TT-XLA] No-cache mode (full recompute per step), "
+            f"max_cache_len={self.max_cache_len}"
         )
+
+    def load_weights(self, weights):
+        """No-op: weights already loaded via AutoModelForCausalLM.from_pretrained.
+
+        SGLang's ModelRunner.load_model calls model.load_weights(weight_iter)
+        after __init__. For TT-XLA the HF model is fully loaded and compiled
+        during __init__, so we just drain the iterator without using it.
+        """
+        # Drain the generator to avoid resource warnings.
+        for _ in weights:
+            pass
+        logger.info("[TT-XLA] load_weights: skipped (model loaded in __init__)")
 
     def forward(
         self,
@@ -156,63 +149,59 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
         # For B=1 prefill: input_ids is [seq_len], reshape to [1, seq_len].
         seq_len = input_ids.shape[0]
-        input_2d = input_ids.unsqueeze(0).to(self.device)
 
-        # Set up cache position for this prefill.
-        cache_pos = torch.arange(0, seq_len).to(self.device)
+        # Store token history for future decode recomputes.
+        self._token_history = input_ids.cpu().tolist()
 
-        # Set attention mask: mark prompt positions as 1.
-        # Reset mask first, then set prompt tokens.
-        self._full_attn_mask = torch.zeros(
-            (1, self.max_cache_len), dtype=torch.long
-        ).to(self.device)
-        self._full_attn_mask[0, :seq_len] = 1
+        # Cast to int32: TT-metal Blackhole kernels only support
+        # Int32/UInt32/UInt16 for integer ops; torch.long (int64) fails.
+        input_2d = input_ids.unsqueeze(0).to(torch.int32).to(self.device)
 
         t0 = time.perf_counter()
         with torch.no_grad():
             output = self.compiled_model(
                 input_ids=input_2d,
-                past_key_values=self.static_cache,
-                cache_position=cache_pos,
-                use_cache=True,
-                attention_mask=self._full_attn_mask,
+                use_cache=False,
             )
         dt = time.perf_counter() - t0
-        logger.debug(f"[TT-XLA] Prefill {seq_len} tokens in {dt:.2f}s")
+        logger.info(f"[TT-XLA] Prefill {seq_len} tokens in {dt:.2f}s")
 
         # Extract last-position logits and move to CPU.
         logits = output.logits[:, -1:, :].to("cpu").float()
-
-        self._cache_position = seq_len
 
         return LogitsProcessorOutput(
             next_token_logits=logits.squeeze(0),
         )
 
     def _forward_decode(self, input_ids, positions, forward_batch):
-        """Decode: process one token at a time."""
+        """Decode: append new token and recompute full sequence."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        # For B=1 decode: input_ids is [1], reshape to [1, 1].
-        input_2d = input_ids.unsqueeze(0).to(self.device)
+        # Append the new token to history.
+        new_tokens = input_ids.cpu().tolist()
+        self._token_history.extend(new_tokens)
 
-        cache_pos = torch.tensor([self._cache_position]).to(self.device)
+        # Build full sequence tensor (int32: TT-metal Blackhole kernels
+        # only support Int32/UInt32/UInt16).
+        full_seq = torch.tensor(
+            [self._token_history], dtype=torch.int32
+        ).to(self.device)
 
         t0 = time.perf_counter()
         with torch.no_grad():
             output = self.compiled_model(
-                input_ids=input_2d,
-                past_key_values=self.static_cache,
-                cache_position=cache_pos,
-                use_cache=True,
-                attention_mask=self._full_attn_mask,
+                input_ids=full_seq,
+                use_cache=False,
             )
         dt = time.perf_counter() - t0
-        logger.debug(f"[TT-XLA] Decode step at pos {self._cache_position} in {dt:.3f}s")
+
+        seq_len = len(self._token_history)
+        if seq_len % 10 == 0:
+            logger.info(
+                f"[TT-XLA] Decode recompute at pos {seq_len} in {dt:.3f}s"
+            )
 
         logits = output.logits[:, -1:, :].to("cpu").float()
-
-        self._cache_position += 1
 
         return LogitsProcessorOutput(
             next_token_logits=logits.squeeze(0),

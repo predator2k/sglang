@@ -101,6 +101,12 @@ class TTSRTPlatform(SRTPlatform):
 
         model_registry = self._uses_model_registry()
 
+        from sglang.srt.hardware_backend.tenstorrent.execution import (
+            resolve_execution_backend_name,
+        )
+        _backend = resolve_execution_backend_name()
+        paged = _backend == "tt_transformers_paged"
+
         # Simple (P1) path hard constraints — relaxed for model-registry backends.
         if not model_registry:
             # Simple path: B=1 enforced; chunked prefill disabled; no radix
@@ -213,11 +219,12 @@ class TTSRTPlatform(SRTPlatform):
         # so this factory should never be invoked. Paged/P2a path: SGLang's
         # standard ModelRunner calls this to construct its slot-index tracker
         # (KV bytes themselves live on TT device, owned by tt_transformers).
-        # Return SGLang's default MHATokenToKVPool — it allocates CPU phantom
-        # tensors keyed by slot index. Plugin's _build_page_table converts
-        # those indices to block IDs (// block_size) before sending to ttnn.
+        # tt_xla path: model manages its own StaticCache internally, but
+        # SGLang's ModelRunner still needs a pool for memory accounting.
+        # Return MHATokenToKVPool — it allocates CPU phantom tensors.
         import os
-        if os.environ.get("SGLANG_TT_EXECUTION_BACKEND") == "tt_transformers_paged":
+        backend = os.environ.get("SGLANG_TT_EXECUTION_BACKEND", "")
+        if backend in ("tt_transformers_paged", "tt_xla"):
             from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
             return MHATokenToKVPool
         raise NotImplementedError(
@@ -238,7 +245,15 @@ class TTSRTPlatform(SRTPlatform):
         clearing) is inherited unchanged.
         """
         import os
-        if os.environ.get("SGLANG_TT_EXECUTION_BACKEND") == "tt_transformers_paged":
+        backend = os.environ.get("SGLANG_TT_EXECUTION_BACKEND", "")
+        if backend == "tt_transformers_paged":
+            from sglang.srt.hardware_backend.tenstorrent.cpu_paged_allocator import (
+                TTCpuPagedTokenToKVPoolAllocator,
+            )
+            return TTCpuPagedTokenToKVPoolAllocator
+        if backend == "tt_xla":
+            # tt_xla manages KV cache internally (StaticCache). Return the
+            # CPU-based allocator for SGLang's memory pool bookkeeping.
             from sglang.srt.hardware_backend.tenstorrent.cpu_paged_allocator import (
                 TTCpuPagedTokenToKVPoolAllocator,
             )
