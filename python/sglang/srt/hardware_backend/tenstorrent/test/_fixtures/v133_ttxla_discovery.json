@@ -1,0 +1,73 @@
+{
+  "version": "v133",
+  "date": "2026-05-16",
+  "title": "tt-xla discovery — go/no-go for P3b Track 2",
+  "decision": "GO",
+  "hardware": {
+    "device": "2x Blackhole P150a",
+    "firmware": "19.6.0",
+    "kmd": "2.8.0",
+    "motherboard": "MAG X870E TOMAHAWK WIFI (MS-7E59)"
+  },
+  "container": {
+    "image": "ghcr.io/tenstorrent/tt-xla-slim:latest",
+    "os": "Ubuntu 24.04",
+    "python": "3.12.3",
+    "torch": "2.9.1+cpu",
+    "torch_xla": "2.9.0+git44ecef3",
+    "pjrt_plugin_tt": "1.1.0",
+    "jax": "0.7.1"
+  },
+  "compatibility_notes": {
+    "python_version_mismatch": "p3a-ngram container uses Python 3.10; tt-xla wheel is cp312 only. Requires separate container (tt-xla-slim:latest).",
+    "torch_version_mismatch": "p3a-ngram has torch 2.7.1; tt-xla needs torch 2.9.1+cpu. Cannot coexist in same venv.",
+    "separate_container_required": true,
+    "ttnn_vs_pjrt": "tt-xla bundles its own tt-metal runtime via PJRT plugin. Does NOT use ttnn directly."
+  },
+  "tests": {
+    "basic_matmul": {
+      "status": "PASS",
+      "method": "xm.xla_device() + tensor ops",
+      "result": "2x3 @ 3x4 = 2x4 correct",
+      "time_s": 5.3,
+      "notes": "JIT compiled 33 kernels, ~690ms each on first run"
+    },
+    "mnist_cnn": {
+      "status": "PASS",
+      "method": "torch.compile(backend='tt') + xm.xla_device()",
+      "pcc": 0.995,
+      "max_diff": 0.015625,
+      "notes": "Official example, CNN + Conv2D + maxpool, bfloat16"
+    },
+    "gpt2_naive": {
+      "status": "FAIL (inf logits)",
+      "method": "model.to(device) without torch.compile",
+      "notes": "Naive model.to(xla_device) produces inf logits. This is NOT the supported usage pattern."
+    },
+    "tinyllama_1.1b_generation": {
+      "status": "PASS",
+      "method": "torch.compile(backend='tt') + StaticCache + SPMD",
+      "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "output": "The capital of France is Paris.",
+      "prefill_time_s": 9.64,
+      "first_decode_step_s": 9.24,
+      "cached_decode_step_s": "<0.01",
+      "compilation_overhead": "~9s per new shape (2 shapes: prefill + decode)",
+      "notes": "Correct output. Must use torch.compile(backend='tt') with StaticCache and explicit cache_position management."
+    }
+  },
+  "architecture_findings": {
+    "usage_pattern": "torch.compile(backend='tt') is REQUIRED. Naive model.to(xla_device) produces garbage.",
+    "static_cache": "transformers.cache_utils.StaticCache is required for generation loops. DynamicCache triggers recompilation.",
+    "spmd": "SPMD mode (xr.use_spmd()) enables multi-device tensor parallelism. Required for 2-device setups.",
+    "compilation": "First invocation per unique shape triggers JIT compilation (~9s for TinyLlama). Subsequent calls with same shape are cached (<0.01s).",
+    "sharding": "Model weights and KV cache can be sharded across devices via torch_xla.distributed.spmd.mark_sharding().",
+    "sglang_integration_challenge": "SGLang's ModelRunner uses model(input_ids, positions, forward_batch) signature. tt-xla needs torch.compile + StaticCache + cache_position. Bridge layer needed."
+  },
+  "next_steps": [
+    "Task 2.2: Rename _paged_mode to _uses_model_registry in tp_worker.py",
+    "Task 2.3: Create TenstorrentXLAGenericCausalLM with torch.compile(backend='tt') + StaticCache",
+    "Task 2.4: Register tt-xla models in registry.py",
+    "Task 2.5: Remove dead tt_xla_backend.py stub"
+  ]
+}
