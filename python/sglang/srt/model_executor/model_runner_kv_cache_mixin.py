@@ -422,6 +422,7 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
+                        and self.server_args.device not in ("tenstorrent", "cpu")
                     ),
                 )
         elif (
@@ -634,6 +635,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and self.server_args.device not in ("tenstorrent", "cpu")
                         ),
                     )
                 else:
@@ -659,6 +661,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and self.server_args.device not in ("tenstorrent", "cpu")
                         ),
                     )
 
