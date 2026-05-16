@@ -84,26 +84,62 @@ def _patch_model_registry_lazy_eagle3():
     logger.info("[TT-Plugin] ✓ Patched ModelRegistry.resolve_model_cls for lazy EAGLE drafts")
 
 
+def _build_tt_xla_registry():
+    """Mapping from HF architectures to the generic tt-xla wrapper class."""
+    from .tt_xla_model import TenstorrentXLAGenericCausalLM
+
+    TT_XLA_ARCHITECTURES = [
+        "LlamaForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen3ForCausalLM",
+        "MistralForCausalLM",
+        "PhiForCausalLM",
+        "Phi3ForCausalLM",
+        "GemmaForCausalLM",
+        "Gemma2ForCausalLM",
+    ]
+    return {arch: TenstorrentXLAGenericCausalLM for arch in TT_XLA_ARCHITECTURES}
+
+
 def register_tt_models():
-    """Register TT-Metal models with SGLang's model registry."""
+    """Register TT models with SGLang's model registry.
+
+    Dispatches between tt_transformers (model-specific classes) and tt_xla
+    (generic wrapper compiled via torch.compile(backend='tt')) based on
+    SGLANG_TT_EXECUTION_BACKEND.
+    """
     logger.info("[TT-Plugin] register_tt_models() called")
     try:
-        TT_MODEL_REGISTRY = _build_tt_model_registry()
-        logger.info("[TT-Plugin] Imported TT model classes successfully")
+        from sglang.srt.hardware_backend.tenstorrent.execution import (
+            resolve_execution_backend_name,
+        )
+
+        backend = resolve_execution_backend_name()
+
+        if backend == "tt_xla":
+            # tt-xla: register generic wrapper for supported architectures.
+            TT_MODEL_REGISTRY = _build_tt_xla_registry()
+            logger.info(
+                f"[TT-Plugin] Registered tt-xla for {len(TT_MODEL_REGISTRY)} architectures: "
+                f"{list(TT_MODEL_REGISTRY.keys())}"
+            )
+        else:
+            # tt_transformers: register model-specific classes.
+            TT_MODEL_REGISTRY = _build_tt_model_registry()
+            logger.info(
+                f"[TT-Plugin] Imported TT model classes successfully"
+            )
 
         # CRITICAL: Directly patch SGLang's ModelRegistry
         ModelRegistry.models.update(TT_MODEL_REGISTRY)
         logger.info(
-            f"[TT-Plugin] ✓ Registered {len(TT_MODEL_REGISTRY)} TT models: {list(TT_MODEL_REGISTRY.keys())}"
+            f"[TT-Plugin] Registered {len(TT_MODEL_REGISTRY)} TT models: "
+            f"{list(TT_MODEL_REGISTRY.keys())}"
         )
 
-        # P3a.2 EAGLE-3 draft registration. SGLang's auto-import of
-        # sglang.srt.models.llama_eagle3 fails because the TT plugin
-        # loads while sglang.srt.layers.utils.multi_platform is mid-
-        # execution (platforms init triggers TT plugin → triggers model
-        # imports → re-enters MultiPlatformOp). Defer the registration
-        # until first lookup, by which time the layers chain is settled.
-        _patch_model_registry_lazy_eagle3()
+        # P3a.2 EAGLE-3 draft registration (only relevant for tt_transformers).
+        if backend != "tt_xla":
+            _patch_model_registry_lazy_eagle3()
 
     except Exception as e:
         logger.error(
