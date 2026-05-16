@@ -121,14 +121,19 @@ class TTTpModelWorker(TpModelWorker):
         # triton.compiler.compiler.triton_key which is missing in our
         # triton-cpu install. Disable dynamo/inductor entirely so models
         # run as plain eager PyTorch.
-        try:
-            import torch._dynamo
-            torch._dynamo.config.disable = True
-            import os
-            os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-            logger.info("Disabled torch._dynamo/inductor (TT: triton-cpu lacks triton_key)")
-        except Exception as exc:
-            logger.warning(f"torch._dynamo disable failed: {exc!r}")
+        # EXCEPTION: tt-xla REQUIRES torch.compile(backend="tt") -- disabling
+        # dynamo would break compilation. Only disable for non-tt-xla backends.
+        if _backend != "tt_xla":
+            try:
+                import torch._dynamo
+                torch._dynamo.config.disable = True
+                import os
+                os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+                logger.info("Disabled torch._dynamo/inductor (TT: triton-cpu lacks triton_key)")
+            except Exception as exc:
+                logger.warning(f"torch._dynamo disable failed: {exc!r}")
+        else:
+            logger.info("Skipped torch._dynamo disable (tt-xla needs torch.compile)")
 
         # P3a.2 EAGLE-3: SGLang's tree-build + verify CUDA C++ ops live in
         # sgl_kernel (not installed on a TT-only image). Inject torch

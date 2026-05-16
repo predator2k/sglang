@@ -13,10 +13,18 @@ tt-xla key constraints discovered during P3b Task 2.1:
   - SPMD mode (xr.use_spmd()) enables multi-device tensor parallelism.
   - First invocation per unique input shape triggers JIT compilation (~9s for
     TinyLlama 1.1B on 2x P150a Blackhole).
-  - ttir.paged_update_cache is NOT supported by TT-MLIR, so StaticCache on
-    the XLA device causes scatter lowering failures. Workaround: run without
-    KV cache (use_cache=False), reprocessing the full sequence each step.
-    This is O(n^2) in sequence length but avoids the compiler limitation.
+
+PJRT plugin compiler workarounds (P3b):
+  - Blocker 1 (ttir.paged_update_cache): When use_cache=False (the naive
+    workaround for cache issues), HF calls aten.scatter_.src for internal
+    operations, which pjrt-plugin-tt 1.1.0 lowers to ttir.paged_update_cache
+    (not implemented). Workaround: use StaticCache with explicit
+    cache_position. StaticCache.update() uses index_copy_ (not scatter_),
+    which TT-MLIR lowers correctly. Proven by test_tt_xla_smoke.py.
+  - Blocker 2 (add_int UInt8): When use_cache=False, HF's internal
+    _update_causal_mask creates boolean/UInt8 tensors that Blackhole's add_int
+    kernel rejects (only Int32/UInt32/UInt16 supported). Workaround: pass
+    an explicit Int32 attention_mask so HF skips its internal mask creation.
 """
 
 from __future__ import annotations
@@ -24,8 +32,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Optional
-
 import torch
 from torch import nn
 
@@ -38,9 +44,11 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
     SGLang's ModelRunner calls forward(input_ids, positions, forward_batch)
     and expects a LogitsProcessorOutput.
 
-    KV cache is managed externally by tracking the full token history on CPU.
-    Each forward pass reprocesses the entire sequence (no device-side cache)
-    to avoid ttir.paged_update_cache lowering failure in TT-MLIR.
+    KV cache strategy: device-resident StaticCache with explicit cache_position
+    and Int32 attention_mask. This avoids both PJRT compiler blockers:
+      - StaticCache uses index_copy_ (not scatter_), so Blocker 1 is avoided
+      - Explicit Int32 mask bypasses HF's internal UInt8 mask (Blocker 2)
+    The pattern is proven by test_tt_xla_smoke.py (TinyLlama generation).
     """
 
     def __init__(
@@ -52,9 +60,9 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         super().__init__()
 
         import torch_xla
-        import torch_xla.core.xla_model as xm
         import torch_xla.runtime as xr
         from transformers import AutoModelForCausalLM
+        from transformers.cache_utils import StaticCache
 
         self.config = config
         model_path = getattr(config, "_name_or_path", None)
@@ -71,14 +79,12 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
             f"[TT-XLA] Device: {self.device}, num_devices: {self.num_devices}"
         )
 
-        # Load HF model in bfloat16, then compile with tt backend.
-        # use_cache=False: avoid StaticCache scatter ops that TT-MLIR cannot
-        # lower (ttir.paged_update_cache not implemented).
+        # Load HF model with use_cache=True (StaticCache needs it).
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            use_cache=False,
+            use_cache=True,
         )
         self.hf_model.eval()
         self.hf_model = self.hf_model.to(self.device)
@@ -96,14 +102,53 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         except Exception:
             self.max_cache_len = 2048
 
-        # CPU-side token history for full-sequence recompute.
-        # Each forward pass sends the entire accumulated token sequence
-        # to the compiled model.
-        self._token_history: list[int] = []
+        # Extract model geometry for StaticCache initialization.
+        self._num_kv_heads = config.num_key_value_heads
+        self._head_dim = config.hidden_size // config.num_attention_heads
+        self._num_layers = config.num_hidden_layers
+
+        # StaticCache with early initialization (Blocker 1 workaround).
+        # Created with device="cpu" for early_initialization, then cache
+        # tensors are moved to XLA device. StaticCache.update() uses
+        # index_copy_ (not scatter_), which TT-MLIR lowers correctly.
+        self._static_cache = StaticCache(
+            config=config,
+            max_cache_len=self.max_cache_len,
+        )
+        # Force early allocation of all layer cache tensors.
+        self._static_cache.early_initialization(
+            batch_size=1,
+            num_heads=self._num_kv_heads,
+            head_dim=self._head_dim,
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+
+        # Move cache tensors to XLA device for the compiled model.
+        # NOTE: despite the variable name, these reside on the XLA device.
+        # The key insight from the smoke test is that StaticCache with
+        # cache_position + attention_mask works on device -- it's the
+        # use_cache=False path (no explicit mask) that triggers UInt8.
+        for layer in self._static_cache.layers:
+            layer.keys = layer.keys.to(self.device)
+            layer.values = layer.values.to(self.device)
+
+        # Pre-allocate the full attention mask (Int32 -- Blocker 2 workaround).
+        # Blackhole's add_int kernel only supports Int32/UInt32/UInt16.
+        # By supplying an explicit Int32 mask, HF skips its internal
+        # _update_causal_mask which would produce UInt8 tensors.
+        self._full_attn_mask = torch.zeros(
+            (1, self.max_cache_len), dtype=torch.int32,
+        )
+
+        # Tracking for the current cache fill position.
+        self._cache_pos = 0
 
         logger.info(
-            f"[TT-XLA] No-cache mode (full recompute per step), "
-            f"max_cache_len={self.max_cache_len}"
+            f"[TT-XLA] StaticCache mode, "
+            f"max_cache_len={self.max_cache_len}, "
+            f"num_kv_heads={self._num_kv_heads}, "
+            f"head_dim={self._head_dim}"
         )
 
     def load_weights(self, weights):
@@ -117,6 +162,24 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         for _ in weights:
             pass
         logger.info("[TT-XLA] load_weights: skipped (model loaded in __init__)")
+
+    def _reset_cache(self):
+        """Reset the StaticCache and attention mask for a new sequence.
+
+        Called at the start of each prefill to clear stale KV entries.
+        Must also reset each layer's cumulative_length counter so
+        StaticLayer.update() writes to position 0 again.
+        """
+        # Zero out cache tensors in-place on device.
+        for layer in self._static_cache.layers:
+            layer.keys.zero_()
+            layer.values.zero_()
+            # Reset the internal position counter so update() starts at 0.
+            if hasattr(layer, "cumulative_length"):
+                layer.cumulative_length.zero_()
+        # Reset attention mask and position tracker.
+        self._full_attn_mask.zero_()
+        self._cache_pos = 0
 
     def forward(
         self,
@@ -144,24 +207,44 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
             return self._forward_decode(input_ids, positions, forward_batch)
 
     def _forward_prefill(self, input_ids, positions, forward_batch):
-        """Prefill: process full prompt through the model."""
+        """Prefill: process full prompt through the model with StaticCache.
+
+        Uses the same pattern proven in test_tt_xla_smoke.py:
+        1. Reset cache for new sequence
+        2. Create cache_position covering [0, seq_len)
+        3. Set attention mask bits for valid positions
+        4. Pass explicit Int32 mask + cache_position to avoid both blockers
+        """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        # For B=1 prefill: input_ids is [seq_len], reshape to [1, seq_len].
         seq_len = input_ids.shape[0]
 
-        # Store token history for future decode recomputes.
-        self._token_history = input_ids.cpu().tolist()
+        # Reset cache for new sequence.
+        self._reset_cache()
 
         # Cast to int32: TT-metal Blackhole kernels only support
         # Int32/UInt32/UInt16 for integer ops; torch.long (int64) fails.
         input_2d = input_ids.unsqueeze(0).to(torch.int32).to(self.device)
 
+        # Build cache_position: [0, 1, ..., seq_len-1]
+        cache_pos = torch.arange(0, seq_len)
+        cache_pos_dev = cache_pos.to(self.device)
+
+        # Set attention mask: 1 for all prompt positions.
+        self._full_attn_mask[:, :seq_len] = 1
+        attn_mask_dev = self._full_attn_mask.to(self.device)
+
+        # Update tracking.
+        self._cache_pos = seq_len
+
         t0 = time.perf_counter()
         with torch.no_grad():
             output = self.compiled_model(
                 input_ids=input_2d,
-                use_cache=False,
+                past_key_values=self._static_cache,
+                cache_position=cache_pos_dev,
+                use_cache=True,
+                attention_mask=attn_mask_dev,
             )
         dt = time.perf_counter() - t0
         logger.info(f"[TT-XLA] Prefill {seq_len} tokens in {dt:.2f}s")
@@ -174,31 +257,41 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         )
 
     def _forward_decode(self, input_ids, positions, forward_batch):
-        """Decode: append new token and recompute full sequence."""
+        """Decode: process single new token using StaticCache.
+
+        Incremental decode: only the new token is sent through the model;
+        KV values for prior tokens are already in the StaticCache.
+        """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        # Append the new token to history.
-        new_tokens = input_ids.cpu().tolist()
-        self._token_history.extend(new_tokens)
+        # Cast to int32 and reshape to [1, 1].
+        input_2d = input_ids.unsqueeze(0).to(torch.int32).to(self.device)
 
-        # Build full sequence tensor (int32: TT-metal Blackhole kernels
-        # only support Int32/UInt32/UInt16).
-        full_seq = torch.tensor(
-            [self._token_history], dtype=torch.int32
-        ).to(self.device)
+        # Build cache_position for the new token.
+        cache_pos = torch.tensor([self._cache_pos])
+        cache_pos_dev = cache_pos.to(self.device)
+
+        # Extend attention mask to cover the new position.
+        self._full_attn_mask[:, self._cache_pos] = 1
+        attn_mask_dev = self._full_attn_mask.to(self.device)
+
+        # Update tracking.
+        self._cache_pos += 1
 
         t0 = time.perf_counter()
         with torch.no_grad():
             output = self.compiled_model(
-                input_ids=full_seq,
-                use_cache=False,
+                input_ids=input_2d,
+                past_key_values=self._static_cache,
+                cache_position=cache_pos_dev,
+                use_cache=True,
+                attention_mask=attn_mask_dev,
             )
         dt = time.perf_counter() - t0
 
-        seq_len = len(self._token_history)
-        if seq_len % 10 == 0:
+        if self._cache_pos % 10 == 0:
             logger.info(
-                f"[TT-XLA] Decode recompute at pos {seq_len} in {dt:.3f}s"
+                f"[TT-XLA] Decode at pos {self._cache_pos} in {dt:.3f}s"
             )
 
         logits = output.logits[:, -1:, :].to("cpu").float()
