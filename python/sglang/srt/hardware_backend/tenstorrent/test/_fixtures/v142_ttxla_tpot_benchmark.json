@@ -1,0 +1,19 @@
+{
+  "version": "v142",
+  "timestamp": "2026-05-16T20:50:00",
+  "status": "INCOMPLETE_HW_RESET_NEEDED",
+  "protocol": "Single inference per container, 30 decode tokens, proven v137 pattern",
+  "max_cache_len": 64,
+  "pad_len": 32,
+  "num_decode": 30,
+  "hw": "2x P150a Blackhole FW 19.6.0",
+  "container": "ghcr.io/tenstorrent/tt-xla-slim:latest",
+  "notes": [
+    "TT devices entered bus-error state during development iteration",
+    "tt-smi -r 0,1 core dumps with Bus Error (SIGBUS)",
+    "PCI remove/rescan and kernel module reload did not recover devices",
+    "Host reboot required to recover device state",
+    "After reboot, run: bash run_ttxla_tpot_bench.sh to complete benchmark"
+  ],
+  "models": {}
+}
