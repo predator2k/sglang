@@ -1,0 +1,27 @@
+{
+  "iteration": "v123 — PERF.md uses NO prefetcher; 3-sub-device approach blocked",
+  "date": "2026-05-16",
+  "key_finding_1": "TT's simple_text_demo.py hard-codes use_prefetcher=False. ALL PERF.md numbers are measured WITHOUT the DRAM prefetcher. The prefetcher is aspirational code, not yet integrated into benchmarked paths.",
+  "key_finding_2": "tt-metal sub_device API requires programs on a single sub-device. 3-sub-device layout (sender/receiver/compute) fails with: TT_FATAL: Programs must be executed on a single sub-device",
+  "corrected_gap_analysis": {
+    "qwen3_8B": {
+      "llama_3_1_8B_P150_no_prefetcher": "33.6 tok/s (PERF.md, use_prefetcher=False)",
+      "expected_qwen3_8B_layer_adjusted": "29.9 tok/s (33.6 × 32/36 layers)",
+      "our_SGLang_P300": "28.0 tok/s",
+      "gap": "6% (NOT 5x)",
+      "note": "Qwen3-8B has 36 layers vs Llama-3.1-8B 32 layers. Architecture differences (GQA config) account for remaining 6% gap."
+    },
+    "qwen3_1_7B": {
+      "llama_3_2_1B_N300_no_prefetcher": "105.9 tok/s (PERF.md, use_prefetcher=False)",
+      "expected_qwen3_1_7B_layer_adjusted": "60.5 tok/s (105.9 × 16/28 layers)",
+      "our_SGLang_P300": "46.9 tok/s",
+      "gap": "22%",
+      "note": "Larger gap likely from: Llama-3.2-1B has more kernel tuning, different GQA config (32/8 vs 16/8)"
+    }
+  },
+  "prefetcher_attempts": {
+    "2_sub_device": "L1 CB clashes with RMSNorm on receiver/worker cores at all ring sizes (170KB-816KB)",
+    "3_sub_device": "tt-metal API limitation: programs must run on single sub-device. Can't partition receiver and compute cores.",
+    "conclusion": "DRAM prefetcher integration requires upstream tt-metal changes to support multi-sub-device program execution OR a fundamentally different L1 partitioning approach. Not achievable from the plugin side."
+  }
+}
