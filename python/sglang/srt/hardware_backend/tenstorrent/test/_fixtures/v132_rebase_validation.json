@@ -1,0 +1,47 @@
+{
+  "date": "2026-05-16",
+  "task": "1.3-1.5 — rebase-p3b branch creation, container build, validation",
+  "rebase_branch": {
+    "name": "rebase-p3b",
+    "base": "e867533fc55",
+    "patches_applied": 10,
+    "patches_summary": [
+      "soft-import AutoModelForVision2Seq",
+      "decode_forward_text fix",
+      "_skip_self_attention EAGLE flag",
+      "use_prefetcher plumbing + Qwen3 VERIFIED_MODEL_CONFIGS",
+      "rope_theta fallback",
+      "MAX_PREFILL_CHUNK_SIZE entries",
+      "Qwen3-8B high-precision exception",
+      "Qwen3-8B balanced mode (BFP4+HIFI2)",
+      "6 experimental precision modes",
+      "EAGLE-3 enablement (device.cpp + distributed_norm + model_config)"
+    ],
+    "cpp_build": "PASS — 1013/1013 targets, _ttnn.so + libtt_metal.so built",
+    "pushed_to": "origin/rebase-p3b (predator2k/tt-metal)"
+  },
+  "container_image": {
+    "tag": "localhost/local-tt-metal:p3b",
+    "size": "13.6 GB",
+    "status": "BUILT — Python imports pass (ttnn, models, sglang), build artifacts present",
+    "blocker": "JIT firmware compilation fails — ckernel_structs.h missing from tt_llk submodule, firmware_brisc.ld linker script path mismatch between new build system and base image install layout. Submodules copied in but runtime paths still misaligned.",
+    "root_cause": "tt-metal e867533 changed its JIT build infrastructure. The base image (latest-rc metalium) has installed paths at /tt-metal/build_Release/libexec/tt-metalium/... while the new build expects runtime files at /tt-metal/runtime/... The build_Release install tree and the source-tree-based JIT build coexist but reference different file layouts."
+  },
+  "overlay_test": {
+    "approach": "Mount rebase-p3b models/ onto old dev container (89686ee78d base)",
+    "result": "FAIL — WIDTH_SHARDED crash in lm_head after prefill warmup",
+    "root_cause": "Model-level patches (DRAM fallbacks for Blackhole MUX) target the e867533 code paths, which differ from 89686ee78d. Overlay approach cannot work — need matching tt-metal build."
+  },
+  "next_steps": [
+    "Option A: Build container entirely from source using Dockerfile (cmake install target, proper RPATH)",
+    "Option B: Use TT vLLM container (which is built from e867533) as base, overlay just the models",
+    "Option C: Use the upstream e867533 metalium release container if one exists with matching install layout"
+  ],
+  "completed_tasks": {
+    "1.1": "DONE — KMD/FW compat check passed",
+    "1.2": "DONE — 22 patches audited (7 CHERRY-PICK, 3 ADAPT, 8 DROP, 4 SKIP)",
+    "1.3": "DONE — rebase-p3b branch created with 10 patches, C++ build 1013/1013",
+    "1.4": "PARTIAL — Container image built but JIT runtime path mismatch blocks serving",
+    "1.5": "BLOCKED — Cannot validate until container runtime issue resolved"
+  }
+}
