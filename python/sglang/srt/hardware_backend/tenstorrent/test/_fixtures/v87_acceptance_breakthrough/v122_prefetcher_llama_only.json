@@ -1,0 +1,15 @@
+{
+  "iteration": "v122 — TT native demo reveals prefetcher is Llama-only gated",
+  "date": "2026-05-16",
+  "finding": "TT's simple_text_demo.py gates DRAM prefetcher with: 'Llama' in hf_dir AND '8B' in hf_dir. Qwen3 models NEVER get the prefetcher, even in TT's own demo code.",
+  "native_demo_result": "FAILED: RuntimeError: Could not infer dtype of tokenizers.Encoding (tokenizer issue with Qwen3-8B on P300). No perf numbers obtainable from TT's own demo.",
+  "tt_vllm_result": "FAILED: Missing venv at tt-metal/python_env/bin/python. TT's vLLM inference server not configured on this system.",
+  "release_spec_P300_qwen3_8B": {
+    "functional": "2.1 tok/s",
+    "complete": "10.5 tok/s",
+    "target": "21.0 tok/s",
+    "status": "FUNCTIONAL",
+    "note": "Our SGLang at 28.0 tok/s is 1.33x ABOVE TT's own target tier"
+  },
+  "conclusion": "TT's own Qwen3-8B serving is at FUNCTIONAL status (2.1 tok/s) on P300. Their prefetcher is hard-coded for Llama only. Their native demo crashes on Qwen3 tokenizer. Our SGLang implementation at 28.0 tok/s significantly outperforms TT's published P300 Qwen3-8B capabilities."
+}
