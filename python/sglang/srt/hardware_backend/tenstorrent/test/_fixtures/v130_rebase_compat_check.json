@@ -1,0 +1,27 @@
+{
+  "date": "2026-05-15",
+  "task": "1.1 — Pre-rebase KMD/FW compatibility check",
+  "host": {
+    "KMD": "TT-KMD 2.8.0",
+    "tt_smi": "5.0.1",
+    "pyluwen": "0.8.5",
+    "tt_umd": "0.9.4",
+    "OS": "Linux 6.17.0-23-generic",
+    "distro": "Ubuntu 24.04.4 LTS"
+  },
+  "devices": [
+    {"bus_id": "0000:01:00.0", "board_type": "p150a", "fw_bundle": "19.6.0.0", "dram": "16G", "pcie": "gen5x16"},
+    {"bus_id": "0000:06:00.0", "board_type": "p150a", "fw_bundle": "19.6.0.0", "dram": "16G", "pcie": "gen3x1"}
+  ],
+  "fork_base": "89686ee78d",
+  "rebase_target": "e867533fc55",
+  "rebase_target_umd": "0450f1be3a21cbf17adb97517038586a6a3af4c0",
+  "base_umd": "2cf326e3e5216e86dda62df93a729b9298aa8106",
+  "compatibility": {
+    "kmd_check": "PASS — tt-metal UMD has no hard KMD version enforcement, only logs. KMD 2.8.0 is recent enough.",
+    "fw_check": "PASS — FW 19.6.0.0 on-device. The previous rebase-e867533 attempt failed due to firmware header mismatch (compiled FW from base vs runtime from target). Fix: build container image FROM rebased source so FW headers match compiled objects.",
+    "umd_change": "UMD submodule moved from 2cf326e to 0450f1b. Need submodule update during rebase.",
+    "api_changes": "device.cpp compute_with_storage_grid_size() signature changed (MetalEnvAccessor removed, replaced with direct MetalContext::instance()). device.cpp patch needs ADAPT, not direct cherry-pick."
+  },
+  "verdict": "PROCEED — no host-level blockers. Container image must be built from rebased source to match firmware headers."
+}
