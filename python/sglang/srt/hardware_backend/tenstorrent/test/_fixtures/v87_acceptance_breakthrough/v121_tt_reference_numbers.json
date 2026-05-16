@@ -1,0 +1,29 @@
+{
+  "iteration": "v121 — TT reference numbers from release_model_spec.json + model_performance_reference.json",
+  "date": "2026-05-16",
+  "source": "github.com/tenstorrent/tt-inference-server (dev branch)",
+  "qwen3_1_7B": {
+    "P150_theoretical": {"ttft_ms": 8, "tput_user_tok_s": 175, "tput_total_tok_s": 5041, "tier": "theoretical"},
+    "N150_theoretical": {"tput_user_tok_s": 98, "tput_total_tok_s": 2836, "tier": "theoretical"},
+    "N300_theoretical": {"tput_user_tok_s": 191, "tput_total_tok_s": 5672, "tier": "theoretical"},
+    "our_P300_SGLang": {"tput_user_tok_s": 46.9, "decode_ms": 21.0, "sglang_overhead_pct": 1.9},
+    "gap_vs_P150_theoretical": "3.7x (175 vs 46.9)"
+  },
+  "qwen3_8B": {
+    "P150_theoretical": {"ttft_ms": 30, "tput_user_tok_s": 37, "tput_total_tok_s": 1158, "tier": "theoretical"},
+    "P100_theoretical": {"ttft_ms": 34, "tput_user_tok_s": 33, "tput_total_tok_s": 1013, "tier": "theoretical"},
+    "N150_functional": {"ttft_ms": 510, "tput_user_tok_s": 2.1, "tput_total_tok_s": 65.2},
+    "N150_target": {"ttft_ms": 51, "tput_user_tok_s": 21, "tput_total_tok_s": 652},
+    "N300_functional": {"ttft_ms": 420, "tput_user_tok_s": 4.1, "tput_total_tok_s": 130.3},
+    "N300_target": {"ttft_ms": 42, "tput_user_tok_s": 41, "tput_total_tok_s": 1303},
+    "P300_release_spec": "status=FUNCTIONAL, perf_reference=[] (no targets defined yet)",
+    "our_P300_SGLang": {"tput_user_tok_s": 27.4, "decode_ms": 36},
+    "gap_vs_P150_theoretical": "1.35x (37 vs 27.4)"
+  },
+  "interpretation": {
+    "theoretical_tier": "Aspirational targets from model_performance_reference.json. NOT measured results.",
+    "functional_tier": "Current floor from release_model_spec.json. Represents what actually works today.",
+    "gap_analysis": "The 5x gap claim may compare to theoretical targets. Our Qwen3-8B at 27.4 tok/s is actually ABOVE the N300 functional floor (4.1 tok/s) and near the N300 complete tier (20.5 tok/s). For Qwen3-1.7B, the theoretical P150 target of 175 tok/s likely requires DRAM prefetcher and model-specific kernel tuning that TT hasn't shipped yet.",
+    "dram_prefetcher_status": "MUX core mapping FIXED (row 9→5). L1 CB clash with RMSNorm persists at ALL ring sizes (170KB and 816KB both crash). Needs tt-metal sub_device API changes to partition L1 between prefetcher CB and model ops."
+  }
+}
