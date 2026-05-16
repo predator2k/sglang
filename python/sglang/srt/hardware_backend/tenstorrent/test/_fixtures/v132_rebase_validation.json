@@ -32,16 +32,29 @@
     "result": "FAIL — WIDTH_SHARDED crash in lm_head after prefill warmup",
     "root_cause": "Model-level patches (DRAM fallbacks for Blackhole MUX) target the e867533 code paths, which differ from 89686ee78d. Overlay approach cannot work — need matching tt-metal build."
   },
+  "vllm_container_test": {
+    "image": "ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-e867533-22be241",
+    "approach": "Use TT vLLM container (built from e867533) as base, overlay rebase-p3b models",
+    "result": "FAIL — ethernet core timeout during mesh device init",
+    "error": "TT_THROW: Device 0: Timed out while waiting for active ethernet core (x=30,y=25) to become active again. Minimum tt-firmware version is 18.10.0",
+    "root_cause": "Firmware compiled into e867533 does not match the on-device firmware (FW 19.6.0.0). The e867533 build's firmware interactions with the ethernet subsystem are incompatible with our P150a devices at the current flash firmware level. The old 89686ee78d build was specifically pinned to work with our FW version.",
+    "notes": [
+      "Same failure on TT's own e867533-based vLLM container — proves the issue is e867533 vs our FW, not our patches",
+      "Device reset did not help — the issue is firmware protocol mismatch, not stale device state",
+      "Error consistently hits ethernet core (x=30,y=25) which is the first fabric link core"
+    ]
+  },
   "next_steps": [
-    "Option A: Build container entirely from source using Dockerfile (cmake install target, proper RPATH)",
-    "Option B: Use TT vLLM container (which is built from e867533) as base, overlay just the models",
-    "Option C: Use the upstream e867533 metalium release container if one exists with matching install layout"
+    "Option A: Flash device firmware to version compatible with e867533 (requires TT firmware bundle update, risk: may break old container too)",
+    "Option B: Pick a tt-metal commit between 89686ee78d and e867533 that is compatible with FW 19.6.0",
+    "Option C: Backport BFP4/LOFI model_config changes to the 89686ee78d base (keep old tt-metal, add new model configs)",
+    "Option D: Contact TT support for recommended FW + tt-metal version pairing for P150a"
   ],
   "completed_tasks": {
-    "1.1": "DONE — KMD/FW compat check passed",
+    "1.1": "DONE — KMD/FW compat check passed (host-level check only; deeper FW protocol incompatibility discovered later)",
     "1.2": "DONE — 22 patches audited (7 CHERRY-PICK, 3 ADAPT, 8 DROP, 4 SKIP)",
-    "1.3": "DONE — rebase-p3b branch created with 10 patches, C++ build 1013/1013",
-    "1.4": "PARTIAL — Container image built but JIT runtime path mismatch blocks serving",
-    "1.5": "BLOCKED — Cannot validate until container runtime issue resolved"
+    "1.3": "DONE — rebase-p3b branch created with 10 patches, C++ build 1013/1013, pushed to origin",
+    "1.4": "DONE — p3b container image built (localhost/local-tt-metal:p3b), imports pass, but runtime blocked by FW mismatch",
+    "1.5": "BLOCKED — e867533 firmware incompatible with on-device FW 19.6.0; cannot validate until FW alignment resolved"
   }
 }
