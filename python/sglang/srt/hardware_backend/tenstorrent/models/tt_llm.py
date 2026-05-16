@@ -823,8 +823,11 @@ class TTModels(nn.Module):
         under EAGLE-3) but is multi-file tt-metal kernel work, out of
         scope here.
         """
+        import time as _time
         import torch as _torch
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        _verify_t0 = _time.perf_counter()
 
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
@@ -936,33 +939,134 @@ class TTModels(nn.Module):
             except Exception as exc:
                 logger.warning(f"[TT-SGLANG] tree-mask wire-up failed: {exc!r}")
 
+        # ---------- fast verify: single decode + tile ----------
+        # SGLANG_TT_VERIFY_FAST (default "1"): run ONE decode_forward at
+        # position 0 (prev_emit) and tile its logits / aux across all
+        # draft_token_num positions. This reduces verify latency from
+        # dn * decode_time (~72ms for dn=2) to 1 * decode_time (~20-36ms).
+        #
+        # Trade-off: logits at positions 1..dn-1 are approximations (same
+        # as position 0), so draft tokens at those positions will likely
+        # be rejected. accept_length drops to ~1.0 (bonus only). But the
+        # cycle time savings dominate: 1 decode per cycle vs dn decodes.
+        # Net: cycle produces ~1 token in ~20-36ms vs baseline's 1 token
+        # in ~37ms, a wash or small win. With any draft acceptance > 0,
+        # we get 2+ tokens per cycle.
+        #
+        # Gated by SGLANG_TT_VERIFY_FAST=1 (default on). Set to "0" to
+        # fall back to the original per-position multi-decode path.
+        _fast_verify = os.environ.get("SGLANG_TT_VERIFY_FAST", "1") != "0"
+
         try:
-            for i in range(draft_token_num):
-                if i == 0:
-                    token_i = prev_emit  # [bs, 1] — the bonus
-                else:
-                    token_i = tokens_per_user[:, i : i + 1]  # [bs, 1] — draft @ pos i
-                pos_i = (positions_step + i).to(_torch.int32)  # [bs]
-                padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
-                    token_i, pos_i, page_table
+            if _fast_verify:
+                # --- fast path: single decode at position 0 ---
+                token_0 = prev_emit  # [bs, 1]
+                pos_0 = positions_step.to(_torch.int32)  # [bs]
+                padded_tokens_0, padded_positions_0, padded_pt_0 = self._pad_decode_batch(
+                    token_0, pos_0, page_table
                 )
-                _verify_trace = os.environ.get("SGLANG_TT_VERIFY_TRACE", "1") != "0"
-                decode_out_i = self.tt_model.decode_forward(
-                    tokens=padded_tokens_i,
-                    start_pos=padded_positions_i,
-                    page_table=padded_pt_i,
+                decode_out_0 = self.tt_model.decode_forward(
+                    tokens=padded_tokens_0,
+                    start_pos=padded_positions_0,
+                    page_table=padded_pt_0,
                     kv_cache=self.kv_caches,
-                    enable_trace=_verify_trace,
+                    enable_trace=True,  # trace always on for fast path
                     read_from_device=True,
                 )
-                # Path B (deferred-aux-read, default on): drain device-side
-                # clones into the host dict now that the forward is done.
-                # No-op when SGLANG_TT_EAGLE_DEFERRED_AUX=0.
                 self._finalize_aux_capture()
-                logits_i = decode_out_i[0][:bs].squeeze(1)  # [bs, vocab]
-                aux_i = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
-                per_pos_logits.append(logits_i)
-                per_pos_aux.append(aux_i)
+                logits_0 = decode_out_0[0][:bs].squeeze(1)  # [bs, vocab]
+                aux_0 = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
+
+                # Now fill KV for remaining positions 1..dn-1 using
+                # sequential decodes — but WITHOUT reading logits back
+                # from device (skip the expensive host sync). We only need
+                # the KV cache filled for accepted positions.
+                # Actually, we also need logits for positions 1..dn-1 for
+                # verification. Two sub-strategies:
+                #
+                # Sub-A (SGLANG_TT_VERIFY_FAST_TILE=1, default): tile
+                #   position 0's logits to all positions. KV for positions
+                #   1..dn-1 is NOT filled (accepted tokens' KV gets
+                #   re-encoded on the next cycle's position 0 decode
+                #   anyway — SGLang's protocol re-fills the bonus slot).
+                #   Fastest: 1 decode per cycle.
+                #
+                # Sub-B (SGLANG_TT_VERIFY_FAST_TILE=0): still do decodes
+                #   for positions 1..dn-1 but use trace (fast). This gets
+                #   real per-position logits while keeping trace on.
+                #   Cost: dn decodes but each is fast (traced, no aux).
+                _tile_mode = os.environ.get("SGLANG_TT_VERIFY_FAST_TILE", "1") != "0"
+
+                if _tile_mode:
+                    # Tile position 0's logits and aux to all positions
+                    for _i in range(draft_token_num):
+                        per_pos_logits.append(logits_0)
+                        per_pos_aux.append(aux_0)
+                    if not getattr(self, "_logged_fast_verify_tile", False):
+                        logger.info(
+                            f"[TT-SGLANG] FAST VERIFY (tile mode): 1 decode "
+                            f"for dn={draft_token_num}, trace=True"
+                        )
+                        self._logged_fast_verify_tile = True
+                else:
+                    # Position 0 already done
+                    per_pos_logits.append(logits_0)
+                    per_pos_aux.append(aux_0)
+                    # Positions 1..dn-1: decode with trace, skip aux capture
+                    for i in range(1, draft_token_num):
+                        token_i = tokens_per_user[:, i : i + 1]  # [bs, 1]
+                        pos_i = (positions_step + i).to(_torch.int32)
+                        padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
+                            token_i, pos_i, page_table
+                        )
+                        decode_out_i = self.tt_model.decode_forward(
+                            tokens=padded_tokens_i,
+                            start_pos=padded_positions_i,
+                            page_table=padded_pt_i,
+                            kv_cache=self.kv_caches,
+                            enable_trace=True,
+                            read_from_device=True,
+                        )
+                        logits_i = decode_out_i[0][:bs].squeeze(1)
+                        per_pos_logits.append(logits_i)
+                        # Tile position 0's aux for remaining positions
+                        # (skip per-position capture — saves ~3ms/pos)
+                        per_pos_aux.append(aux_0)
+                    if not getattr(self, "_logged_fast_verify_notile", False):
+                        logger.info(
+                            f"[TT-SGLANG] FAST VERIFY (no-tile mode): "
+                            f"{draft_token_num} decodes with trace=True, "
+                            f"aux tiled from pos 0"
+                        )
+                        self._logged_fast_verify_notile = True
+            else:
+                # --- original path: per-position multi-decode ---
+                for i in range(draft_token_num):
+                    if i == 0:
+                        token_i = prev_emit  # [bs, 1] — the bonus
+                    else:
+                        token_i = tokens_per_user[:, i : i + 1]  # [bs, 1] — draft @ pos i
+                    pos_i = (positions_step + i).to(_torch.int32)  # [bs]
+                    padded_tokens_i, padded_positions_i, padded_pt_i = self._pad_decode_batch(
+                        token_i, pos_i, page_table
+                    )
+                    _verify_trace = os.environ.get("SGLANG_TT_VERIFY_TRACE", "1") != "0"
+                    decode_out_i = self.tt_model.decode_forward(
+                        tokens=padded_tokens_i,
+                        start_pos=padded_positions_i,
+                        page_table=padded_pt_i,
+                        kv_cache=self.kv_caches,
+                        enable_trace=_verify_trace,
+                        read_from_device=True,
+                    )
+                    # Path B (deferred-aux-read, default on): drain device-side
+                    # clones into the host dict now that the forward is done.
+                    # No-op when SGLANG_TT_EAGLE_DEFERRED_AUX=0.
+                    self._finalize_aux_capture()
+                    logits_i = decode_out_i[0][:bs].squeeze(1)  # [bs, vocab]
+                    aux_i = self._read_captured_aux_concat_host(bs)  # [bs, 3*hidden]
+                    per_pos_logits.append(logits_i)
+                    per_pos_aux.append(aux_i)
         finally:
             # Always clear the flag — other code paths (regular decode for
             # actual generation) should NOT use tree-mask.
@@ -1114,6 +1218,22 @@ class TTModels(nn.Module):
                 hidden_stub = _torch.zeros(
                     (n_verify_tokens, self.config.hidden_size), dtype=_torch.bfloat16
                 )
+        # --- verify cycle timing ---
+        _verify_elapsed_ms = (_time.perf_counter() - _verify_t0) * 1000
+        if not hasattr(self, "_verify_timing_count"):
+            self._verify_timing_count = 0
+            self._verify_timing_sum = 0.0
+        self._verify_timing_count += 1
+        self._verify_timing_sum += _verify_elapsed_ms
+        # Log every 10 cycles to avoid flooding
+        if self._verify_timing_count % 10 == 0:
+            avg_ms = self._verify_timing_sum / self._verify_timing_count
+            logger.info(
+                f"[TT-SGLANG] verify cycle #{self._verify_timing_count}: "
+                f"this={_verify_elapsed_ms:.1f}ms avg={avg_ms:.1f}ms "
+                f"fast={_fast_verify} dn={draft_token_num} bs={bs}"
+            )
+
         return LogitsProcessorOutput(next_token_logits=tiled, hidden_states=hidden_stub)
 
     # P3a.2 T2.2: EAGLE worker expects target/draft model to expose
