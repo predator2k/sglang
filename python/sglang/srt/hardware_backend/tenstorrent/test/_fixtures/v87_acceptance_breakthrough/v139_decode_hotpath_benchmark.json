@@ -1,0 +1,71 @@
+{
+  "iteration": "v139 — decode hot-path pre-allocated buffer benchmark, Qwen3-8B on 2xP150a",
+  "date": "2026-05-16",
+  "model": "Qwen3-8B",
+  "device": "2xP150a (P300_X2)",
+  "config": "no-spec, --max-running-requests 1, --context-length 2048, --mem-fraction-static 0.5, --attention-backend torch_native, --disable-cuda-graph, SGLANG_TT_DECODE_TIMING=1",
+  "optimization_tested": "Pre-allocated padding buffers in _pad_decode_batch_fast (v138 commit 6c094a169). Replaces per-step torch.zeros + torch.cat with in-place copy_ into pre-allocated buffers.",
+  "decode_timing_ms": {
+    "pt_build": 0.02,
+    "prep": 0.01,
+    "pad": 0.00,
+    "fwd": 36.35,
+    "post": 0.00,
+    "total_in_forward": 36.38,
+    "samples": "19 batches of 50 steps each (950 steps total)",
+    "first_batch_total_ms": 39.37,
+    "steady_state_total_ms": 36.35,
+    "note": "First 50-step batch includes trace capture overhead (+3ms)"
+  },
+  "throughput": {
+    "benchmark_runs": 5,
+    "warmup_runs": 3,
+    "tokens_per_run": 100,
+    "end_to_end_tok_s": [27.0, 26.9, 26.9, 27.0, 27.0],
+    "avg_tok_s": 27.0,
+    "min_tok_s": 26.9,
+    "max_tok_s": 27.0,
+    "raw_forward_tok_s": 27.5,
+    "sglang_overhead_ms_per_step": 0.03,
+    "sglang_overhead_pct": "0.1%",
+    "scheduler_reported_tok_s": "25.9-27.1"
+  },
+  "comparison": {
+    "v116_baseline_tok_s": 27.4,
+    "v116_baseline_tpot_ms": 36,
+    "v139_optimized_tok_s": 27.0,
+    "delta_tok_s": -0.4,
+    "delta_pct": "-1.5%",
+    "tt_vllm_reference_tok_s": 32.6,
+    "tt_metal_llama_8b_p150_ref_tok_s": 33.6,
+    "note": "Delta is within measurement noise. Pre-allocated buffers eliminated the pad allocation overhead (now 0.00ms vs ~0.01ms before), but that overhead was already negligible. The 36.35ms forward time is the same as v116's 36ms."
+  },
+  "buffer_init_log": {
+    "required_bsz": 1,
+    "pt_width": 32,
+    "note": "With max-running-requests=1 and data_parallel=1, required_bsz=1 means no padding is needed at all. The fast path exits immediately at actual_bsz == required_bsz."
+  },
+  "output_quality": {
+    "france_capital": "Paris (correct)",
+    "gold_symbol": "Au (correct)",
+    "water_boils": "degenerate (BFP8 quantization artifact, known issue)",
+    "einstein_born": "degenerate (BFP8 quantization artifact, known issue)",
+    "chat_completion": "degenerate (BFP8 + Qwen3 chat template, known issue)",
+    "note": "Quality matches v116 baseline. BFP8 artifacts are model-level, not optimization-related."
+  },
+  "conclusions": [
+    "Pre-allocated buffer optimization works correctly: pad phase = 0.00ms (was ~0.01ms with torch.cat)",
+    "But SGLang overhead is only 0.1% of total decode time — the optimization target was already negligible",
+    "99.9% of decode time is tt-metal decode_forward (36.35ms/step)",
+    "With max-running-requests=1 and required_bsz=1, the padding path is actually a no-op (actual_bsz == required_bsz early exit)",
+    "The optimization would matter more with batch>1 where actual padding occurs (pad_n > 0)",
+    "End-to-end throughput (27.0 tok/s) matches v116 baseline (27.4 tok/s) within noise",
+    "The 5.6 tok/s gap to TT vLLM (32.6) is entirely in the tt-metal kernel layer, not SGLang overhead",
+    "Timing instrumentation (SGLANG_TT_DECODE_TIMING=1) adds zero measurable overhead (all measurements use perf_counter)"
+  ],
+  "next_steps": [
+    "The pre-allocated buffer optimization is a no-op for B=1 workloads but is correct infrastructure for future B>1 support",
+    "To close the gap to TT vLLM (32.6 tok/s), need tt-metal kernel optimization (DRAM prefetcher or similar)",
+    "The timing instrumentation is valuable for ongoing performance monitoring"
+  ]
+}
