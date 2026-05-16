@@ -21,18 +21,36 @@ logger = logging.getLogger("sglang.srt.hardware_backend.tenstorrent")
 def activate_tt_platform() -> str | None:
     """Entry-point activation function for sglang.srt.platforms.
 
-    Returns the fully-qualified class string when ttnn is importable
-    (we're inside the tt-metal docker image); returns None on hosts
-    without ttnn so SGLang falls back to the default platform.
+    Returns the fully-qualified class string when a TT runtime is available:
+    - ttnn (tt-metal container for tt_transformers_single / tt_transformers_paged)
+    - pjrt_plugin_tt (tt-xla container for tt_xla backend)
+
+    Returns None on hosts without either, so SGLang falls back to the
+    default platform.
     """
+    has_ttnn = False
+    has_ttxla = False
     try:
         import ttnn  # noqa: F401
+        has_ttnn = True
     except ImportError:
+        pass
+    try:
+        import pjrt_plugin_tt  # noqa: F401
+        has_ttxla = True
+    except ImportError:
+        pass
+
+    if not has_ttnn and not has_ttxla:
         return None
+
     # Register Tenstorrent models with SGLang ModelRegistry (INV-6).
     # Side-effect import: models/__init__.py calls register_tt_models()
     from sglang.srt.hardware_backend.tenstorrent import models  # noqa: F401
-    logger.info("[TT-Platform] Tenstorrent model arches registered")
+    logger.info(
+        "[TT-Platform] Tenstorrent model arches registered"
+        f" (ttnn={has_ttnn}, tt-xla={has_ttxla})"
+    )
     return "sglang.srt.hardware_backend.tenstorrent.platform:TTSRTPlatform"
 
 
@@ -68,20 +86,23 @@ class TTSRTPlatform(SRTPlatform):
         # registry, so this string is never actually looked up in P1.
         return "tenstorrent"
 
-    def _is_paged_mode(self) -> bool:
-        """Return True when SGLANG_TT_EXECUTION_BACKEND resolves to paged."""
+    def _uses_model_registry(self) -> bool:
+        """Return True when backend uses SGLang ModelRegistry (paged or tt-xla)."""
         from sglang.srt.hardware_backend.tenstorrent.execution import (
             resolve_execution_backend_name,
         )
-        return resolve_execution_backend_name() == "tt_transformers_paged"
+        return resolve_execution_backend_name() in (
+            "tt_transformers_paged",
+            "tt_xla",
+        )
 
     def apply_server_args_defaults(self, server_args):
         import os
 
-        paged = self._is_paged_mode()
+        model_registry = self._uses_model_registry()
 
-        # Simple (P1) path hard constraints — relaxed for paged.
-        if not paged:
+        # Simple (P1) path hard constraints — relaxed for model-registry backends.
+        if not model_registry:
             # Simple path: B=1 enforced; chunked prefill disabled; no radix
             # cache (tt_transformers manages KV internally without page tables).
             server_args.max_running_requests = 1

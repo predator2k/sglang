@@ -3,23 +3,23 @@
 Inherits from TpModelWorker for scheduler integration. In *simple* mode
 (``tt_transformers_single``) overrides ``_init_model_runner`` to wire up
 MeshDeviceCtx + execution-backend registry + warmup + TTModelRunner stub.
-In *paged* mode (``tt_transformers_paged``) delegates entirely to the
-standard ``TpModelWorker`` init so SGLang's ModelRunner loads
-``TenstorrentLlamaForCausalLM`` via ModelRegistry; ``forward_batch_generation``
-likewise delegates to ``super()`` for paged mode.
+In *model-registry* mode (``tt_transformers_paged`` or ``tt_xla``) delegates
+entirely to the standard ``TpModelWorker`` init so SGLang's ModelRunner loads
+the appropriate model class via ModelRegistry; ``forward_batch_generation``
+likewise delegates to ``super()`` for model-registry mode.
 
 The worker MUST NOT import ttnn directly (spec §3.2 invariant #7) — all
 device interaction goes through the resolved TTExecutionBackend instance
 (simple path) or through TenstorrentLlamaForCausalLM / BaseMetalDeviceRunner
-(paged path).
+(paged path) or TenstorrentXLAGenericCausalLM (tt-xla path).
 
-Mesh-device ownership in paged mode
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Mesh-device ownership in model-registry mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ``MeshDeviceCtx`` opens the mesh with fabric + ROW dispatch (the simple-path
-approach). In paged mode the plugin's ``BaseMetalDeviceRunner.set_device()``
-(called from ``TTModels.__init__``) handles mesh opening instead.  Having both
-open the same physical devices would conflict, so in paged mode we skip
-``MeshDeviceCtx`` entirely and let the plugin own device lifecycle.
+approach). In model-registry mode the model class itself handles device
+lifecycle (BaseMetalDeviceRunner for paged, PJRT for tt-xla). Having both
+open the same physical devices would conflict, so in model-registry mode we
+skip ``MeshDeviceCtx`` entirely and let the model own device lifecycle.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ DEFAULT_TT_MAX_SEQ_LEN = 4096
 
 
 class TTTpModelWorker(TpModelWorker):
-    """TpModelWorker subclass that dispatches between simple and paged TT paths.
+    """TpModelWorker subclass that dispatches between simple and model-registry TT paths.
 
     Simple mode (SGLANG_TT_EXECUTION_BACKEND=tt_transformers_single or auto
     resolves to single):
@@ -50,10 +50,10 @@ class TTTpModelWorker(TpModelWorker):
       - self._model_runner: TTModelRunner stub (bookkeeping only)
       - forward_batch_generation: custom greedy-sampling path
 
-    Paged mode (SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged):
-      - No MeshDeviceCtx (BaseMetalDeviceRunner inside TTModels owns the mesh)
+    Model-registry mode (SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged or tt_xla):
+      - No MeshDeviceCtx (model class owns device lifecycle)
       - self._model_runner: standard SGLang ModelRunner loading
-        TenstorrentLlamaForCausalLM from ModelRegistry
+        TenstorrentLlamaForCausalLM or TenstorrentXLAGenericCausalLM from ModelRegistry
       - forward_batch_generation: delegates to super() (standard SGLang path)
     """
 
@@ -62,10 +62,17 @@ class TTTpModelWorker(TpModelWorker):
         # override knows which path to take.  super().__init__ calls
         # self._init_model_runner() via Python's MRO, so the flag must be set
         # before the super().__init__ call.
-        self._paged_mode = resolve_execution_backend_name() == "tt_transformers_paged"
+        _backend = resolve_execution_backend_name()
+        self._uses_model_registry = _backend in (
+            "tt_transformers_paged",
+            "tt_xla",
+        )
         logger.info(
             "tt_worker_dispatch",
-            extra={"paged_mode": self._paged_mode},
+            extra={
+                "backend": _backend,
+                "uses_model_registry": self._uses_model_registry,
+            },
         )
 
         # P3a.2 EAGLE-3: register draft model classes that SGLang's
@@ -140,23 +147,26 @@ class TTTpModelWorker(TpModelWorker):
         super().__init__(**kwargs)
 
     def _init_model_runner(self):
-        if self._paged_mode:
-            self._init_model_runner_paged()
+        if self._uses_model_registry:
+            self._init_model_runner_registry()
         else:
             self._init_model_runner_simple()
 
-    def _init_model_runner_paged(self):
-        """Paged path: standard SGLang ModelRunner loads TenstorrentLlamaForCausalLM.
+    def _init_model_runner_registry(self):
+        """Model-registry path: standard SGLang ModelRunner loads a TT model class.
+
+        For tt_transformers_paged: loads TenstorrentLlamaForCausalLM.
+        For tt_xla: loads TenstorrentXLAGenericCausalLM.
 
         MeshDeviceCtx is NOT opened here — device lifecycle belongs to
-        BaseMetalDeviceRunner inside TTModels.__init__ (the plugin-absorbed
-        architecture). Opening a second mesh on the same physical devices would
-        cause a ttnn double-open conflict.
+        the model class itself (BaseMetalDeviceRunner for paged, PJRT for
+        tt-xla). Opening a second mesh on the same physical devices would
+        cause a device conflict.
         """
-        logger.info("tt_worker_init_paged_start")
+        logger.info("tt_worker_init_registry_start")
         super()._init_model_runner()
         logger.info(
-            "tt_worker_init_paged_done",
+            "tt_worker_init_registry_done",
             extra={"model_runner": type(self._model_runner).__name__},
         )
 
@@ -253,10 +263,11 @@ class TTTpModelWorker(TpModelWorker):
 
         P1 doesn't batch (max_running_requests=1), so padding is trivial.
         MLX returns None here (mlx/tp_worker.py:85-86); we do the same for
-        simple mode.  Paged mode delegates to the standard ModelRunner which
-        has the real model's pad_input_ids method if it exists.
+        simple mode.  Model-registry mode delegates to the standard
+        ModelRunner which has the real model's pad_input_ids method if it
+        exists.
         """
-        if self._paged_mode:
+        if self._uses_model_registry:
             return super().get_pad_input_ids_func()
         return None
 
@@ -268,16 +279,16 @@ class TTTpModelWorker(TpModelWorker):
         is_verify=False,
         skip_attn_backend_init=False,
     ) -> "GenerationBatchResult":
-        """Dispatch between paged (standard SGLang) and simple (custom TT) paths.
+        """Dispatch between model-registry (standard SGLang) and simple (custom TT) paths.
 
-        Paged mode: delegates entirely to super() — SGLang's ModelRunner calls
-        TenstorrentLlamaForCausalLM.forward(input_ids, positions, forward_batch).
+        Model-registry mode: delegates entirely to super() — SGLang's
+        ModelRunner calls the registered model class's forward method.
 
         Simple mode: mirrors MLX (mlx/tp_worker.py:103-114) — if mwb is not
-        None, take our custom greedy path; else fall back to parent (None →
+        None, take our custom greedy path; else fall back to parent (None ->
         speculative decoding scratch path; never reached in P1).
         """
-        if self._paged_mode:
+        if self._uses_model_registry:
             return super().forward_batch_generation(
                 model_worker_batch,
                 forward_batch,
