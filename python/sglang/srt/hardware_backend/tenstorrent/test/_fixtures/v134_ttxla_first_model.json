@@ -1,0 +1,45 @@
+{
+  "version": "v134",
+  "date": "2026-05-16",
+  "title": "tt-xla first model serving via smoke test",
+  "hardware": {
+    "device": "2x Blackhole P150a",
+    "firmware": "19.6.0",
+    "kmd": "2.8.0"
+  },
+  "container": {
+    "image": "ghcr.io/tenstorrent/tt-xla-slim:latest",
+    "python": "3.12.3",
+    "torch": "2.9.1+cpu",
+    "pjrt_plugin_tt": "1.1.0"
+  },
+  "smoke_test_results": {
+    "basic_matmul": {
+      "status": "PASS",
+      "details": "4x8 @ 8x4 = 4x4, all finite values"
+    },
+    "tinyllama_1.1b_generation": {
+      "status": "PASS",
+      "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "prompt": "The capital of France is",
+      "output": "The capital of France isParis.\n\n2.",
+      "prefill_time_s": 9.6,
+      "decode_cached_time_s": "<0.01",
+      "num_devices": 2,
+      "method": "torch.compile(backend='tt') + StaticCache + SPMD"
+    }
+  },
+  "integration_status": {
+    "sglang_server_launch": "BLOCKED — tt-xla container (Python 3.12 / torch 2.9.1) cannot install SGLang's editable package (Rust edition 2024 requires newer cargo). Full server integration deferred to P3b Track 2.6b when a combined container image is built.",
+    "model_wrapper_created": true,
+    "registry_conditional_dispatch": true,
+    "execution_stub_removed": true,
+    "tp_worker_updated": true
+  },
+  "track2_gate": {
+    "criterion_1_model_serving": "PARTIAL — TinyLlama serves correct output via smoke test; full SGLang server launch requires combined container",
+    "criterion_2_throughput": "UNKNOWN — no server-level tok/s measurement yet",
+    "criterion_3_no_garbage": "PASS — output correct, no garbage tokens",
+    "criterion_4_smoke_test": "PASS"
+  }
+}
