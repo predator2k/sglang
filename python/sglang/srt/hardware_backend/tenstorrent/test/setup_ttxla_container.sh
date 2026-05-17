@@ -21,6 +21,25 @@ docker run -d --name "$CONTAINER_NAME" \
 echo "[3/4] Installing sglang (no-deps, preserves torch 2.9.1+cpu)..."
 docker exec "$CONTAINER_NAME" pip install -e /sglang/python --no-deps --no-build-isolation -q
 
+echo "[3a/4] Installing torchvision (matched to torch 2.9.1+cpu) with --no-deps..."
+docker exec "$CONTAINER_NAME" pip install --no-deps -q \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    torchvision==0.24.0
+
+echo "[3b/4] Installing runtime deps for sglang server + bench_serving (no-deps, lock-safe)..."
+docker exec "$CONTAINER_NAME" pip install --no-deps -q \
+    orjson multiprocess pyarrow dill xxhash fsspec \
+    IPython traitlets jedi prompt_toolkit pygments stack_data executing \
+    pure_eval matplotlib_inline decorator asttokens wcwidth
+
+echo "[3c/4] Installing runtime deps that pull transitive deps (server framework, datasets, CI tooling)..."
+docker exec "$CONTAINER_NAME" pip install -q \
+    fastapi uvicorn msgpack msgspec prometheus-client pyzmq sentencepiece \
+    tiktoken openai einops blobfile llguidance outlines interegular modelscope \
+    partial_json_parser pybase64 datasets scipy aiohttp anthropic gguf \
+    python-multipart setproctitle psutil packaging pydantic requests pillow \
+    soundfile pytest
+
 echo "[4/4] Verifying..."
 docker exec "$CONTAINER_NAME" python3 -c "
 import torch, torch_xla, sglang
