@@ -177,6 +177,50 @@ A simpler heuristic worth trying: check if the cache operand traces back to a `s
 - ✗ B.2 patch needs smarter detection logic (current hasOneUse() guard insufficient for V2 case)
 - Next step: smarter B.2 (e.g., detect scatter-from-clone) — or revisit whether V2 is the right way to express A1 K=4
 
+### Important finding about TTMLIR_SOURCE_DIR_OVERRIDE
+
+tt-xla `470f0fad` (canonical wheel's tt-xla) has **NO** `TTMLIR_SOURCE_DIR_OVERRIDE` support — that knob was added in a later tt-xla commit. At `470f0fad`, the `ExternalProject_Add(tt-mlir ...)` always clones from `https://github.com/tenstorrent/tt-mlir.git` at `${TT_MLIR_VERSION}`. So our `tt-mlir-sglang` fork's patches were being IGNORED by the canonical-tt-xla build.
+
+To apply a patch in this configuration:
+
+```bash
+# After the first `ninja -C build-local` clones tt-mlir into
+# /tt-xla/third_party/tt-mlir/src/tt-mlir/, sed-patch directly:
+docker exec tt-xla-eval bash -c '
+F=/tt-xla/third_party/tt-mlir/src/tt-mlir/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+# ... apply patch via sed or git apply ...
+rm -f /tt-xla/third_party/tt-mlir/src/tt-mlir/build/lib/Conversion/StableHLOToTTIR/CMakeFiles/obj.TTMLIRStableHLOToTTIR.dir/StableHLOToTTIRPatterns.cpp.o
+export TTMLIR_TOOLCHAIN_DIR=/opt/tt-mlir-toolchain
+ninja -C /tt-xla/third_party/tt-mlir/src/tt-mlir/build -j $(nproc)
+cmake --install /tt-xla/third_party/tt-mlir/src/tt-mlir/build --component SharedLib
+# Force tt-xla relink:
+touch /tt-xla/third_party/tt-mlir/src/tt-mlir-stamp/tt-mlir-build
+cd /tt-xla && ninja -C build-local
+'
+```
+
+### Failed attempts on B.2 logic
+
+Both versions of the B.2 patch were tested:
+
+1. **`hasOneUse()` guard** — skip the cache pattern when scatter input has >1 user. V2 has a single-user clone, so guard doesn't fire and the pattern still fails downstream.
+
+2. **Always-fail (blanket disable)** — return `mlir::failure()` unconditionally. **This breaks prefill** because HF StaticCache's in-place `index_copy_` also generates a scatter that matches `CacheFillUpdatePattern`. With the pattern disabled, that scatter falls through to the generic `ttnn.scatter` path, which **doesn't work** at prefill shape `[1, n_heads, INPUT_LEN, head_dim]` (was: `TT_THROW @ kernel.cpp:89`).
+
+So B.2 needs to **discriminate** between: (a) the V2 clone-style scatter (defer to generic) and (b) the in-place prefill scatter (keep using the fast-path). The difference at MLIR level is non-trivial — both have block-arg cache_positions; the input tensor's shape might differ (q_len=1 for decode-clone vs q_len=seq_len for prefill).
+
+A shape-based heuristic might work: only defer when `updates.shape[2] == 1` (decode q_len=1 scatter into multi-user cache). This was the v1 hasOneUse logic, but `updates.shape[2] == 1` is also true for in-place decode where the cache is mutated. So this still doesn't discriminate.
+
+The fundamentally correct approach is probably to make `ttnn.paged_update_cache` accept our shape — i.e., fix the underlying lowering, not work around it at the pattern matcher. That's deeper into tt-mlir / tt-metal than I can investigate here.
+
+### End state (2026-05-17)
+
+- `/home/mhnie/tt-mlir-sglang/` — fork at `tenstorrent-p1`, HEAD `e62086947` (B.2 v2 "always-fail"). NOT a working B.2.
+- `/home/mhnie/tt-xla/` — restored to `main` HEAD `392e200b9` (after Path 2 checkout to `470f0fad`).
+- Container `tt-xla-eval` — restored to canonical `pjrt-plugin-tt 1.1.0`. Workstream A bit-exact CI PASSES.
+- `/opt/tt-mlir-toolchain/` — built toolchain preserved (5.1 GB).
+- All build infrastructure documented + reproducible.
+
 - ✓ Container recreated with bind-mounts for `tt-mlir-sglang`, `tt-xla`, `tt-mlir-toolchain`
 - ✓ Build tools installed: cmake 3.28, clang/clang++-17, ninja, ccache, libzstd-dev, libprotobuf-dev, patchelf, libfmt9, libopenmpi3
 - ✓ tt-mlir-sglang rebuilt inside container at `/tt-mlir-sglang/build/` (790/790 steps)
