@@ -123,6 +123,60 @@ Path 3 is the most surgical — it doesn't pull in a new tt-metal. But it requir
 
 For this work cycle, **Workstream A is the shippable outcome.**
 
+---
+
+## Path 2 attempt (2026-05-17 21:00-22:00) — BUILD PIPELINE SUCCESS
+
+Rebased tt-mlir-sglang from `eb9005fa` to **`f3ddbfb6`** (the canonical wheel's tt-mlir, pinning tt-metal at `90c914ef`). Also checked out `/home/mhnie/tt-xla` to `470f0fad88fb9c2a0a94394ec35b0bfa8c82e743` (the canonical wheel's tt-xla — newer HEAD `392e200b9` uses `BFPDtypeParser.h` which was introduced after f3ddbfb6).
+
+Re-applied 3 patches via `git format-patch | git am`:
+- `f73775529` — B.2 hasOneUse() guard
+- `95d656c8f` — build helper
+- `8eb2e5b46` — TT_RUNTIME_ENABLE_DISTRIBUTED default OFF
+
+Plus an additional fix uncovered:
+- `4899ff291` — replace `"LINKER:${TTNN_LIBRARY_PATH}"` with direct path in `tools/tt-alchemist/csrc/python_runner/CMakeLists.txt` (CMake's `LINKER:` shim inside `target_link_libraries` is malformed; ld interprets it as `-lLINKER:` library name).
+
+**Build succeeded end-to-end** inside container against canonical tt-metal commit `90c914ef`. Plugin: 1.34 MB `pjrt_plugin_tt.so` at `/tt-xla/build-local/pjrt_implementation/src/`. Metadata:
+
+```
+Version: 0.1.260428+dev.470f0fad8
+commit=470f0fad88fb9c2a0a94394ec35b0bfa8c82e743
+tt-mlir-commit=f3ddbfb6b0eab2c2ec65fe45ec2347cc6ebedaca
+tt-metal-commit=90c914ef258b5cc92ad172f3604b784ec77253ca
+```
+
+This **matches the canonical wheel's commit triple exactly** — same tt-xla, tt-mlir, AND tt-metal. The only difference is our 4 patches on tt-mlir-sglang's tenstorrent-p1 branch.
+
+### Runtime validation
+
+- **CI test `test_t2_1_functional_cache.py`: PASSED** with the new plugin (bit-exact vs StaticCache, 5-token decode).
+- **`probe_t2_1_v3_writeops.py` V1 (torch.where): PASSES** (steady-state TPOT min 55ms).
+- **`probe_t2_1_v3_writeops.py` V2 (clone + index_copy_): still FAILS** with `loc("scatter.6929"): error: failed to legalize operation 'ttir.paged_update_cache'`.
+
+### B.2 patch logic problem
+
+The original B.2 patch checks `scatterOp.getInputs()[0].hasOneUse()`. For V2 (clone+index_copy_), `inputs()[0]` is the **clone**, which has just 1 user (the index_copy_). So the guard returns false and the pattern proceeds. The failure is downstream — `paged_update_cache` verifier or its TTNN lowering — not the user-count check.
+
+The hasOneUse() guard would correctly skip the pattern when the cache is shared (e.g., torch.where path), but V2 specifically creates a fresh clone, so the cache is genuinely single-user.
+
+**The right B.2 logic** likely needs to look at where the cache value originates: if it's a tensor that the surrounding model also READS via attention (not just writes via update), defer. That's tricky to detect at the StableHLO level because the read and write may be in different functions / dispatch boundaries.
+
+A simpler heuristic worth trying: check if the cache operand traces back to a `stablehlo.copy` (which is what `clone()` lowers to). If yes, this is the V2 case → defer to generic scatter.
+
+### What Path 2 unblocked
+
+- ABI integration: plugin loads + runs without symbol errors, MPI hangs, or kernel-level `TT_THROW`
+- Build pipeline reproducible: `cd /tt-xla && cmake -G Ninja -B build-local -DTTMLIR_SOURCE_DIR_OVERRIDE=/tt-mlir-sglang && ninja -C build-local`
+- Path 1 (use non-slim dev container) is no longer needed — we can build in the slim container itself
+
+### Status
+
+- ✓ Build infrastructure proven on canonical tt-metal pin
+- ✓ Workstream A unchanged, runs cleanly on the rebuilt plugin
+- ✗ B.2 patch needs smarter detection logic (current hasOneUse() guard insufficient for V2 case)
+- Next step: smarter B.2 (e.g., detect scatter-from-clone) — or revisit whether V2 is the right way to express A1 K=4
+
 - ✓ Container recreated with bind-mounts for `tt-mlir-sglang`, `tt-xla`, `tt-mlir-toolchain`
 - ✓ Build tools installed: cmake 3.28, clang/clang++-17, ninja, ccache, libzstd-dev, libprotobuf-dev, patchelf, libfmt9, libopenmpi3
 - ✓ tt-mlir-sglang rebuilt inside container at `/tt-mlir-sglang/build/` (790/790 steps)
