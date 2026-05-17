@@ -183,6 +183,13 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
             f"head_dim={self._head_dim}"
         )
 
+        # Watermark observability (A.5 in spec v5.3).
+        # _first_shape_seen logs once per new (kind, padded_input_len) tuple — combined
+        # with the stale-path detector for any future re-introduction of dynamo.reset
+        # this replaces the discredited in-process torch._dynamo.utils.counters gate
+        # (which fails when SGLang spawns the model in a subprocess).
+        self._first_shape_seen: set[tuple[str, int]] = set()
+
     def load_weights(self, weights):
         """No-op: weights already loaded via AutoModelForCausalLM.from_pretrained.
 
@@ -283,6 +290,7 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
         # Right-pad input to a fixed bucket for JIT graph reuse.
         pad_len = self._get_pad_bucket(seq_len)
+        self._watermark_shape("prefill", pad_len)
 
         input_padded = torch.zeros(pad_len, dtype=torch.int32)
         input_padded[:seq_len] = input_ids.to(torch.int32)
@@ -332,6 +340,7 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         Incremental decode: only the new token is sent through the model;
         KV values for prior tokens are already in the StaticCache.
         """
+        self._watermark_shape("decode", 1)
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         t_start = time.perf_counter()
@@ -375,4 +384,14 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
         return LogitsProcessorOutput(
             next_token_logits=logits.squeeze(0),
+        )
+
+    def _watermark_shape(self, kind: str, padded_input_len: int) -> None:
+        """Log a `first_shape_seen` watermark when (kind, padded_input_len) is new this process."""
+        key = (kind, padded_input_len)
+        if key in self._first_shape_seen:
+            return
+        self._first_shape_seen.add(key)
+        logger.info(
+            f"[TT-XLA] WATERMARK first_shape_seen kind={kind} padded_input_len={padded_input_len}"
         )
