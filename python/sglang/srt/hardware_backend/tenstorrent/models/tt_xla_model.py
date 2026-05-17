@@ -190,6 +190,14 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         # (which fails when SGLang spawns the model in a subprocess).
         self._first_shape_seen: set[tuple[str, int]] = set()
 
+        # Phase 2a (v5.3 spec): pre-warm every prefill bucket + decode shape.
+        # Set SGLANG_TT_DISABLE_PREWARM=1 to skip (useful for fast iteration).
+        if int(os.environ.get("SGLANG_TT_DISABLE_PREWARM", "0")) != 1:
+            from sglang.srt.hardware_backend.tenstorrent.models.tt_xla_warmup import (
+                tt_xla_prewarm,
+            )
+            tt_xla_prewarm(self)
+
     def load_weights(self, weights):
         """No-op: weights already loaded via AutoModelForCausalLM.from_pretrained.
 
