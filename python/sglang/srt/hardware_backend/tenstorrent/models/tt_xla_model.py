@@ -138,19 +138,35 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         # Created with device="cpu" for early_initialization, then cache
         # tensors are moved to XLA device. StaticCache.update() uses
         # index_copy_ (not scatter_), which TT-MLIR lowers correctly.
+        # Phase 3b (v5.3 spec): A4-aligned bs=N lockstep batching.
+        # Real continuous batching (mixed cache_positions) needs paged KV layout
+        # and is out of scope. This path is benchmark-shape only.
+        try:
+            self.max_batch_size = int(
+                os.environ.get(
+                    "SGLANG_TT_MAX_BATCH",
+                    str(getattr(server_args, "max_running_requests", 1) or 1),
+                )
+            )
+        except Exception:
+            self.max_batch_size = 1
+        logger.info(
+            f"[TT-XLA] max_batch_size={self.max_batch_size} (A4 lockstep)"
+        )
+
         from sglang.srt.hardware_backend.tenstorrent.models.tt_functional_cache import (
             TTFunctionalCache,
         )
         self._static_cache = TTFunctionalCache(
             config=config,
-            max_batch_size=1,  # bs > 1 wired in Phase 3b
+            max_batch_size=self.max_batch_size,
             max_cache_len=self.max_cache_len,
             device="cpu",
             dtype=torch.bfloat16,
         )
         # Force early allocation of all layer cache tensors.
         self._static_cache.early_initialization(
-            batch_size=1,
+            batch_size=self.max_batch_size,
             num_heads=self._num_kv_heads,
             head_dim=self._head_dim,
             dtype=torch.bfloat16,
@@ -169,7 +185,7 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         # By supplying an explicit Int32 mask, HF skips its internal
         # _update_causal_mask which would produce UInt8 tensors.
         self._full_attn_mask = torch.zeros(
-            (1, self.max_cache_len), dtype=torch.int32,
+            (self.max_batch_size, self.max_cache_len), dtype=torch.int32,
         )
 
         # Tracking for the current cache fill position.
@@ -349,6 +365,18 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         KV values for prior tokens are already in the StaticCache.
         """
         self._watermark_shape("decode", 1)
+
+        if self.max_batch_size > 1:
+            # Lockstep invariant (Phase 3b): all sequences must share cache_position.
+            # SGLang's continuous batcher will violate this; fail fast with clear message.
+            if forward_batch.seq_lens.shape[0] > 1:
+                assert (
+                    (forward_batch.seq_lens == forward_batch.seq_lens[0]).all().item()
+                ), (
+                    "tt-xla A4-aligned batching requires lockstep seq_lens; "
+                    "continuous batching with mixed positions is out of scope. "
+                    f"Got seq_lens={forward_batch.seq_lens.tolist()}"
+                )
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         t_start = time.perf_counter()
