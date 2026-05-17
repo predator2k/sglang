@@ -80,9 +80,48 @@ bash /home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh
 - `/home/mhnie/tt-xla/build-local/` — built tt-xla with new `pjrt_plugin_tt.so` (host-built, ABI-drifted)
 - Container `tt-xla-eval` — recreated with extra mounts (`/tt-mlir-sglang`, `/tt-xla`, `/opt/tt-mlir-toolchain`) + build tools (cmake, clang-17, lld, ninja, ccache, libzstd-dev, libprotobuf-dev, etc.) + sglang server runtime deps. Workstream A still passes the bit-exact CI test on this configuration.
 
-## Container-rebuild attempt log (2026-05-17 19:25-20:00)
+## Container-rebuild full pipeline attempt (2026-05-17 19:25-20:30)
 
-Path 1 from the spec was attempted — build `pjrt-plugin-tt` INSIDE the container so it links against the locked torch_xla 2.9.0+git44ecef3.
+Two passes attempted Path 1 ("build inside container"):
+
+### Pass A — manual stepwise build (19:25-19:50)
+
+Built `tt-mlir-sglang` directly inside container at `/tt-mlir-sglang/build`. Hit cascading missing-generated-headers chain (TableGen `.h.inc` files for shardy + stablehlo).
+
+### Pass B — tt-xla's own ExternalProject pipeline (20:00-20:30)
+
+Let tt-xla's `ExternalProject_Add(tt-mlir ...)` build everything end-to-end with `TTMLIR_SOURCE_DIR_OVERRIDE=/tt-mlir-sglang`. This auto-handles TableGen generation. Steps:
+
+- ✓ Installed all build deps in container: cmake/clang-17/lld/ninja/ccache, libzstd-dev, libprotobuf-dev, patchelf, libcapstone-dev, libxxhash-dev, libnuma-dev, libhwloc-dev, libopenmpi-dev, openmpi-bin, openmpi-common, libgtest-dev, libssl-dev, zlib1g-dev, libffi-dev
+- ✓ Installed sglang server runtime deps
+- ✓ Provisioned SFPI 7.47.0 (downgrade from 7.48 — tt-metal pin)
+- ✓ Patched `tt-mlir-sglang/CMakeLists.txt` to `TT_RUNTIME_ENABLE_DISTRIBUTED OFF` by default (committed at `571063ab0`) — to avoid OpenMPI build/runtime fragility
+- ✓ Full pipeline build succeeded: tt-mlir-sglang → install at `/tt-xla/third_party/tt-mlir/install/` → tt-xla → `pjrt_plugin_tt.so` (1.4 MB, links cleanly against `/lib/x86_64-linux-gnu/libprotobuf.so.32` and our `/tt-xla/third_party/tt-mlir/install/lib/libTTMLIR{Compiler,Runtime}.so`)
+- ✓ Tiny `torch.compile(backend="tt")` smoke test PASSES inside container
+- ✗ `test_t2_1_functional_cache.py` and `probe_t2_1_v3_writeops.py` FAIL at runtime:
+  - editable-install wrapper → `torch._dynamo.exc.InternalTorchDynamoError: TypeError: eval()` (guard creation crash)
+  - canonical-wrapper + swap-only-libs → `RuntimeError: TT_THROW @ /tt-mlir-sglang/.../kernel.cpp:89` during prefill execute, then `LogMessageFatal: ComputationClient already initialized` during cleanup
+
+### Root cause analysis
+
+The new build picks up tt-metal commit `d5a16537336229bee54fd4a6d8bd54c492abc7d1` (newer; what the eb9005fa tt-mlir pin specifies). The slim container's canonical `pjrt-plugin-tt 1.1.0` wheel was built against tt-metal commit `90c914ef258b5cc92ad172f3604b784ec77253ca` (older). The container's `torch_xla 2.9.0+git44ecef3` was validated against the OLDER tt-metal. The newer tt-metal pulls in kernel-level changes that haven't been validated against this torch_xla; baseline prefills now `TT_THROW` even without B.2-relevant code paths.
+
+### What works at this snapshot
+
+- `/home/mhnie/tt-mlir-sglang/` — fork at branch `tenstorrent-p1` with B.2 patch (`c1bae0bf2`) + distributed-runtime-off patch (`571063ab0`)
+- `/opt/tt-mlir-toolchain/` — built LLVM/MLIR toolchain (5.1 GB)
+- `/home/mhnie/tt-xla/build-local/pjrt_implementation/src/pjrt_plugin_tt.so` — newly-built plugin (1.4 MB, ABI-matched to container's torch_xla per ldd, NOT runtime-validated)
+- `/home/mhnie/tt-xla/third_party/tt-mlir/install/` — tt-mlir install tree consumed by tt-xla build
+
+### Next attempt should
+
+1. **Use a Tenstorrent development container** (`tt-xla` non-slim) instead of `tt-xla-slim`. The dev image has matching dev environment + the tt-metal pin tt-xla's pin expects, fully built end-to-end.
+2. **Pin tt-mlir-sglang to a commit whose tt-metal pin is the SAME as `tt-xla-slim:latest`'s canonical**: pull tt-metal commit `90c914ef258b5cc92ad172f3604b784ec77253ca` instead of the newer one. This is a tt-mlir rebase to an older base that includes B.2 patches behaviorally.
+3. **Build a custom slim image** — start FROM the canonical slim, install build deps, build only `libTTMLIRCompiler.so` and `libTTMLIRRuntime.so` (NOT tt-metal — keep that canonical), and replace those libs.
+
+Path 3 is the most surgical — it doesn't pull in a new tt-metal. But it requires careful CMake config of tt-mlir-sglang to consume the canonical tt-metal install rather than building its own. This is multi-day work.
+
+For this work cycle, **Workstream A is the shippable outcome.**
 
 - ✓ Container recreated with bind-mounts for `tt-mlir-sglang`, `tt-xla`, `tt-mlir-toolchain`
 - ✓ Build tools installed: cmake 3.28, clang/clang++-17, ninja, ccache, libzstd-dev, libprotobuf-dev, patchelf, libfmt9, libopenmpi3
