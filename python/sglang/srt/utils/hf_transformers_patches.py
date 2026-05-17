@@ -191,8 +191,21 @@ def _patch_flash_attn_availability():
     ``is_flash_attn_2_available()`` return True, but lacks the v2 API.
     Remote model code (e.g. Kimi-VL) guarded by that check will crash.
 
+    Also ensures ``PACKAGE_DISTRIBUTION_MAPPING`` contains a ``flash_attn``
+    key.  transformers >=5.6 calls ``is_flash_attn_4_available()`` at
+    module-import time which accesses that key without checking existence,
+    raising ``KeyError`` when flash-attn is not installed.
+
     TODO(upstream): model authors should check for specific API symbols.
     """
+    # Populate PACKAGE_DISTRIBUTION_MAPPING before any transformers
+    # submodule import can trigger is_flash_attn_*_available().
+    try:
+        from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
+        PACKAGE_DISTRIBUTION_MAPPING.setdefault("flash_attn", ["flash-attn"])
+    except Exception:
+        pass
+
     try:
         import flash_attn as _fa
 

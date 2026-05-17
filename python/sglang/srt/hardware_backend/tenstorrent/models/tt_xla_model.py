@@ -27,13 +27,18 @@ PJRT plugin compiler workarounds (P3b), HW-validated 2026-05-16:
     kernel rejects (only Int32/UInt32/UInt16 supported). Workaround: pass
     an explicit Int32 attention_mask so HF skips its internal mask creation.
 
+  - Blocker 3 (position_ids device mismatch): transformers >=5.6 computes
+    position_ids internally via past_seen_tokens (CPU) + arange(device=XLA),
+    which torch.compile rejects as a cross-device add. Workaround: pass
+    explicit position_ids on XLA device so HF skips internal computation.
+
 Known limitations discovered during HW validation:
-  - pjrt-plugin-tt 1.1.0 triggers INTERNAL error 13 for large StaticCache
-    sizes (>64). The workaround pattern is valid but requires small cache.
   - torch.compile graph retracing after cache mutation (zero_) fails with
     error 13; multi-sequence serving needs a single compile trace.
   - JIT compilation takes ~9s per unique input shape (prefill vs decode);
     second invocation with cached graph runs in ~0.001s per token.
+  - StaticCache.layers[*].cumulative_length stays on CPU; tt_torch backend
+    auto-moves it, but logs warnings. Harmless.
 """
 
 from __future__ import annotations
@@ -43,6 +48,15 @@ import os
 import time
 import torch
 from torch import nn
+
+# transformers 5.6.0 raises KeyError('flash_attn') when flash-attn is
+# not installed, which breaks tt_torch imports.  Populate the mapping
+# before any transformers submodule touches it.
+try:
+    from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
+    PACKAGE_DISTRIBUTION_MAPPING.setdefault("flash_attn", ["flash-attn"])
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +102,14 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
             f"[TT-XLA] Device: {self.device}, num_devices: {self.num_devices}"
         )
 
-        # Load HF model with use_cache=True (StaticCache needs it).
+        # Load HF model: use_cache=True (StaticCache needs it),
+        # attn_implementation="eager" (SDPA corrupts device state on tt-xla).
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             use_cache=True,
+            attn_implementation="eager",
         )
         self.hf_model.eval()
         self.hf_model = self.hf_model.to(self.device)
@@ -113,7 +129,9 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
         # Extract model geometry for StaticCache initialization.
         self._num_kv_heads = config.num_key_value_heads
-        self._head_dim = config.hidden_size // config.num_attention_heads
+        self._head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
         self._num_layers = config.num_hidden_layers
 
         # StaticCache with early initialization (Blocker 1 workaround).
@@ -133,11 +151,9 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
             device="cpu",
         )
 
-        # Move cache tensors to XLA device for the compiled model.
-        # NOTE: despite the variable name, these reside on the XLA device.
-        # The key insight from the smoke test is that StaticCache with
-        # cache_position + attention_mask works on device -- it's the
-        # use_cache=False path (no explicit mask) that triggers UInt8.
+        # Move cache KV tensors to XLA device for the compiled model.
+        # cumulative_length and layer.device stay on CPU — tt_torch
+        # backend auto-moves them during torch.compile tracing.
         for layer in self._static_cache.layers:
             layer.keys = layer.keys.to(self.device)
             layer.values = layer.values.to(self.device)
@@ -152,6 +168,7 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
         # Tracking for the current cache fill position.
         self._cache_pos = 0
+        self._needs_reset = False
 
         logger.info(
             f"[TT-XLA] StaticCache mode, "
@@ -172,22 +189,46 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
             pass
         logger.info("[TT-XLA] load_weights: skipped (model loaded in __init__)")
 
-    def _reset_cache(self):
-        """Reset the StaticCache and attention mask for a new sequence.
+    def _get_pad_bucket(self, seq_len: int) -> int:
+        """Round seq_len up to a fixed bucket for graph reuse.
 
-        Called at the start of each prefill to clear stale KV entries.
-        Must also reset each layer's cumulative_length counter so
-        StaticLayer.update() writes to position 0 again.
+        Uses SGLANG_TT_PREFILL_PAD_STEP (default: power-of-2 buckets).
+        Set to a fixed value like 2048 to compile only one prefill graph.
         """
-        # Zero out cache tensors in-place on device.
+        step = int(os.environ.get("SGLANG_TT_PREFILL_PAD_STEP", "0"))
+        if step > 0:
+            return min(((seq_len + step - 1) // step) * step, self.max_cache_len)
+        bucket = 32
+        while bucket < seq_len:
+            bucket *= 2
+        return min(bucket, self.max_cache_len)
+
+    def _set_cumulative_length(self, value: int):
+        """Set cumulative_length on all cache layers BEFORE a compiled call.
+
+        tt_torch auto-moves CPU tensors to XLA on every compiled call
+        (logs: "Force moving the argument to XLA"). So changing the CPU
+        tensor here ensures the XLA copy has the correct value when the
+        compiled graph runs. We DON'T clear KV tensors — the attention
+        mask blocks stale positions.
+        """
         for layer in self._static_cache.layers:
-            layer.keys.zero_()
-            layer.values.zero_()
-            # Reset the internal position counter so update() starts at 0.
             if hasattr(layer, "cumulative_length"):
-                layer.cumulative_length.zero_()
-        # Reset attention mask and position tracker.
-        self._full_attn_mask.zero_()
+                layer.cumulative_length.fill_(value)
+
+    def _reset_cache(self):
+        """Reset for a new sequence.
+
+        torch._dynamo.reset() clears the compiled graph cache so the
+        next forward call retraces with fresh tensor state. This is
+        required because XLA compiled graphs capture tensor data at
+        trace time — reusing a cached graph sees stale KV values.
+
+        Cost: each new request recompiles (~9s TinyLlama, ~50s 8B).
+        Benefit: correct multi-request serving.
+        """
+        torch._dynamo.reset()
+        self._full_attn_mask.fill_(0)
         self._cache_pos = 0
 
     def forward(
@@ -228,23 +269,38 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
 
         seq_len = input_ids.shape[0]
 
-        # Reset cache for new sequence.
-        self._reset_cache()
+        # Reset cache for new sequence (skip first — tensors are already zero).
+        if self._needs_reset:
+            self._reset_cache()
+        else:
+            self._needs_reset = True
+            self._full_attn_mask.fill_(0)
+            self._cache_pos = 0
 
-        # Cast to int32: TT-metal Blackhole kernels only support
-        # Int32/UInt32/UInt16 for integer ops; torch.long (int64) fails.
-        input_2d = input_ids.unsqueeze(0).to(torch.int32).to(self.device)
+        # Right-pad input to a fixed bucket for JIT graph reuse.
+        pad_len = self._get_pad_bucket(seq_len)
 
-        # Build cache_position: [0, 1, ..., seq_len-1]
-        cache_pos = torch.arange(0, seq_len)
+        input_padded = torch.zeros(pad_len, dtype=torch.int32)
+        input_padded[:seq_len] = input_ids.to(torch.int32)
+        input_2d = input_padded.unsqueeze(0).to(self.device)
+
+        cache_pos = torch.arange(0, pad_len)
         cache_pos_dev = cache_pos.to(self.device)
 
-        # Set attention mask: 1 for all prompt positions.
+        position_ids = torch.zeros(pad_len, dtype=torch.long)
+        position_ids[:seq_len] = torch.arange(0, seq_len)
+        position_ids = position_ids.unsqueeze(0).to(self.device)
+
         self._full_attn_mask[:, :seq_len] = 1
         attn_mask_dev = self._full_attn_mask.to(self.device)
 
-        # Update tracking.
+        # Decode starts at seq_len (right after real tokens, skipping pad KV).
         self._cache_pos = seq_len
+
+        # Set cumulative_length=0 so StaticCacheLayer writes KV at [0, pad_len).
+        # After forward, cumulative_length will be pad_len on the XLA copy,
+        # but we reset it to seq_len before the first decode call.
+        self._set_cumulative_length(0)
 
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -254,12 +310,13 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
                 cache_position=cache_pos_dev,
                 use_cache=True,
                 attention_mask=attn_mask_dev,
+                position_ids=position_ids,
             )
         dt = time.perf_counter() - t0
-        logger.info(f"[TT-XLA] Prefill {seq_len} tokens in {dt:.2f}s")
+        logger.info(f"[TT-XLA] Prefill {seq_len} tokens (padded {pad_len}) in {dt:.2f}s")
 
-        # Extract last-position logits and move to CPU.
-        logits = output.logits[:, -1:, :].to("cpu").float()
+        # Extract logits at the last REAL token (not pad position).
+        logits = output.logits[:, seq_len - 1:seq_len, :].to("cpu").float()
 
         return LogitsProcessorOutput(
             next_token_logits=logits.squeeze(0),
@@ -280,9 +337,17 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         cache_pos = torch.tensor([self._cache_pos])
         cache_pos_dev = cache_pos.to(self.device)
 
+        # Explicit position_ids on device (Blocker 3 workaround).
+        position_ids = torch.tensor(
+            [[self._cache_pos]], dtype=torch.long
+        ).to(self.device)
+
         # Extend attention mask to cover the new position.
         self._full_attn_mask[:, self._cache_pos] = 1
         attn_mask_dev = self._full_attn_mask.to(self.device)
+
+        # Set cumulative_length so StaticCacheLayer writes KV at _cache_pos.
+        self._set_cumulative_length(self._cache_pos)
 
         # Update tracking.
         self._cache_pos += 1
@@ -295,6 +360,7 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
                 cache_position=cache_pos_dev,
                 use_cache=True,
                 attention_mask=attn_mask_dev,
+                position_ids=position_ids,
             )
         dt = time.perf_counter() - t0
 
