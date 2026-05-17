@@ -1,0 +1,890 @@
+{
+  "version": "v143",
+  "timestamp": "2026-05-16T21:01:58",
+  "max_cache_len": 64,
+  "num_decode_tokens": 30,
+  "num_devices": 2,
+  "limitation": "max_cache_len=64 limits output to ~30-50 tokens, preventing full reasoning chains",
+  "models": {
+    "TinyLlama-1.1B": {
+      "model_path": "/models/TinyLlama-1.1B-Chat-v1.0",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "3/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "3/25",
+      "accuracy": 0.12,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": ""
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": ""
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": ""
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": ""
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": ""
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": ""
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": ""
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": ""
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": ""
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": ""
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": "HHWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+        },
+        {
+          "prompt": "The author of Romeo and Juliet is",
+          "expected": "shakespeare",
+          "got": "William.IsWIsWIsWIsWIsWIsWIsWIsWIsWIsWIsWIsWIsWIsWIs"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": " approximately approximately approximately approximately approximately approximately approximately approximately approximately approximately approximately approximately approximately approximately app"
+        },
+        {
+          "prompt": "The largest planet in our solar system is",
+          "expected": "jupiter",
+          "got": "Jup.........................................................:...!:...!:!:!!"
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": ".....................:...:::::::::: water is water is water is water is water is water"
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": "isapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproapproappro"
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": "........................................................................which is which is which is"
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": "TomAnsweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweranswer"
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": "$---------------------------------------------------------answer:------------------answer:---"
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": "answeransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweransweranswer"
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": "Answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answ"
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": "AnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswerAnswer"
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 40.45,
+      "model_card_gsm8k": "~10%",
+      "family": "tinyllama",
+      "param_count": "1.1B",
+      "note": "Limited performance; small model or output truncation affects results"
+    },
+    "SmolLM2-135M": {
+      "model_path": "/models/SmolLM2-135M-Instruct",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "4/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "4/25",
+      "accuracy": 0.16,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": ""
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": ""
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": ""
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": ""
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": ""
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": ""
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": ""
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": ""
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": ""
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": ""
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": " H the symbol is the letter 't' the letter 't' is the letter 't' the letter 't' is the letter 't'"
+        },
+        {
+          "prompt": "The author of Romeo and Juliet is",
+          "expected": "shakespeare",
+          "got": " a a a a a a a a a a a a a a a a a a a a a land of the people.\n\nThe first step"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": " \n$1.000000$\n\nThe average price of a house in the United States is approximately $1,00"
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": " 3, and and and and and and and and and and and and and and and and and and and and and and and and and and and and"
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": " \n\\frac{1}{2} \\cdot 10^{-10} \\cdot 10^{-10} \\cdot"
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": " 100000000000000000000000000000"
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": ""
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": ""
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": ""
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": ""
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": ""
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 44.61,
+      "model_card_gsm8k": "N/A (too small)",
+      "family": "smollm",
+      "param_count": "0.1B",
+      "note": "Limited performance; small model or output truncation affects results"
+    },
+    "Qwen2.5-0.5B": {
+      "model_path": "/models/Qwen2.5-0.5B",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "1/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "1/25",
+      "accuracy": 0.04,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": " -? -????????????????????????????"
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": " What??????????????????????????????"
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": " To To To To To To To To To/"
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": " To To To To To To To To/ To To/ To/ To/ To/ To/ To/ To/ To/ To/ To/ "
+        },
+        {
+          "prompt": "The capital of Japan is",
+          "expected": "tokyo",
+          "got": " __ is __ __ is __ __ is __ is __ is __ is is __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __"
+        },
+        {
+          "prompt": "The chemical symbol for gold is",
+          "expected": "au",
+          "got": " ____ is ____ ____ is ____ ____ ____ ________\nA. 1000\nB. 100\nC. 10"
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": " ____ is is isis are is is is is is/"
+        },
+        {
+          "prompt": "The author of Romeo and Juliet is",
+          "expected": "shakespeare",
+          "got": " __ is __ __ is __ is __ is __ is __ is\u00a0 is ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____ ____"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": "                               "
+        },
+        {
+          "prompt": "The largest planet in our solar system is",
+          "expected": "jupiter",
+          "got": " __ is __ is __ is is chiselled into a statue of a man with a sword, and the statue is placed in the courtyard of the palace"
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": "                               "
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": "                              0"
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": " ( is is is is is is is is is is is is is is is is is / / / / / / / / / / / / /"
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": " Tom::::::::::::::::::::::::::::::"
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": " $::::::::::/"
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": " Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah Sarah"
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": "                             ( ( ("
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": "                               "
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 43.01,
+      "model_card_gsm8k": "~36%",
+      "family": "qwen2.5",
+      "param_count": "0.5B",
+      "note": "Limited performance; small model or output truncation affects results"
+    },
+    "Qwen2.5-3B": {
+      "model_path": "/models/Qwen2.5-3B",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "4/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "4/25",
+      "accuracy": 0.16,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": "  1  1  1  1  1  1  1  1  1  1 "
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": " What is 1000000000000000000000000000"
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": " | | | | | | | | | | | | | | | | | | | | | | | | | | | | | | |"
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": " H H H H H H H H H H H H H H H H H H H H H H H H H H H H H H H"
+        },
+        {
+          "prompt": "The author of Romeo and Juliet is",
+          "expected": "shakespeare",
+          "got": " ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ___"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": " 1000.\n\n1000000000000000000000000"
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": "                1  1  1  1  1  "
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": " 0.6666666666666666666666666666"
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": " 100000000000000000000000000000"
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": "        1  1 1 1 1 1 1 1 1 1 1 "
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": "                        1.  1. "
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": "        1  1 1 1 1 1 1 1 1 1 1 "
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": "         1  1 1 1 1 1 1 1 1 1 1"
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": "                        1\u3001\u5728\u201c201"
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 59.98,
+      "model_card_gsm8k": "~65%",
+      "family": "qwen2.5",
+      "param_count": "3B",
+      "note": "Limited performance; small model or output truncation affects results"
+    },
+    "Qwen3-0.6B": {
+      "model_path": "/models/Qwen3-0.6B",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "3/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "3/25",
+      "accuracy": 0.12,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": " What************************************************************"
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": " What?????????????..................................................."
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": " What There There There There There There There There There There There There There There There There There There There There There There There There There There There There There There"
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": " What??????????????...?...?...?...?...?...?...?...?"
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": " What************************************************************"
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": " What**:**:**:**:**:****:**********************************************"
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": " What************************************************************"
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": " What?????????????..................................................."
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": " What And And And And And And And And And And And And And And And And And And And And And And And And And And And And And And"
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": " What************************************************************"
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": " H. H. H. H. H. H. H. H. H. H. H. H. H. H. H. H"
+        },
+        {
+          "prompt": "The author of Romeo and Juliet is",
+          "expected": "shakespeare",
+          "got": " a person. A A A A A A A A A A A A ABARRACLEBARACLEACLEACLEACLEACLEACLEACLEACLEACLEACLEACLE"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": "                               "
+        },
+        {
+          "prompt": "The largest planet in our solar system is",
+          "expected": "jupiter",
+          "got": "............................................................................................."
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": " 111111111111111111111111111111"
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": "                               "
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": " ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______ ______\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": "             ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '"
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": " $:::::::::..............................................................."
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": "         '  '  ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '"
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": "     '  '  ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '"
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": "     ###  ###  ###  ###  ###  ###  ###  ###  ###  ###  ###  ###"
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 49.03,
+      "model_card_gsm8k": "~50%",
+      "family": "qwen3",
+      "param_count": "0.6B",
+      "note": "Limited performance; small model or output truncation affects results"
+    },
+    "Qwen3-1.7B": {
+      "model_path": "/models/Qwen3-1.7B",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "3/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "3/25",
+      "accuracy": 0.12,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": " Also All All All All All All All All All All All All All All All All All All All All All All All All All All All All All All"
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": " Also All All All All All All All All All All All All All All All All All All All All All All All All All All All All All All"
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": " Also All All All All All All All All All All All All All All All All All All All All All All All All All All All All All All"
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": " Also All All All All All All All All All All All All All All All All All All All All All All All All All All All All All All"
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": " Also All All All All All All All All All All All All All All All All All All All All All All All All All All All All All All"
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": " Also All All All All All All All All All All All All All All All All All All All All All All All All All All All All All All"
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": " H H H H H H H H H H H H H H H H H H H H H H H H H H H H H H H"
+        },
+        {
+          "prompt": "The author of Romeo and Juliet is",
+          "expected": "shakespeare",
+          "got": " William William William William William William William William William William William William William William William William William William William William William William William William William"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": "            \f\n                                                                                                                                                                                          "
+        },
+        {
+          "prompt": "The largest planet in our solar system is",
+          "expected": "jupiter",
+          "got": " the planet the planet the planet the planet the planet the planet the planet the planet the planet the planet the planet the planet the planet the planet the planet the"
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": "                               "
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": "          --  -- --------------------------------"
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": "                               "
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": "                               "
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": "                               "
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": "                               "
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": "                               "
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": " \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\"
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 52.48,
+      "model_card_gsm8k": "~65%",
+      "family": "qwen3",
+      "param_count": "1.7B",
+      "note": "Limited performance; small model or output truncation affects results"
+    },
+    "Qwen3-4B": {
+      "model_path": "/models/Qwen3-4B",
+      "status": "PASS",
+      "math_score": "0/10",
+      "factual_score": "5/10",
+      "gsm8k_simple_score": "0/5",
+      "total_score": "5/25",
+      "accuracy": 0.2,
+      "failures": [
+        {
+          "prompt": "What is 2+3?",
+          "expected": "5",
+          "got": " Also, and, and, and, and, and, and, and, and, and, and, and, and, and, and, and"
+        },
+        {
+          "prompt": "What is 7*8?",
+          "expected": "56",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "What is 100/4?",
+          "expected": "25",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "What is 15+27?",
+          "expected": "42",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "What is 9*9?",
+          "expected": "81",
+          "got": " Also??????????????????????????????????????????????????????????"
+        },
+        {
+          "prompt": "What is 144/12?",
+          "expected": "12",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "What is 33+67?",
+          "expected": "100",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "What is 6*7?",
+          "expected": "42",
+          "got": " Also??????????????????????????????????????????????????????????"
+        },
+        {
+          "prompt": "What is 50-17?",
+          "expected": "33",
+          "got": " Also?...?...?...?...?...?...?...?...??...?...?...?...?...?...?"
+        },
+        {
+          "prompt": "What is 8*12?",
+          "expected": "96",
+          "got": " What? What? What? What? What? What? What? What? What? What? What? What? What? What? What? What"
+        },
+        {
+          "prompt": "The chemical symbol for water is",
+          "expected": "h2o",
+          "got": " H H H H H H H H H H H H H H. The user is asking for the correct chemical symbol for water. The answer is H"
+        },
+        {
+          "prompt": "The speed of light is approximately",
+          "expected": "300, 3",
+          "got": "                               "
+        },
+        {
+          "prompt": "The boiling point of water is",
+          "expected": "100, 212",
+          "got": "  is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is"
+        },
+        {
+          "prompt": "Pi is approximately",
+          "expected": "3.14",
+          "got": "                               "
+        },
+        {
+          "prompt": "The square root of 64 is",
+          "expected": "8",
+          "got": "                               "
+        },
+        {
+          "prompt": "Tom has 5 apples. He buys 3 more. How many apples does Tom have? Answer:",
+          "expected": "8",
+          "got": " Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom: Tom"
+        },
+        {
+          "prompt": "A store sells pencils for $2 each. If you buy 4, how much do you pay? Answer:",
+          "expected": "8, $8",
+          "got": " $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $ $"
+        },
+        {
+          "prompt": "Sarah has 20 cookies and gives away 7. How many does she have left? Answer:",
+          "expected": "13",
+          "got": "                             \n "
+        },
+        {
+          "prompt": "A car travels at 60 mph for 2 hours. How far does it go? Answer:",
+          "expected": "120",
+          "got": " : : : : : : : : : : : : : : : : : : : : : : : : : : : : : :"
+        },
+        {
+          "prompt": "There are 24 students split into 4 groups. How many per group? Answer:",
+          "expected": "6",
+          "got": "                               "
+        }
+      ],
+      "error": "",
+      "prefill_time_s": 67.21,
+      "model_card_gsm8k": "~75%",
+      "family": "qwen3",
+      "param_count": "4B",
+      "note": "Limited performance; small model or output truncation affects results"
+    }
+  },
+  "completed_at": "2026-05-16T21:53:28"
+}

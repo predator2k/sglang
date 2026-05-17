@@ -326,29 +326,20 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        # Cast to int32 and reshape to [1, 1].
+        t_start = time.perf_counter()
+
         input_2d = input_ids.unsqueeze(0).to(torch.int32).to(self.device)
-
-        # Build cache_position for the new token.
-        cache_pos = torch.tensor([self._cache_pos])
-        cache_pos_dev = cache_pos.to(self.device)
-
-        # Explicit position_ids on device (Blocker 3 workaround).
+        cache_pos_dev = torch.tensor([self._cache_pos]).to(self.device)
         position_ids = torch.tensor(
             [[self._cache_pos]], dtype=torch.long
         ).to(self.device)
-
-        # Extend attention mask to cover the new position.
         self._full_attn_mask[:, self._cache_pos] = 1
         attn_mask_dev = self._full_attn_mask.to(self.device)
-
-        # Set cumulative_length so StaticCacheLayer writes KV at _cache_pos.
         self._set_cumulative_length(self._cache_pos)
-
-        # Update tracking.
         self._cache_pos += 1
 
-        t0 = time.perf_counter()
+        t_prep = time.perf_counter()
+
         with torch.no_grad():
             output = self.compiled_model(
                 input_ids=input_2d,
@@ -358,14 +349,21 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
                 attention_mask=attn_mask_dev,
                 position_ids=position_ids,
             )
-        dt = time.perf_counter() - t0
+
+        t_fwd = time.perf_counter()
+
+        logits = output.logits[:, -1:, :].to("cpu").float()
+
+        t_end = time.perf_counter()
 
         if self._cache_pos % 10 == 0:
             logger.info(
-                f"[TT-XLA] Decode at pos {self._cache_pos} in {dt:.3f}s"
+                f"[TT-XLA] Decode pos {self._cache_pos}: "
+                f"prep={1000*(t_prep-t_start):.1f}ms "
+                f"fwd={1000*(t_fwd-t_prep):.1f}ms "
+                f"logits={1000*(t_end-t_fwd):.1f}ms "
+                f"total={1000*(t_end-t_start):.1f}ms"
             )
-
-        logits = output.logits[:, -1:, :].to("cpu").float()
 
         return LogitsProcessorOutput(
             next_token_logits=logits.squeeze(0),
