@@ -75,7 +75,21 @@ bash /home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh
 
 ## What's preserved
 
-- `/home/mhnie/tt-mlir-sglang/` — fork with B.2 patch on `tenstorrent-p1` branch
+- `/home/mhnie/tt-mlir-sglang/` — fork with B.2 patch on `tenstorrent-p1` branch (`c1bae0bf2`)
 - `/opt/tt-mlir-toolchain/` — built toolchain (LLVM, FlatBuffers, StableHLO, Shardy)
-- `/home/mhnie/tt-xla/build-local/` — built tt-xla with new `pjrt_plugin_tt.so`
-- Container `tt-xla-eval` restored to canonical state (original `pjrt-plugin-tt 1.1.0` wheel) — Workstream A still passes the bit-exact CI test.
+- `/home/mhnie/tt-xla/build-local/` — built tt-xla with new `pjrt_plugin_tt.so` (host-built, ABI-drifted)
+- Container `tt-xla-eval` — recreated with extra mounts (`/tt-mlir-sglang`, `/tt-xla`, `/opt/tt-mlir-toolchain`) + build tools (cmake, clang-17, lld, ninja, ccache, libzstd-dev, libprotobuf-dev, etc.) + sglang server runtime deps. Workstream A still passes the bit-exact CI test on this configuration.
+
+## Container-rebuild attempt log (2026-05-17 19:25-20:00)
+
+Path 1 from the spec was attempted — build `pjrt-plugin-tt` INSIDE the container so it links against the locked torch_xla 2.9.0+git44ecef3.
+
+- ✓ Container recreated with bind-mounts for `tt-mlir-sglang`, `tt-xla`, `tt-mlir-toolchain`
+- ✓ Build tools installed: cmake 3.28, clang/clang++-17, ninja, ccache, libzstd-dev, libprotobuf-dev, patchelf, libfmt9, libopenmpi3
+- ✓ tt-mlir-sglang rebuilt inside container at `/tt-mlir-sglang/build/` (790/790 steps)
+- ✓ tt-mlir-sglang manual install to `/tt-xla/third_party/tt-mlir/install/`
+- ✓ Headers copied from `runtime/include/tt/` and `build/runtime/include/tt/`
+- ✓ tt-metal source symlinked at `/tt-xla/third_party/tt-mlir/install/tt-metal/{tools,ttnn}`
+- ✗ **Blocked**: tt-xla compilation needs TableGen-generated `.h.inc` files from shardy and stablehlo (`shardy/dialect/sdy/ir/dialect.h.inc`, `stablehlo/dialect/BaseAttrInterfaces.h.inc`). These are normally generated as part of tt-mlir's nested build under tt-xla's ExternalProject pipeline. Bypassing via `TTMLIR_SOURCE_DIR_OVERRIDE` skips this auto-handling.
+
+**Next attempt should**: either (a) Dockerfile that starts from `tt-xla-slim`, patches the relevant source, rebuilds via tt-xla's standard ExternalProject pipeline (which auto-generates the .inc files), or (b) add an install rule in `tt-mlir-sglang` that exports the generated .inc files to a location tt-xla can find. Both are multi-hour follow-up work.
