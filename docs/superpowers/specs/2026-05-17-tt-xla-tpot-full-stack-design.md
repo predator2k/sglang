@@ -171,9 +171,9 @@ Total realistic: **2-3 weeks** if B.2 is straightforward; **3-4 weeks** with buf
 | Status quo | 212 ms | every request pays both JIT cliffs |
 | T2.1 only (A.1) | ~90-130 ms | dynamo.reset gone; R1 still pays cliff; mid-decode shape changes still might |
 | T2.1 + pre-warm (A.1 + A.2) | **~75 ms** | both cliffs gone at startup → matches standalone steady-state |
-| + B.2 + A1 K=4 (clone+index_copy_) | **~35-45 ms** | PJRT amortized 4×; cheap KV update |
-| + B.3 (torch.where kernel) | ~30-35 ms | only if B.2 doesn't already solve A1 |
-| + A4 bs=8 on top of above | throughput 1.4× of the above | latency-throughput tradeoff |
+| ~~+ B.2 + A1 K=4 (clone+index_copy_)~~ | **~55–58 ms** (measured 2026-05-17, **not 35–45 ms**) | B.2 v3 patch landed and V2 functional; K-fold functional-cache copy cost cancels PJRT amortization. A1 path **retired**. |
+| + A4 bs=8 (post-B.2 build) | **42.3 ms / tok, 23.6 tok/s, 1.41×** (measured 2026-05-17) | meets spec gate ≥ 23 tok/s |
+| + B.3 (torch.where kernel) | n/a | A1 retired → B.3 deferred indefinitely |
 
 ## Risks (with mitigations)
 
