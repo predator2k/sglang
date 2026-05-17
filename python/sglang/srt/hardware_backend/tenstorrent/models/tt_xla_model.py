@@ -219,13 +219,9 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
     def _reset_cache(self):
         """Reset for a new sequence.
 
-        torch._dynamo.reset() clears the compiled graph cache so the
-        next forward call retraces with fresh tensor state. This is
-        required because XLA compiled graphs capture tensor data at
-        trace time — reusing a cached graph sees stale KV values.
-
-        Cost: each new request recompiles (~9s TinyLlama, ~50s 8B).
-        Benefit: correct multi-request serving.
+        torch._dynamo.reset() forces the tt_torch backend to re-export
+        the model with fresh tensor state on the next call. The TT-MLIR
+        JIT build cache (disk-based) still caches kernel compilation.
         """
         torch._dynamo.reset()
         self._full_attn_mask.fill_(0)
