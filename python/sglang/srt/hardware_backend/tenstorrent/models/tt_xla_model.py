@@ -138,9 +138,15 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
         # Created with device="cpu" for early_initialization, then cache
         # tensors are moved to XLA device. StaticCache.update() uses
         # index_copy_ (not scatter_), which TT-MLIR lowers correctly.
-        self._static_cache = StaticCache(
+        from sglang.srt.hardware_backend.tenstorrent.models.tt_functional_cache import (
+            TTFunctionalCache,
+        )
+        self._static_cache = TTFunctionalCache(
             config=config,
+            max_batch_size=1,  # bs > 1 wired in Phase 3b
             max_cache_len=self.max_cache_len,
+            device="cpu",
+            dtype=torch.bfloat16,
         )
         # Force early allocation of all layer cache tensors.
         self._static_cache.early_initialization(
@@ -219,11 +225,13 @@ class TenstorrentXLAGenericCausalLM(nn.Module):
     def _reset_cache(self):
         """Reset for a new sequence.
 
-        torch._dynamo.reset() forces the tt_torch backend to re-export
-        the model with fresh tensor state on the next call. The TT-MLIR
-        JIT build cache (disk-based) still caches kernel compilation.
+        T2.1 (v5.3 spec): the prior workaround called torch._dynamo.reset() here
+        to force re-export of the model. That invalidated JIT-compiled graphs on
+        every request and caused ~9s prefill + ~9s first-decode cliffs per request
+        (probe_c3_warmup_vs_cache_*.log). TTFunctionalCache replaces the in-place
+        index_copy_ that required dynamo.reset; we no longer reset the JIT cache.
         """
-        torch._dynamo.reset()
+        self._static_cache.reset()
         self._full_attn_mask.fill_(0)
         self._cache_pos = 0
 
