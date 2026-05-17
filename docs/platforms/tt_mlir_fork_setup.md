@@ -47,4 +47,35 @@ rebase MUST be followed by `regression_check_v145.py` PASS.
 
 ## Status
 
-- 2026-05-17: fork created at pin `eb9005fa`, branch `tenstorrent-p1`. No patches applied yet.
+- **2026-05-17 03:47** — fork created at pin `eb9005fa`, branch `tenstorrent-p1`
+- **2026-05-17 03:49** — `scripts/build_and_install.sh` committed (tt-mlir-sglang commit `04ae33328`)
+- **2026-05-17 ~04:00** — **B.2 patch applied** (tt-mlir-sglang commit `c1bae0bf2`): 14-line guard in `CacheFillUpdatePattern::matchAndRewrite` at `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp:6124` — returns `failure()` when `scatterOp.getInputs()[0]` has more than one user, letting the autoregressive cache scatter fall through to the generic `ttnn.scatter` path.
+- **2026-05-17 04:03** — LLVM/MLIR toolchain built at `/opt/tt-mlir-toolchain/` (5.1 GB, 35/35 ExternalProject steps).
+- **2026-05-17 ~04:20** — tt-mlir-sglang top-level built (`build/lib/libTTMLIRCompiler.so`, `build/runtime/lib/libTTMLIRRuntime.so`).
+- **2026-05-17 ~04:25** — tt-xla built against local override (`build-local/pjrt_implementation/src/pjrt_plugin_tt.so`, 2 MB).
+
+## Known integration issue (open)
+
+The host-built `pjrt_plugin_tt.so` cannot be dropped directly into the slim container's `pjrt_plugin_tt/lib64/` and remain working. Symptoms while integrating:
+- `libprotobuf.so.32` missing (host v32 vs container's bundled v25). Fixed by `apt install libprotobuf32t64`.
+- `undefined symbol: _ZN4mlir2tt4ttnn17symbolizeBFPDtypeEN4llvm9StringRefE` — bundled `libTTMLIRCompiler.so` was older than what the new plugin expects. Replaced from local build.
+- `libtt-umd.so.0`, `libfmt.so.11`, `libmpi.so.40` chain — bulk-copied tt-metal `build_Release/lib/*.so*` + apt-installed `libopenmpi3`.
+- After all that: plugin LOADS but compiled `forward()` FAILS without a clean error, suggesting ABI drift between host-built libs and the container's torch / torch_xla (locked at 2.9.1+cpu / 2.9.0+git44ecef3 per memory `tenstorrent-tt-transformers-constraints`).
+
+To validate B.2 end-to-end, one of:
+1. **Build pjrt-plugin-tt INSIDE the slim container** so it links against the container's exact torch / nanobind / protobuf. Requires cmake + clang + lld toolchain inside the container (~5-10 GB image growth).
+2. **Match versions on the host**: install torch 2.9.1+cpu + torch_xla 2.9.0+git44ecef3 + matching nanobind in a clean Python env on the host, point the tt-xla build at it.
+3. **Build a new `tt-xla-slim` image** with our pjrt plugin baked in, auditwheel-bundled.
+
+Rebuild + reinstall cycle (after the ABI integration is solved):
+
+```bash
+bash /home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh
+```
+
+## What's preserved
+
+- `/home/mhnie/tt-mlir-sglang/` — fork with B.2 patch on `tenstorrent-p1` branch
+- `/opt/tt-mlir-toolchain/` — built toolchain (LLVM, FlatBuffers, StableHLO, Shardy)
+- `/home/mhnie/tt-xla/build-local/` — built tt-xla with new `pjrt_plugin_tt.so`
+- Container `tt-xla-eval` restored to canonical state (original `pjrt-plugin-tt 1.1.0` wheel) — Workstream A still passes the bit-exact CI test.
