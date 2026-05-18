@@ -82,7 +82,9 @@ Phase 0 is a gate, not a formality. The Phase 0.3 quantitative threshold is the 
 |---|---|---|---|---|
 | 0.1 | Bucket Tracy Tilizes by tensor shape (weight tilize vs activation tilize) | The aggregator at `_fixtures/tracy_aggregate.py` only reads `OP CODE`; it does NOT have shape columns. Use the RAW `ops_perf_results_*.csv` directly. **Tracy's actual shape encoding**: it emits four padded-logical-dim columns per input (`INPUT_0_W_PAD[LOGICAL]`, `INPUT_0_Z_PAD[LOGICAL]`, `INPUT_0_Y_PAD[LOGICAL]`, `INPUT_0_X_PAD[LOGICAL]`) plus `INPUT_0_LAYOUT`, `INPUT_0_DATATYPE`, `INPUT_0_MEMORY`. Shape is reassembled from the four W/Z/Y/X columns. Confirm column names by inspecting `head -1 ops_perf_results_*.csv | tr ',' '\n'` from the existing run dir. Write a small one-shot Python script that filters rows where `OP CODE == "TilizeWithValPadding"`, assembles the shape from the four pad columns, and joins against known weight shapes derived from `hf_model.config` (e.g., `[vocab, hidden]`, `[hidden, 3*hidden]`, etc., padded to tile boundaries). Match modulo tile-padding. | % split | If weights ≪ 5 %, document in Phase 5 and proceed (no descope — A.1.a/A.3 still land, just with lower expected gain) |
 | 0.2 | Dump tt-xla StableHLO + TTIR for one decode step. Inspect block-arg attrs | Set `torch_xla.set_custom_compile_options({"export_path": "/tmp/shlo_dump", "enable_const_eval": True})` before warm-up. Run probe with `--decode 1`. **First confirm the round-trip works**: after one decode, `ls /tmp/shlo_dump/irs/shlo_*.mlir` must list at least one file (note: `irs/` is the actual subdir created by `printModule` at `module_builder.cc:1230`; filenames are `shlo_<timestamp>.mlir` if model_name unset, `shlo_<model>_<timestamp>.mlir` if set — the glob covers both). If the directory itself doesn't exist OR is empty, the Python→C++ option-key serialization didn't reach `module_builder.cc`. **Caveat:** `compile_options.cc:78–82` ABORTs the plugin when `export_path` is MISSING and the backend is NOT `TTNNFlatbuffer`. The default tt-xla backend IS `TTNNFlatbuffer`, so a missing/empty `export_path` won't trigger ABORT in practice — the symptom of a failed round-trip is just "no files written", not a crash. Then grep the matched `shlo_*.mlir` file for `mhlo.`/`xla.`/`tf.`/`jax.`/`torch.`/`_xla` -prefixed arg attrs. | Confirmed torch_xla marker name(s) on block args, OR "no per-arg marker" | "No per-arg marker" → Strategy C (heuristic) handles via Phase 4 auto-detect. NOT a descope. |
-| 0.3 | Count `to_layout`-pair patterns in TTNN IR | Open the `ttnn`-stage MLIR file from 0.2 (glob `<export_path>/irs/ttnn_*.mlir`). Count `ttnn.to_layout → <allowlist_op from Phase 3> → ttnn.to_layout` chains where the final to_layout's output layout matches the first's input layout. **MLIR isn't a nested-paren language** — string parsing won't work because ops are SSA-numbered flat statements (`%2 = "ttnn.to_layout"(%1) ...`). Implementation: either (a) use `ttmlir-opt --print-op-stats` for op counts then a small pass to detect chains, OR (b) use Python MLIR bindings to walk the SSA def-use graph. The bindings live at `/opt/tt-mlir-toolchain/python_packages/mlir_core/` in the `tt-xla-eval` container; activate via `PYTHONPATH=/opt/tt-mlir-toolchain/python_packages/mlir_core python3 -c "from mlir import ir"`. **Note:** `ttnn.tilize`/`ttnn.untilize` are NOT MLIR ops (review 6 finding) — only `ttnn.to_layout` survives in IR. Don't grep for the runtime kernel names. | Cancellable-triple count | If < 50 per decode step, de-scope A.2.a (Phase 3 → skipped). Document count in Phase 5. |
+| 0.3 | Count `to_layout`-pair patterns in TTNN IR | Open the `ttnn`-stage MLIR file from 0.2 (glob `<export_path>/irs/ttnn_*.mlir`). Count `ttnn.to_layout → <allowlist_op from Phase 3> → ttnn.to_layout` chains where the final to_layout's output layout matches the first's input layout. **MLIR isn't a nested-paren language** — string parsing won't work because ops are SSA-numbered flat statements (`%2 = "ttnn.to_layout"(%1) ...`). Implementation:
+- Option (a) `ttmlir-opt --print-op-stats`: the binary lives at `/tt-xla/third_party/tt-mlir/src/tt-mlir/build/tools/ttmlir-opt` BEFORE Phase 1 (canonical clone); after Phase 1 the fork's build at `/home/mhnie/tt-mlir-sglang/build/bin/ttmlir-opt` is the right one. Phase 0 runs pre-Phase-1, so use the canonical-clone path.
+- Option (b) Python MLIR bindings (`mlir.ir` module): bindings at `/opt/tt-mlir-toolchain/python_packages/mlir_core/` in `tt-xla-eval`. Activate with `PYTHONPATH=/opt/tt-mlir-toolchain/python_packages/mlir_core python3 -c "from mlir import ir"`. **Critical**: TTNN dialect is not auto-registered — set `ctx.allow_unregistered_dialects = True` before parsing the TTNN-stage MLIR file, otherwise the parser fails with `MLIRError: dialect not registered`. Walk ops via `op.walk(...)` and inspect operand SSA values for the `to_layout` chain pattern. **Note:** `ttnn.tilize`/`ttnn.untilize` are NOT MLIR ops (review 6 finding) — only `ttnn.to_layout` survives in IR. Don't grep for the runtime kernel names. | Cancellable-triple count | If < 50 per decode step, de-scope A.2.a (Phase 3 → skipped). Document count in Phase 5. |
 
 If 0.2 also produces a clean per-arg parameter marker, capture an arg attr example for the Phase 4 implementation.
 
@@ -121,7 +123,6 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
 **Concrete steps (executor refines until verification passes):**
 
 1. Edit `/home/mhnie/tt-xla/third_party/CMakeLists.txt`:
-   - **Update `TT_MLIR_VERSION` at line 8** from the canonical `f3ddbfb6b0eab2c2ec65fe45ec2347cc6ebedaca` to the fork HEAD SHA (`2fc1d119e...`, get the full SHA from `git -C /home/mhnie/tt-mlir-sglang rev-parse HEAD`). This is the critical step that makes Phase 1 verification meaningful — `pip3 show pjrt-plugin-tt` extracts this string directly via regex (`setup.py:106`), so without this edit, pip's reported `tt-mlir-commit=` continues to show the canonical SHA even when the fork is linked.
    - ExternalProject_Add block at lines 47–85:
      - Replace `GIT_REPOSITORY ... + GIT_TAG ... + GIT_PROGRESS ON` with `SOURCE_DIR /home/mhnie/tt-mlir-sglang` + `DOWNLOAD_COMMAND ""`.
      - Set `CONFIGURE_COMMAND ""` and `BUILD_COMMAND ""` (build_and_install.sh handles those for the fork in steps [1-2]/4).
@@ -141,11 +142,28 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
 
 5. Run `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang). It builds fork first (steps [1-2]/4), THEN configures+builds tt-xla which consumes the pre-built fork (step [3]/4), THEN installs plugin (step [4]/4). Ordering matters.
 
-6. **Hard verification — the load-bearing step:**
-   - Run `pip3 show pjrt-plugin-tt | grep -E "Version|Summary"` in `tt-xla-eval`. The Summary line includes `tt-mlir-commit=<SHA>` (read from `TT_MLIR_VERSION` via `setup.py:106`). After step 1's update to `TT_MLIR_VERSION`, the SHA must show fork HEAD (`2fc1d119e...`), NOT canonical `f3ddbfb6`.
-   - **Do NOT use `strings .../pjrt_plugin_tt.so | grep "tt-mlir-commit="`** — the commit triple is NOT embedded in the compiled .so binary (review 9 verified empirically). The pip metadata is the authoritative source, but only because step 1 above updates the CMakeLists string literal that pip reads.
-   - **Additional check (catches the "TT_MLIR_VERSION updated but build still used canonical" failure mode):** compare `stat -c "%Y" /tt-xla/third_party/tt-mlir/install/lib/libTTMLIRCompiler.so` with `stat -c "%Y" /home/mhnie/tt-mlir-sglang/build/lib/libTTMLIRCompiler.so`. The first should be ≥ the second (install copied from fork's build). If install is older than the fork's build output, the `ExternalProject_Add`'s INSTALL_COMMAND didn't fire — check Phase 1's `INSTALL_COMMAND` neutering fallback.
-   - If verification fails, the edits didn't take. **STOP. Investigate. Do NOT proceed to Phase 2 against a canonical-tt-mlir-backed plugin.**
+6. **Hard verification — the load-bearing step.** Two prior verification approaches (strings-grep on .so, pip3-show metadata) were unsound — `pip3 show` reads from `setup.py`'s wheel-build-time metadata that doesn't refresh on rebuild; the strings-grep returned empty because the commit triple isn't in the .so binary. Use a **binary differential SHA** check instead:
+
+   **Pre-Phase-1 snapshot (run BEFORE step 5):**
+   ```
+   docker exec tt-xla-eval bash -c \
+     'sha256sum /tt-xla/third_party/tt-mlir/install/lib/*.so' \
+     > /tmp/canonical-lib-shas.txt
+   ```
+   Save this as the canonical baseline.
+
+   **Post-Phase-1 check (run AFTER step 5):**
+   ```
+   docker exec tt-xla-eval bash -c \
+     'sha256sum /tt-xla/third_party/tt-mlir/install/lib/*.so' \
+     > /tmp/post-phase1-lib-shas.txt
+   diff /tmp/canonical-lib-shas.txt /tmp/post-phase1-lib-shas.txt
+   ```
+   At least one `.so` MUST differ — typically `libTTMLIRStableHLOToTTIR.so` (B.2 v3 patches it). If the diff is empty, the fork's source did NOT replace the canonical's binary — the rebuild path didn't take. **STOP. Investigate. Do NOT proceed to Phase 2.**
+
+   **Path note:** the `stat -c "%Y"` + path comparison previously suggested won't help here because (a) `cmake --install` does NOT preserve mtimes — installed file gets a fresh mtime regardless of source, and (b) host vs container paths differ (`/home/mhnie/tt-mlir-sglang` on host, `/tt-mlir-sglang` in container). The container-side SHA check above sidesteps both issues.
+
+   **Behavioural cross-check (additional):** run the smoke bench at step 7 and confirm TPOT is within ±5% of the pre-Phase-1 baseline (~132 ms). Both a regression or a surprise improvement could indicate the fork built but with a different compile path — investigate either way.
 
 7. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
 
@@ -304,13 +322,13 @@ Fixtures saved alongside commit: `_fixtures/v146_3run_server_q8b_<phase>.json`.
 ## 8. Estimated wall-clock
 
 - Phase 0: ~1.5 hours (0.1 ≈ 30 min, 0.2 ≈ 45 min including `export_path` wire-up + Python-bool round-trip, 0.3 ≈ 15 min)
-- Phase 1: ~2 hours (CMakeLists.txt edit + ExternalProject_Add neutering + TT_METAL_RUNTIME_ROOT redirect + build-script edit + stamp/dir cleanup + rebuild + verify-fork-loaded + smoke). Bumped from 1.5h after review-4 surfaced the ExternalProject collision and runtime-root issues.
+- Phase 1: ~3 hours (CMakeLists.txt edit + ExternalProject_Add neutering + TT_METAL_RUNTIME_ROOT redirect + build-script edit + stamp/dir cleanup + initial fork build from scratch + plugin rebuild + verify SHA-diff + smoke bench). Bumped from 2h: fork's `build/` dir doesn't exist today, so first run includes a full tt-mlir build (~30–60 min) before any tt-xla rebuild.
 - Phase 2: ~4 hours (≈ 1.5h C++ classifier with all three strategies + 1h mini-test scaffolding and execution + 30 min rebuild + 1h bench/verify/commit). The mini-test (mandatory before live use) is what bumped this.
 - Phase 3: ~5 hours (only if Phase 0.3 ≥ 50 cancellable pairs). Bumped from 3h after review 6 reframed the pass to match `to_layout` patterns rather than non-existent named tilize/untilize ops; new logic must coexist with the existing `foldConsecutiveToLayoutOp` without duplicating its work.
 - Phase 4: ~2 hours (most logic is reused from Phase 2 classifier; new work is the schedule-in-StableHLOPipelines + short-circuit-on-existing-attr + verification under `TT_DISABLE_PJRT_ARG_TYPE_MAP=1`)
 - Phase 5: ~30 min
 
-Total: ~10 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~15 hours maximum (all phases, after Phase 3 reframe).
+Total: ~11 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~16 hours maximum (all phases).
 
 ## 9. Open items to confirm in writing-plans
 
