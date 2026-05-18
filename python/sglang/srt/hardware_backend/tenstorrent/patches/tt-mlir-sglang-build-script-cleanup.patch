@@ -1,0 +1,20 @@
+--- /tmp/build_and_install.sh.before	2026-05-18 00:34:02.601996374 -0700
++++ /home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh	2026-05-18 00:34:46.286409698 -0700
+@@ -32,10 +32,16 @@
+ echo "[2/4] Building tt-mlir-sglang..."
+ ninja -C "$TTMLIR_DIR/build" -j "$NPROC"
+ 
++# TT_METAL_RUNTIME_ROOT must point at the fork's tt-metal source tree.
++# The fork's own ExternalProject for tt-metal lands it at this path after the
++# fork's configure step [1/4] runs. Hardcoded (not via `find`) because on a
++# fresh fork checkout the path doesn't exist until configure populates it;
++# `find` would return empty.
++export TT_METAL_RUNTIME_ROOT="/home/mhnie/tt-mlir-sglang/third_party/tt-metal/src/tt-metal"
++
+ echo "[3/4] Configuring + building tt-xla against local tt-mlir-sglang..."
+ if [[ ! -f "$TTXLA_DIR/build-local/build.ninja" ]]; then
+     cmake -G Ninja -B "$TTXLA_DIR/build-local" -S "$TTXLA_DIR" \
+-        -DTTMLIR_SOURCE_DIR_OVERRIDE="$TTMLIR_DIR" \
+         -DCMAKE_BUILD_TYPE=Release
+ fi
+ ninja -C "$TTXLA_DIR/build-local" -j "$NPROC"

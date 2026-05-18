@@ -1,0 +1,57 @@
+--- /tmp/CMakeLists.txt.before	2026-05-18 00:34:02.601577372 -0700
++++ third_party/CMakeLists.txt	2026-05-18 00:45:49.835016421 -0700
+@@ -32,7 +32,8 @@
+ 
+     # ----- tt-mlir -----
+     set(TTMLIR_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tt-mlir")
+-    set(TTMLIR_BUILD_DIR "${TTMLIR_SOURCE_DIR}/src/tt-mlir/build")
++    # Redirected to fork's build dir per docs/superpowers/specs/2026-05-17-tt-xla-tilize-attack-design.md Phase 1.
++    set(TTMLIR_BUILD_DIR "/tt-mlir-sglang/build")
+     set(WITH_METAL_RUNTIME_ROOT_SET "")
+     if(NOT DEFINED ENV{TT_METAL_RUNTIME_ROOT})
+         set(WITH_METAL_RUNTIME_ROOT_SET "TT_METAL_RUNTIME_ROOT=${TTPJRT_SOURCE_DIR}/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal")
+@@ -47,18 +48,27 @@
+     ExternalProject_Add(
+         tt-mlir
+         PREFIX ${TTPJRT_SOURCE_DIR}/third_party/tt-mlir
++        SOURCE_DIR /tt-mlir-sglang
+ 
+-        # Installing the python dependencies before the build
+-        PATCH_COMMAND mkdir -p ${TTMLIR_BUILD_DIR}
+-        COMMAND TTPJRT_SOURCE_DIR=${TTPJRT_SOURCE_DIR} bash ${TTPJRT_SOURCE_DIR}/venv/install_ttmlir_requirements.sh
++        DOWNLOAD_COMMAND ""
++        CONFIGURE_COMMAND ""
++        BUILD_COMMAND ""
++
++        # PATCH_COMMAND neutered too: the fork's build is pre-built by
++        # build_and_install.sh step [1-2]/4, so no Python-deps install needed
++        # here. The original PATCH_COMMAND ran install_ttmlir_requirements.sh
++        # which expected the canonical tt-mlir/src/tt-mlir tree layout.
++        PATCH_COMMAND ""
+ 
+         CMAKE_GENERATOR Ninja
+         BINARY_DIR ${TTMLIR_BUILD_DIR}
+ 
+-        BUILD_COMMAND env ${WITH_METAL_RUNTIME_ROOT_SET} ${CMAKE_COMMAND} --build <BINARY_DIR>
+-
+-        INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --component SharedLib
+-        COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --component DistributedRuntime
++        # CRITICAL: --prefix override is required because the fork's build was
++        # configured WITHOUT -DCMAKE_INSTALL_PREFIX=${TTMLIR_INSTALL_PREFIX},
++        # so its CMakeCache caches /usr/local. Without --prefix, install lands
++        # in /usr/local/lib and tt-xla links the stale canonical artifacts.
++        INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --prefix ${TTMLIR_INSTALL_PREFIX} --component SharedLib
++        COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --prefix ${TTMLIR_INSTALL_PREFIX} --component DistributedRuntime
+ 
+         CMAKE_ARGS
+           -DCMAKE_BUILD_TYPE=${TTMLIR_BUILD_TYPE}
+@@ -79,9 +89,6 @@
+           -DTTMLIR_ENABLE_TOOLS=${TTXLA_ENABLE_TOOLS}
+           -DTTMLIR_ENABLE_DOCS=OFF
+           -DTT_USE_SYSTEM_SFPI=${TT_USE_SYSTEM_SFPI}
+-        GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git
+-        GIT_TAG ${TT_MLIR_VERSION}
+-        GIT_PROGRESS ON
+     )
+ 
+     if(TTXLA_ENABLE_EXPLORER)
