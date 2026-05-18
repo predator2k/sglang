@@ -76,8 +76,8 @@ Phase 0 is a gate, not a formality. The Phase 0.3 quantitative threshold is the 
 
 | Step | Action | Mechanism | Output | Gate |
 |---|---|---|---|---|
-| 0.1 | Bucket existing Tracy CSV Tilizes by sibling-op context (weight tilize vs activation tilize) | Re-run `tracy_aggregate.py` on existing fixture, augment with column joining each Tilize to its consumer op's tensor shape; weights have known shapes from `hf_model.named_parameters()` | % split | If weights ≪ 5 %, document in Phase 5 and proceed (no descope — A.1.a/A.3 still land, just with lower expected gain) |
-| 0.2 | Dump tt-xla StableHLO + TTIR for one decode step. Inspect block-arg attrs | Set `torch_xla.set_custom_compile_options({"export_path": "/tmp/shlo_dump", "enable_const_eval": True})` before warm-up. Run probe with `--decode 1`. Files appear under `/tmp/shlo_dump/{vhlo,shlo,shlo_frontend,shlo_compiler,ttir,ttnn}.mlir`. Grep `shlo.mlir` for `mhlo.`/`tf.`/`jax.`/`torch.`-prefixed arg attrs | Confirmed torch_xla marker name(s) on block args, OR "no per-arg marker" | "No per-arg marker" → activate A.3.b fallback in Phase 4 (heuristic). NOT a descope. |
+| 0.1 | Bucket Tracy Tilizes by tensor shape (weight tilize vs activation tilize) | The aggregator at `_fixtures/tracy_aggregate.py` only reads `OP CODE`; it does NOT have shape columns. Use the RAW `ops_perf_results_*.csv` directly (Tracy emits per-op input/output shape columns natively — e.g., `INPUT_0_SHAPE`, `OUTPUT_SHAPE` or similar). Write a small one-shot Python script that filters rows where `OP CODE == "TilizeWithValPadding"`, parses the shape column, and joins against known weight shapes derived from `hf_model.config` (e.g., `[vocab, hidden]`, `[hidden, 3*hidden]`, etc.) — anything matching a known weight shape is a "weight tilize"; everything else is "activation tilize". If the raw CSV's shape column name isn't obvious, run `head -1 ops_perf_results_*.csv | tr ',' '\n'` and pick the right column. | % split | If weights ≪ 5 %, document in Phase 5 and proceed (no descope — A.1.a/A.3 still land, just with lower expected gain) |
+| 0.2 | Dump tt-xla StableHLO + TTIR for one decode step. Inspect block-arg attrs | Set `torch_xla.set_custom_compile_options({"export_path": "/tmp/shlo_dump", "enable_const_eval": True})` before warm-up. Run probe with `--decode 1`. **First confirm the round-trip works**: after one decode, `ls /tmp/shlo_dump/` must show at least `shlo.mlir` (or similar). If empty, the Python→C++ option-key serialization isn't reaching `module_builder.cc` — investigate before any other Phase 0 work. Then grep `shlo.mlir` for `mhlo.`/`xla.`/`tf.`/`jax.`/`torch.`/`_xla` -prefixed arg attrs. | Confirmed torch_xla marker name(s) on block args, OR "no per-arg marker" | "No per-arg marker" → activate A.3.b fallback in Phase 4 (heuristic). NOT a descope. |
 | 0.3 | Count redundant layout kernel pairs in TTNN IR | Open `/tmp/shlo_dump/ttnn.mlir` from 0.2. Grep `ttnn.tilize`, `ttnn.untilize`, `ttnn.tilize_with_val_padding`. Count `untilize → ≤2 layout-agnostic ops → tilize` triples (and the reverse) | Cancellable-pair count | If < 50 per decode step, de-scope A.2.a (Phase 3 → skipped). Document count in Phase 5. |
 
 If 0.2 also produces a clean per-arg parameter marker, capture an arg attr example for the Phase 4 implementation.
@@ -131,7 +131,7 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
    - Insert before step `[3/4]`: `export TT_METAL_RUNTIME_ROOT="/home/mhnie/tt-mlir-sglang/third_party/tt-metal/src/tt-metal"`. This path will exist after script step [1-2]/4 completes (fork's own ExternalProject pulls tt-metal there during fork configure+build).
    - Hardcode rather than `find`, because the find returns empty on fresh checkouts. The fork's CMakeLists.txt is what populates the path.
 
-4. Save the CMakeLists.txt edit and the build-script edit as checked-in patches under `/home/mhnie/sglang/python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-source-dir-fork.patch` and `.../patches/tt-mlir-sglang-build-script-cleanup.patch` so they can be re-applied after container restart.
+4. Create the patches directory if missing (`mkdir -p /home/mhnie/sglang/python/sglang/srt/hardware_backend/tenstorrent/patches/`), then save the CMakeLists.txt edit and the build-script edit as checked-in patches under `tt-xla-source-dir-fork.patch` and `tt-mlir-sglang-build-script-cleanup.patch` so they can be re-applied after container restart.
 
 5. Run `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang). It builds fork first (steps [1-2]/4), THEN configures+builds tt-xla which consumes the pre-built fork (step [3]/4), THEN installs plugin (step [4]/4). Ordering matters.
 
@@ -173,26 +173,29 @@ Verification:
 
 Commits: tt-xla side (`module_builder.cc` change) lives in `/home/mhnie/tt-xla/pjrt_implementation/` — since `/home/mhnie/tt-xla/` is a host clone of canonical tt-xla, the diff lives as a local patch; sync to `/home/mhnie/tt-mlir-sglang/` if a fork branch is later set up for it. For now, save the diff under `python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-argument-type-map.patch` in sglang and `git apply` from the container. Sglang commit captures the patch + bench fixture.
 
-### Phase 3 — A.2.a (post-decomp fold pass) — conditional on Phase 0.3
+### Phase 3 — A.2.a (extended ToLayoutOp fold) — conditional on Phase 0.3
 
-If Phase 0.3 reports ≥ 50 cancellable pairs per decode:
+**Reframed (review 6 finding).** `ttnn.tilize` / `ttnn.untilize` / `ttnn.tilize_with_val_padding` are NOT MLIR ops. The TTNN dialect only has `ttnn.to_layout` (per `include/ttmlir/Dialect/TTNN/IR/TTNNOps.td`); the runtime kernels `TilizeWithValPadding` etc. are dispatched by tt-metal when each `to_layout` op executes. So the MLIR pass must match `to_layout` ops, not named tilize/untilize ops. `TTNNDecomposeLayouts.cpp` confirms: after decompose, the IR still contains `to_layout` ops — they're just simpler (layout-only, separated from dtype/memory-config conversions). Each surviving `to_layout` lowers to one runtime kernel dispatch.
+
+If Phase 0.3 reports ≥ 50 candidate fold targets per decode:
 
 Implementation:
-- New file `/home/mhnie/tt-mlir-sglang/lib/Dialect/TTNN/Transforms/TTNNFoldRedundantLayoutKernels.cpp`.
-- Pattern matches `tilize → layout-agnostic-op* → untilize` and the symmetric `untilize → … → tilize` where the intervening ops can equivalently run on the source layout. Layout-agnostic = same-shape elementwise ops AND ops that ttnn supports natively in both tile and row-major.
-- Allowlist (start conservative): `ttnn.add`, `ttnn.multiply`, `ttnn.subtract`, `ttnn.relu`, `ttnn.gelu`, `ttnn.silu`, `ttnn.typecast` (when output dtype is layout-preserving). Expand only after measuring stable.
+- New file `/home/mhnie/tt-mlir-sglang/lib/Dialect/TTNN/Transforms/TTNNFoldThroughAgnosticOps.cpp`.
+- Pattern matches `ttnn.to_layout(allowlist_op(ttnn.to_layout(x, L1)), L0)` and rewrites to `allowlist_op(x)` when L0 == original layout of x and the allowlist op is genuinely layout-agnostic for the dtype involved. The existing `foldConsecutiveToLayoutOp` at `TTNNOps.cpp:2062` already handles the case where the two `to_layout` ops are directly adjacent; this new pattern handles the non-adjacent case with an allowlist op between them.
+- Allowlist (start conservative): `ttnn.add`, `ttnn.multiply`, `ttnn.subtract`, `ttnn.relu`, `ttnn.gelu`, `ttnn.silu`, `ttnn.typecast` (when output dtype is layout-preserving). Each entry must have its own per-dtype/per-layout compatibility predicate (open item in §9). Expand only after measuring stable.
 - Mirror the DRAM↔L1 safety guard from `foldConsecutiveToLayoutOp` (`TTNNOps.cpp:2078–2089`): don't fold when source op stages to DRAM and the eventual consumer expects L1 (or vice versa).
 - Register pass via `Passes.td` (in `include/ttmlir/Dialect/TTNN/Transforms/Passes.td`).
-- Wire into `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp` inside the helper `createTTNNPipelineLayoutDecompositionPass` (defined at line 249): add `pm.addPass(createTTNNFoldRedundantLayoutKernels());` immediately after the existing `pm.addPass(createTTNNDecomposeLayouts());` at line 251. The helper is invoked from the top-level pipeline at line 407 (inside `devicePm`), so placement inside the helper ensures the new fold runs in every context where layout decomposition runs. Verify by reading any other pass added inside the helper after the decompose call (today: none — decompose is the last op there).
+- Wire into `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp` inside the helper `createTTNNPipelineLayoutDecompositionPass` (defined at line 249): add `pm.addPass(createTTNNFoldThroughAgnosticOps());` immediately after the existing `pm.addPass(createTTNNDecomposeLayouts());` at line 251. The helper is invoked from the top-level pipeline at line 407 (inside `devicePm`), so placement inside the helper ensures the new fold runs in every context where layout decomposition runs.
 
 Verification:
-- Re-dump `ttnn.mlir` via `export_path`. Re-run Phase 0.3 counting script. Confirm cancellable-pair count drops.
-- Tracy probe: total Tilize+Untilize op count should drop by approximately the cancelled-pair count × 2.
+- Re-dump `ttnn.mlir` via `export_path`. Re-run Phase 0.3 counting script. Confirm `to_layout`-allowlist_op-`to_layout` triple count drops.
+- Tracy probe: total Tilize+Untilize+Typecast kernel count should drop. **The drop is NOT necessarily count × 2** — one MLIR `ttnn.to_layout` may lower to one OR several runtime kernels depending on dtype/memory-config (TilizeWithValPadding + Typecast etc.). Treat the Tracy delta as directional, not numeric.
 - Server bench: TPOT should drop. Numeric expectation depends on the activation-tilize share from Phase 0.1.
 
 Risks:
 - Allowlist too aggressive → wrong layout reaches a kernel that secretly assumes one layout. Mitigation: bench accuracy test (greedy-only, 10 prompts, byte-exact vs Phase 1 baseline) is a release gate.
 - Pass placement wrong → other passes re-insert redundant layout kernels after this fold runs. Mitigation: dump IR after each pipeline pass with `--mlir-print-ir-after-all` (set via env var or extra pass option in pjrt-plugin-tt) and verify the fold's output survives.
+- The existing `foldConsecutiveToLayoutOp` may catch cases the new pattern thought it needed to handle — verify by inspecting IR before/after the existing fold runs in pipeline.
 
 ### Phase 4 — A.3.a (auto-detect parameter markers in tt-mlir)
 
@@ -202,7 +205,8 @@ Why not `AnalyzeMesh.cpp`: `AnalyzeMesh.cpp:120–132` emits errors when a block
 
 Implementation:
 - Add a new small pass `populateArgumentTypesAutoDetect` in `lib/Dialect/StableHLO/Transforms/` (or fold into `StableHLOToTTIRPass.cpp` if simpler).
-- For each `func::FuncOp`: classify block args using the same A→B→C strategy as Phase 2 (Strategy A: per-arg marker; B: module-level cluster marker; C: heuristic). Strategy A→B priority: scan all block args once; if ANY block arg carries a per-arg marker, use Strategy A for the entire function and ignore module-level cluster markers (do not mix); otherwise look for module-level cluster marker (Strategy B); otherwise fall to heuristic (Strategy C). Mixing two markers in one function is undefined and the classifier must assert.
+- For each `func::FuncOp`: classify block args using the same A→B→C strategy as Phase 2 (Strategy A: per-arg marker; B: module-level cluster marker; C: heuristic). Strategy A→B priority: scan all block args once; if ANY block arg carries a per-arg marker, use Strategy A for the entire function and ignore module-level cluster markers (do not mix); otherwise look for module-level cluster marker (Strategy B); otherwise fall to heuristic (Strategy C). Mixing two markers in one function: emit a warning and fall through to Strategy C (graceful degrade, not abort).
+- **Target function scope.** Like Phase 2, restrict the auto-detect pass to the **unique non-private `func::FuncOp`** of the module (every torch_xla compile emits one such function; the inliner may collapse helpers into it but the entry function itself is stable). If multiple non-private funcs are present, log a warning and process none — downstream pipeline runs with no auto-detect entries for that module.
 - For each classified `Parameter` arg, set the function's arg attr at `ttcore.argument_type = #ttcore<argument_type parameter>`. **Skip args that already carry `ArgumentTypeAttr`** (don't overwrite Phase 2's explicit map).
 - Schedule the new pass in `StableHLOPipelines.cpp` AFTER the existing `createTTPopulateArgumentTypes` invocation (`StableHLOPipelines.cpp:24`), and BEFORE the `createAnalyzeMeshPass` invocation (`StableHLOPipelines.cpp:52`). Order in the pipeline: `tt-populate-argument-types → populateArgumentTypesAutoDetect → analyze-mesh`. **Reason for after-populate:** `tt-populate-argument-types` at `PopulateArgumentTypes.cpp:286–313` unconditionally OVERWRITES `ArgumentTypeAttr` whenever the map provides a value for that function (it doesn't merge; it emits a warning and replaces). If auto-detect ran first, every entry it set would be clobbered by Phase 2's explicit map. Running auto-detect AFTER (and short-circuiting on existing attr) means: explicit map wins for mapped functions; auto-detect fills in unmapped functions or args. **Reason for before-analyze-mesh:** `AnalyzeMesh.cpp:120–132` is gated on `automaticArgAnalysis` (line 353); today tt-xla doesn't enable it, but if a future compile path does, `AnalyzeMesh` errors on un-annotated args — auto-detect must populate before it runs.
 
@@ -240,16 +244,17 @@ Verification:
 
 ### Phase 5 — Final reporting (~30 min)
 
-- Update `docs/platforms/tt_xla_tpot_handoff_2026-05-17.md` with a new TPOT table (post-Phase-1, post-A.1.a, post-A.2.a if landed, post-A.3.a if landed). Note any patches that needed re-applying after container restart.
+- Update `docs/platforms/tt_xla_tpot_handoff_2026-05-17.md` with a new TPOT table. Mirror the existing format at lines 11–22 (columns: Config | TPOT warm | tok/s | vs baseline). Add one row per landed phase. Note any patches that needed re-applying after container restart.
 - Always update memory `tenstorrent-tt-xla-tilize-bottleneck.md` with which attacks landed, measured TPOT, and residual bottleneck.
 - Always update memory `tenstorrent-tt-mlir-sglang-fork.md` if any new commits were added.
+- Update memory `tenstorrent-tt-xla-tpot-workstream-a.md` to correct the prior claim that the script "built B.2 v3 into the canonical wheel" — Phase 1's reality check found the script's `-DTTMLIR_SOURCE_DIR_OVERRIDE` was dead code; the working build was a separate manual operation.
 - Write a NEW memory only if Phase 0 surfaced a finding worth saving for future sessions (e.g., an unexpected pipeline ordering, a marker name worth remembering, a layout-agnostic-op behavior that's not what the type system claimed).
 
 ## 6. Verification cadence
 
 Per phase: Tracy probe → server bench → commit. ~30 min per loop. Isolates which change moved which metric and keeps fixtures aligned with commits.
 
-**All bench commands must include `BYPASS_PREWARM=1`** (handoff doc Pitfall #4 — required on the rebuilt plugin). Tracy probe also requires it. Cache mode: keep `SGLANG_TT_CACHE_MODE=index_copy` for consistency with the shipped baseline.
+**All bench commands must include `BYPASS_PREWARM=1` as an environment variable** (NOT a CLI flag — it's read at server startup; handoff doc Pitfall #4 — required on the rebuilt plugin). Tracy probe also requires it. Cache mode: keep `SGLANG_TT_CACHE_MODE=index_copy` for consistency with the shipped baseline.
 
 Tracy probe: `probe_decode_op_profile.py` with **`--decode 5`** (handoff doc Pitfall #2 — each step adds 30 MB to the trace; >5 risks container OOM).
 
@@ -285,11 +290,11 @@ Fixtures saved alongside commit: `_fixtures/v146_3run_server_q8b_<phase>.json`.
 - Phase 0: ~1.5 hours (0.1 ≈ 30 min, 0.2 ≈ 45 min including `export_path` wire-up + Python-bool round-trip, 0.3 ≈ 15 min)
 - Phase 1: ~2 hours (CMakeLists.txt edit + ExternalProject_Add neutering + TT_METAL_RUNTIME_ROOT redirect + build-script edit + stamp/dir cleanup + rebuild + verify-fork-loaded + smoke). Bumped from 1.5h after review-4 surfaced the ExternalProject collision and runtime-root issues.
 - Phase 2: ~4 hours (≈ 1.5h C++ classifier with all three strategies + 1h mini-test scaffolding and execution + 30 min rebuild + 1h bench/verify/commit). The mini-test (mandatory before live use) is what bumped this.
-- Phase 3: ~3 hours (only if Phase 0.3 ≥ 50 cancellable pairs)
+- Phase 3: ~5 hours (only if Phase 0.3 ≥ 50 cancellable pairs). Bumped from 3h after review 6 reframed the pass to match `to_layout` patterns rather than non-existent named tilize/untilize ops; new logic must coexist with the existing `foldConsecutiveToLayoutOp` without duplicating its work.
 - Phase 4: ~2 hours (most logic is reused from Phase 2 classifier; new work is the schedule-in-StableHLOPipelines + short-circuit-on-existing-attr + verification under `TT_DISABLE_PJRT_ARG_TYPE_MAP=1`)
 - Phase 5: ~30 min
 
-Total: ~10 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~13 hours maximum (all phases).
+Total: ~10 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~15 hours maximum (all phases, after Phase 3 reframe).
 
 ## 9. Open items to confirm in writing-plans
 
