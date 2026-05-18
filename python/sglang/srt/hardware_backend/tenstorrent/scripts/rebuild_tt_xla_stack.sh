@@ -40,7 +40,10 @@
 # rebuild, you must copy fork outputs into the plugin's lib64 — see the
 # "install fork libs into plugin lib64" section at the end.
 
-set -euo pipefail
+# -e: exit on error. -o pipefail: catch pipe failures.
+# NOT -u: env/activate references unset shell vars (e.g.,
+# `_ACTIVATE_ECHO_TOOLCHAIN_DIR_AND_EXIT`) which would error out under nounset.
+set -eo pipefail
 
 # ============================================================================
 # Configuration
@@ -220,15 +223,102 @@ fi
 
 ln -sfn "${TTMLIR_DIR}" "${CANONICAL_SRC_PATH}/tt-mlir"
 
+# Touching stamps alone is NOT sufficient — tt-xla's ExternalProject_Add
+# has `BUILD_COMMAND env ... cmake --build <BINARY_DIR>` and a git update
+# step that would attempt git operations on the symlinked fork (resulting
+# in "stash entry conflicts" because fork has its own diverging commits).
+# So ALSO neuter the EP via in-place CMakeLists.txt edit (idempotent: skip
+# if already neutered).
+
+TTXLA_CMAKELISTS="${TTXLA_DIR}/third_party/CMakeLists.txt"
+
+if grep -q "SOURCE_DIR ${TTMLIR_DIR}" "${TTXLA_CMAKELISTS}"; then
+    echo "  CMakeLists.txt already neutered for fork (idempotent skip)"
+else
+    echo "  Patching CMakeLists.txt to neuter ExternalProject_Add(tt-mlir)..."
+
+    # Backup once (don't overwrite a backup we already made).
+    if [[ ! -f "${TTXLA_CMAKELISTS}.original" ]]; then
+        cp -p "${TTXLA_CMAKELISTS}" "${TTXLA_CMAKELISTS}.original"
+    fi
+
+    # Use python for the multi-line edit — safer than sed for this
+    # because we need to insert and remove specific blocks together.
+    python3 - <<PY_EOF
+import re
+path = "${TTXLA_CMAKELISTS}"
+src = open(path).read()
+
+# 1) Redirect TTMLIR_BUILD_DIR to fork build dir
+src = src.replace(
+    'set(TTMLIR_BUILD_DIR "\${TTMLIR_SOURCE_DIR}/src/tt-mlir/build")',
+    'set(TTMLIR_BUILD_DIR "${TTMLIR_DIR}/build")  # redirected to fork by rebuild_tt_xla_stack.sh'
+)
+
+# 2) Strip GIT_REPOSITORY, GIT_TAG, GIT_PROGRESS (lines anywhere in the
+# ExternalProject_Add(tt-mlir ...) block).
+src = re.sub(r'\n[ \t]*GIT_REPOSITORY[^\n]*', '', src, count=1)
+src = re.sub(r'\n[ \t]*GIT_TAG[^\n]*', '', src, count=1)
+src = re.sub(r'\n[ \t]*GIT_PROGRESS[^\n]*', '', src, count=1)
+
+# 2b) Strip the original BUILD_COMMAND line (the one with 'env ... cmake
+# --build <BINARY_DIR>'). Our injected BUILD_COMMAND "" right after PREFIX
+# already handles this — but if the original line stays, CMake will treat
+# the EP as needing a real build step and re-rebuild the fork on every
+# tt-xla configure.
+src = re.sub(r'\n[ \t]*BUILD_COMMAND env \\\$\{WITH_METAL_RUNTIME_ROOT_SET\}[^\n]*', '', src)
+
+# 3) Inject SOURCE_DIR / DOWNLOAD_COMMAND / CONFIGURE_COMMAND / BUILD_COMMAND
+# overrides and remove PATCH_COMMAND lines, by editing the tt-mlir EP block.
+# The tt-mlir EP starts at the line containing 'ExternalProject_Add(' followed
+# by '\\n        tt-mlir'. We anchor on the literal 'PREFIX \${TTPJRT_SOURCE_DIR}/third_party/tt-mlir'
+# which appears right after 'tt-mlir'.
+
+# Inject SOURCE_DIR + DOWNLOAD/CONFIGURE/BUILD overrides right after the PREFIX line.
+src = src.replace(
+    "PREFIX \${TTPJRT_SOURCE_DIR}/third_party/tt-mlir\n",
+    "PREFIX \${TTPJRT_SOURCE_DIR}/third_party/tt-mlir\n"
+    "        SOURCE_DIR ${TTMLIR_DIR}\n"
+    "        DOWNLOAD_COMMAND \"\"\n"
+    "        CONFIGURE_COMMAND \"\"\n"
+    "        BUILD_COMMAND \"\"\n",
+    1
+)
+
+# Remove PATCH_COMMAND + its COMMAND continuation (install_ttmlir_requirements.sh)
+src = re.sub(
+    r'\n[ \t]*# Installing the python dependencies before the build[^\n]*'
+    r'\n[ \t]*PATCH_COMMAND mkdir -p \\\$\{TTMLIR_BUILD_DIR\}'
+    r'\n[ \t]*COMMAND TTPJRT_SOURCE_DIR=[^\n]*',
+    '\n        PATCH_COMMAND ""  # neutered; fork is pre-built externally',
+    src
+)
+
+# Override INSTALL_COMMAND lines with explicit --prefix (idempotent: skip if
+# already has --prefix).
+if '--prefix \${TTMLIR_INSTALL_PREFIX}' not in src:
+    src = src.replace(
+        'INSTALL_COMMAND \${CMAKE_COMMAND} --install <BINARY_DIR> --component SharedLib',
+        'INSTALL_COMMAND \${CMAKE_COMMAND} --install <BINARY_DIR> --prefix \${TTMLIR_INSTALL_PREFIX} --component SharedLib'
+    )
+    src = src.replace(
+        'COMMAND \${CMAKE_COMMAND} --install <BINARY_DIR> --component DistributedRuntime',
+        'COMMAND \${CMAKE_COMMAND} --install <BINARY_DIR> --prefix \${TTMLIR_INSTALL_PREFIX} --component DistributedRuntime'
+    )
+
+open(path, 'w').write(src)
+print(f"  patched: {path}")
+PY_EOF
+fi
+
 # Touch every stamp file the ExternalProject_Add would create so it skips
-# all sub-steps. Order matters — build stamp must be newer than configure
-# stamp, install newer than build, etc. We just touch them all now (same
-# mtime); CMake's check is "newer-than" so equal timestamps satisfy.
+# all sub-steps. Order matters — newer-than checks. Use same mtime; CMake's
+# check is "newer-than", equal timestamps satisfy.
 for stage in mkdir download update patch configure build install; do
     touch "${CANONICAL_SRC_PATH}/tt-mlir-stamp/tt-mlir-${stage}"
 done
 
-echo "  symlink + stamps in place"
+echo "  symlink + stamps + CMakeLists patch in place"
 
 # ============================================================================
 # Step 5: Configure + build tt-xla plugin
