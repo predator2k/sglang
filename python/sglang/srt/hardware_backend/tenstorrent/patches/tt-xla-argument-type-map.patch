@@ -1,0 +1,466 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+index 87e6db017..0d188e4a5 100644
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -19,6 +19,8 @@
+ #include <vector>
+ 
+ // llvm includes
++#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/LogicalResult.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -56,6 +58,7 @@
+ #include "ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
++#include "ttmlir/Dialect/TTCore/Utils/PopulateArgumentTypes.h"
+ #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
+ #include "ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h"
+@@ -81,6 +84,417 @@ namespace tt::pjrt::module_builder {
+ 
+ const std::string c_mlir_format_name = "mlir";
+ 
++//===----------------------------------------------------------------------===//
++// Phase 2 (A.1.a): classifyArgs — derive a TTArgumentTypeMap from the SHLO
++// module so that tt-populate-argument-types can set ttcore.argument_type
++// attrs on block args, enabling ConstEvalHoistTransform to hoist
++// weight-touching subgraphs. See docs/superpowers/specs/
++// 2026-05-17-tt-xla-tilize-attack-design.md §5 Phase 2.
++//===----------------------------------------------------------------------===//
++
++namespace {
++
++// Find the unique non-private FuncOp in the module. Returns nullptr if 0 or
++// > 1 non-private funcs exist.
++mlir::func::FuncOp findUniqueEntryFunc(mlir::ModuleOp module) {
++  mlir::func::FuncOp result;
++  for (auto func : module.getOps<mlir::func::FuncOp>()) {
++    if (func.isPrivate()) {
++      continue;
++    }
++    if (result) {
++      LOG_F(WARNING,
++            "[TT-XLA classifyArgs] module has multiple non-private FuncOps; "
++            "skipping auto-classification");
++      return {};
++    }
++    result = func;
++  }
++  return result;
++}
++
++// True iff any block arg of `func` carries a *non-default* ttcore.argument_type
++// (i.e. Parameter or Constant), indicating a real upstream signal from JAX /
++// frontend pattern matching. The tt-xla frontend pass
++// `setDefaultRoleForUnannotatedArguments` blanket-stamps every torch_xla arg
++// with `Input` regardless of whether it's a weight, so a uniform-Input
++// annotation set is the "no signal" case — the heuristic classifier should
++// still run and overwrite.
++bool funcHasNonDefaultArgTypeAttrs(mlir::func::FuncOp func) {
++  for (uint32_t i = 0; i < func.getNumArguments(); ++i) {
++    auto attr = func.getArgAttrOfType<mlir::tt::ttcore::ArgumentTypeAttr>(
++        i, mlir::tt::ttcore::ArgumentTypeAttr::name);
++    if (attr && attr.getValue() != mlir::tt::ttcore::ArgumentType::Input) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Strategy A: read per-arg torch_xla marker. Phase 0.2 finding: torch_xla
++// emits no such per-arg marker, so this returns false for torch_xla
++// modules. Kept for forward-compat with future torch_xla / JAX flows.
++constexpr llvm::StringRef kPerArgMarkerName = "mhlo.parameter_replication";
++
++bool applyStrategyA(
++    mlir::func::FuncOp func,
++    llvm::SmallVector<mlir::tt::ttcore::ArgumentType> &arg_types) {
++  bool found_any = false;
++  for (uint32_t i = 0; i < func.getNumArguments(); ++i) {
++    auto attr = func.getArgAttr(i, kPerArgMarkerName);
++    if (!attr) {
++      return false; // missing on this arg → A cannot fully classify
++    }
++    found_any = true;
++    bool is_parameter = false;
++    if (auto bool_attr = mlir::dyn_cast<mlir::BoolAttr>(attr)) {
++      is_parameter = bool_attr.getValue();
++    } else if (auto str_attr = mlir::dyn_cast<mlir::StringAttr>(attr)) {
++      auto v = str_attr.getValue();
++      is_parameter = (v == "parameter" || v == "weight");
++    } else if (auto arr_attr = mlir::dyn_cast<mlir::ArrayAttr>(attr)) {
++      // Common torch_xla form: array of i64/bool. Treat any non-empty / true
++      // element as Parameter.
++      for (auto elt : arr_attr) {
++        if (auto b = mlir::dyn_cast<mlir::BoolAttr>(elt)) {
++          if (b.getValue()) {
++            is_parameter = true;
++            break;
++          }
++        } else if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(elt)) {
++          if (i.getInt() != 0) {
++            is_parameter = true;
++            break;
++          }
++        }
++      }
++    }
++    arg_types.push_back(is_parameter
++                            ? mlir::tt::ttcore::ArgumentType::Parameter
++                            : mlir::tt::ttcore::ArgumentType::Input);
++  }
++  return found_any;
++}
++
++// Strategy B: read module-level cluster marker array.
++constexpr llvm::StringRef kClusterMarkerName = "mhlo.parameter_replication";
++
++bool applyStrategyB(
++    mlir::func::FuncOp func,
++    llvm::SmallVector<mlir::tt::ttcore::ArgumentType> &arg_types) {
++  auto attr = func->getAttr(kClusterMarkerName);
++  if (!attr) {
++    return false;
++  }
++  auto array = mlir::dyn_cast<mlir::ArrayAttr>(attr);
++  if (!array) {
++    return false;
++  }
++  if (array.size() != func.getNumArguments()) {
++    LOG_F(WARNING,
++          "[TT-XLA classifyArgs] cluster marker size mismatch: %u args, "
++          "%zu marker entries — falling through to Strategy C",
++          func.getNumArguments(), array.size());
++    return false;
++  }
++  for (auto entry : array) {
++    bool is_parameter = false;
++    if (auto bool_attr = mlir::dyn_cast<mlir::BoolAttr>(entry)) {
++      is_parameter = bool_attr.getValue();
++    }
++    arg_types.push_back(is_parameter
++                            ? mlir::tt::ttcore::ArgumentType::Parameter
++                            : mlir::tt::ttcore::ArgumentType::Input);
++  }
++  return true;
++}
++
++// Strategy C — Rule 1 (shape gate): tensor passes if every dim ≥ 16, OR
++// rank == 1 with that dim ≥ 64. Excludes attention_mask (size-1 dims) and
++// scalar/small tensors.
++bool ruleOneShapeGate(mlir::BlockArgument arg) {
++  auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType());
++  if (!tensor_type) {
++    return false;
++  }
++  auto shape = tensor_type.getShape();
++  if (shape.empty()) {
++    return false;
++  }
++  if (shape.size() == 1) {
++    return shape[0] >= 64;
++  }
++  for (int64_t dim : shape) {
++    if (dim < 16) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Layout-only ops are traversed transparently when walking use chains.
++bool isLayoutOnlyOp(mlir::Operation *op) {
++  if (!op) {
++    return false;
++  }
++  llvm::StringRef name = op->getName().getStringRef();
++  return name == "stablehlo.transpose" || name == "stablehlo.reshape" ||
++         name == "stablehlo.broadcast_in_dim" ||
++         name == "stablehlo.convert" || name == "stablehlo.slice";
++}
++
++// Terminal-use allowlist for Rule 2. `operand` is the value being checked.
++bool isAllowlistTerminalUse(mlir::Operation *op, mlir::Value operand) {
++  if (!op) {
++    return false;
++  }
++  llvm::StringRef name = op->getName().getStringRef();
++  if (name == "stablehlo.dot_general") {
++    return true;
++  }
++  if (name == "stablehlo.convolution") {
++    return true;
++  }
++  if (name == "stablehlo.gather") {
++    return true;
++  }
++  if (name == "stablehlo.dynamic_slice") {
++    return true;
++  }
++  if (name == "stablehlo.slice") {
++    return true;
++  }
++  if (name == "stablehlo.multiply" || name == "stablehlo.add") {
++    // The OTHER operand(s) must not be block args (filters fused-activation
++    // bias paths from confusing the heuristic).
++    for (mlir::Value other : op->getOperands()) {
++      if (other == operand) {
++        continue;
++      }
++      if (mlir::isa<mlir::BlockArgument>(other)) {
++        return false;
++      }
++    }
++    return true;
++  }
++  return false;
++}
++
++// Rule 2: every use of the arg lands in the allowlist (possibly via ≤ 3
++// layout-only hops). Returns false if any use is non-allowlisted or the
++// arg is unused.
++bool ruleTwoUsePattern(mlir::BlockArgument arg, int max_layout_hops = 3) {
++  llvm::SmallVector<std::pair<mlir::Value, int>> worklist;
++  worklist.push_back({arg, 0});
++  llvm::DenseSet<mlir::Value> visited;
++  while (!worklist.empty()) {
++    auto entry = worklist.pop_back_val();
++    mlir::Value v = entry.first;
++    int depth = entry.second;
++    if (!visited.insert(v).second) {
++      continue;
++    }
++    if (v.use_empty()) {
++      return false;
++    }
++    for (mlir::OpOperand &use : v.getUses()) {
++      mlir::Operation *user = use.getOwner();
++      if (isLayoutOnlyOp(user)) {
++        if (depth >= max_layout_hops) {
++          return false;
++        }
++        for (mlir::Value result : user->getResults()) {
++          worklist.push_back({result, depth + 1});
++        }
++        continue;
++      }
++      if (!isAllowlistTerminalUse(user, v)) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++// Rule 3: arg is never the destination of a scatter (i.e. it's not mutated
++// in place).
++bool ruleThreeNoMutate(mlir::BlockArgument arg) {
++  for (mlir::OpOperand &use : arg.getUses()) {
++    mlir::Operation *user = use.getOwner();
++    if (user->getName().getStringRef() == "stablehlo.scatter") {
++      if (user->getNumOperands() > 0 && user->getOperand(0) == arg) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++// Rule 4: arg is not a "batched" dynamic-slice source — i.e. it is not the
++// destination operand of a dynamic_slice whose indices come from another
++// block arg (which would mark it as input_ids / position_ids / kv-cache).
++bool ruleFourNotBatchInput(mlir::BlockArgument arg) {
++  for (mlir::OpOperand &use : arg.getUses()) {
++    mlir::Operation *user = use.getOwner();
++    if (user->getName().getStringRef() == "stablehlo.dynamic_slice") {
++      if (user->getNumOperands() > 0 && user->getOperand(0) == arg) {
++        for (uint32_t i = 1; i < user->getNumOperands(); ++i) {
++          if (mlir::isa<mlir::BlockArgument>(user->getOperand(i))) {
++            return false;
++          }
++        }
++      }
++    }
++  }
++  return true;
++}
++
++// Rule 5: arg's forward dataflow does not reach a stablehlo.exponential via
++// at least one add/sub/multiply (softmax denominator path). Depth counts
++// only non-layout ops; worklist capped to 256.
++//
++// We carry a per-frontier "seen_add_mul" bit. Visited bookkeeping uses two
++// separate DenseSets (one per flag value) — std::pair<Value, bool> can't be
++// keyed directly because llvm::DenseMapInfo<bool> doesn't specialize.
++bool ruleFiveSoftmaxPathExcluded(mlir::BlockArgument arg) {
++  struct Item {
++    mlir::Value v;
++    int depth;
++    bool seen_add_mul;
++  };
++  llvm::SmallVector<Item> worklist;
++  worklist.push_back({arg, 0, false});
++  llvm::DenseSet<mlir::Value> visited_clean;
++  llvm::DenseSet<mlir::Value> visited_seen;
++  constexpr int kMaxDepth = 8;
++  constexpr int kMaxWorklist = 256;
++  int popped = 0;
++  while (!worklist.empty()) {
++    if (++popped > kMaxWorklist) {
++      return false; // fail closed
++    }
++    Item item = worklist.pop_back_val();
++    auto &visited = item.seen_add_mul ? visited_seen : visited_clean;
++    if (!visited.insert(item.v).second) {
++      continue;
++    }
++    for (mlir::OpOperand &use : item.v.getUses()) {
++      mlir::Operation *user = use.getOwner();
++      llvm::StringRef name = user->getName().getStringRef();
++      if (name == "stablehlo.exponential" && item.seen_add_mul) {
++        return false;
++      }
++      bool layout_only = isLayoutOnlyOp(user);
++      int new_depth = layout_only ? item.depth : item.depth + 1;
++      if (new_depth > kMaxDepth) {
++        continue;
++      }
++      bool is_add_mul = (name == "stablehlo.add" ||
++                        name == "stablehlo.subtract" ||
++                        name == "stablehlo.multiply");
++      bool new_seen = item.seen_add_mul || is_add_mul;
++      for (mlir::Value result : user->getResults()) {
++        worklist.push_back({result, new_depth, new_seen});
++      }
++    }
++  }
++  return true;
++}
++
++mlir::tt::ttcore::ArgumentType
++classifyOneArgStrategyC(mlir::BlockArgument arg) {
++  if (!ruleOneShapeGate(arg)) {
++    return mlir::tt::ttcore::ArgumentType::Input;
++  }
++  if (!ruleTwoUsePattern(arg)) {
++    return mlir::tt::ttcore::ArgumentType::Input;
++  }
++  if (!ruleThreeNoMutate(arg)) {
++    return mlir::tt::ttcore::ArgumentType::Input;
++  }
++  if (!ruleFourNotBatchInput(arg)) {
++    return mlir::tt::ttcore::ArgumentType::Input;
++  }
++  if (!ruleFiveSoftmaxPathExcluded(arg)) {
++    return mlir::tt::ttcore::ArgumentType::Input;
++  }
++  return mlir::tt::ttcore::ArgumentType::Parameter;
++}
++
++void applyStrategyC(
++    mlir::func::FuncOp func,
++    llvm::SmallVector<mlir::tt::ttcore::ArgumentType> &arg_types) {
++  for (auto arg : func.getArguments()) {
++    arg_types.push_back(classifyOneArgStrategyC(arg));
++  }
++}
++
++mlir::tt::ttcore::TTArgumentTypeMap classifyArgs(mlir::ModuleOp module) {
++  mlir::tt::ttcore::TTArgumentTypeMap result;
++  mlir::func::FuncOp func = findUniqueEntryFunc(module);
++  if (!func) {
++    return result; // empty map — pass becomes no-op
++  }
++
++  // Don't clobber non-default annotations (JAX path / frontend pattern match).
++  // The torch_xla frontend pass annotates every unmarked arg with Input by
++  // default, so a uniform-Input set is the "no signal" case — keep classifying.
++  if (funcHasNonDefaultArgTypeAttrs(func)) {
++    LOG_F(INFO,
++          "[TT-XLA classifyArgs] func '%s' has non-default ttcore.argument_type "
++          "attrs — skipping (likely JAX-origin)",
++          func.getName().str().c_str());
++    return result;
++  }
++
++  llvm::SmallVector<mlir::tt::ttcore::ArgumentType> arg_types;
++
++  if (applyStrategyA(func, arg_types)) {
++    uint32_t k_in = static_cast<uint32_t>(std::count(
++        arg_types.begin(), arg_types.end(),
++        mlir::tt::ttcore::ArgumentType::Input));
++    uint32_t k_p = static_cast<uint32_t>(std::count(
++        arg_types.begin(), arg_types.end(),
++        mlir::tt::ttcore::ArgumentType::Parameter));
++    LOG_F(INFO,
++          "[TT-XLA classifyArgs] strategy=A func='%s' K_inputs=%u K_params=%u",
++          func.getName().str().c_str(), k_in, k_p);
++    result[func.getName()] = std::move(arg_types);
++    return result;
++  }
++
++  arg_types.clear();
++  if (applyStrategyB(func, arg_types)) {
++    uint32_t k_in = static_cast<uint32_t>(std::count(
++        arg_types.begin(), arg_types.end(),
++        mlir::tt::ttcore::ArgumentType::Input));
++    uint32_t k_p = static_cast<uint32_t>(std::count(
++        arg_types.begin(), arg_types.end(),
++        mlir::tt::ttcore::ArgumentType::Parameter));
++    LOG_F(INFO,
++          "[TT-XLA classifyArgs] strategy=B func='%s' K_inputs=%u K_params=%u",
++          func.getName().str().c_str(), k_in, k_p);
++    result[func.getName()] = std::move(arg_types);
++    return result;
++  }
++
++  arg_types.clear();
++  applyStrategyC(func, arg_types);
++  uint32_t k_in = static_cast<uint32_t>(std::count(
++      arg_types.begin(), arg_types.end(),
++      mlir::tt::ttcore::ArgumentType::Input));
++  uint32_t k_p = static_cast<uint32_t>(std::count(
++      arg_types.begin(), arg_types.end(),
++      mlir::tt::ttcore::ArgumentType::Parameter));
++  LOG_F(INFO,
++        "[TT-XLA classifyArgs] strategy=C func='%s' K_inputs=%u K_params=%u",
++        func.getName().str().c_str(), k_in, k_p);
++  result[func.getName()] = std::move(arg_types);
++  return result;
++}
++
++} // namespace
++
+ // Maps per-axis fabric config to TTNN mesh topology for CCL operations.
+ static std::vector<mlir::tt::ttcore::Topology>
+ fabricConfigToMeshTopology(const tt::runtime::MeshFabricConfig &fabricConfig) {
+@@ -830,6 +1244,11 @@ tt_pjrt_status ModuleBuilder::runCompilerStableHLOPipeline(
+                                           mlir::PassManager::Nesting::Implicit);
+   mlir::tt::stablehlo::StableHLOPipelineOptions stablehlo_pipeline_options;
+   stablehlo_pipeline_options.resultPresharded = result_presharded;
++  // Phase 2 A.1.a: populate argumentTypeMap so tt-populate-argument-types
++  // sets ttcore.argument_type on block args; downstream ConstEvalHoistTransform
++  // then fires for weight-touching subgraphs. See docs/superpowers/specs/
++  // 2026-05-17-tt-xla-tilize-attack-design.md §5 Phase 2.
++  stablehlo_pipeline_options.argumentTypeMap = classifyArgs(mlir_module.get());
+   mlir::tt::stablehlo::createStableHLOPipeline(stablehlo_pipeline_pm,
+                                                stablehlo_pipeline_options);
+ 
+@@ -983,6 +1402,14 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+   static std::atomic<int> graph_counter{0};
+ 
+   mlir::tt::ttnn::TTIRToTTNNCommonPipelineOptions options;
++  // Phase 2 A.1.a: feed argumentTypeMap on the TTNN PM as well. By this
++  // point the StableHLO-stage tt-populate-argument-types already wrote
++  // Parameter/Input on the entry func. classifyArgs sees the non-default
++  // attrs and short-circuits, returning an empty map — which
++  // PopulateArgumentTypes treats as a no-op (existing attrs survive intact).
++  // The plumbing is kept for symmetry and for flows where the TTNN PM is the
++  // only place the map can be set.
++  options.argumentTypeMap = classifyArgs(mlir_module.get());
+ 
+   // Optimizer passes are not supported in distributed runtime.
+   if (tt::runtime::getCurrentHostRuntime() ==

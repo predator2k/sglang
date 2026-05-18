@@ -1,0 +1,48 @@
+{
+  "version": "v146",
+  "backend": "tt_xla",
+  "input_len": 1024,
+  "output_len": 1024,
+  "context_len": 2048,
+  "hw": "2x P150a (post-B.2 canonical wheel)",
+  "max_batch_size": 1,
+  "tag": "phase2_a1a",
+  "logdir": "/sglang/python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/bench_3run_phase2_a1a",
+  "results": [
+    {
+      "model": "Qwen3-8B",
+      "model_id": "Qwen/Qwen3-8B",
+      "status": "PASS",
+      "t_ready_s": 58.04881869498058,
+      "input_len": 1024,
+      "output_len": 1024,
+      "run1_cold": {
+        "ttft_ms": 23014.41875900491,
+        "tpot_ms_mean": 154.8728731371192,
+        "tpot_ms_min": 130.4783480009064,
+        "tpot_ms_max": 22822.545885981526,
+        "n_chunks": 1022,
+        "wall_s": 181.13976980300504,
+        "error": null
+      },
+      "run2_warm_new_prompt": {
+        "ttft_ms": 631.3435980118811,
+        "tpot_ms_mean": 132.64569132222226,
+        "tpot_ms_min": 130.2200669888407,
+        "tpot_ms_max": 139.01173797785304,
+        "n_chunks": 1022,
+        "wall_s": 136.06272694899235,
+        "error": null
+      },
+      "run3_warm_kv_hit": {
+        "ttft_ms": 137.64106298913248,
+        "tpot_ms_mean": 132.67828132222925,
+        "tpot_ms_min": 130.31064500682987,
+        "tpot_ms_max": 139.86058798036538,
+        "n_chunks": 1022,
+        "wall_s": 135.6022805729881,
+        "error": null
+      }
+    }
+  ]
+}
