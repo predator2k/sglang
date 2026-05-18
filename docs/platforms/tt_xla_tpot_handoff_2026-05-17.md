@@ -15,7 +15,13 @@
 | tt-xla BF16 + torch.where cache (original) | 162.6 ms | 6.15 | 1.00× |
 | tt-xla BFP8 weights + torch.where | 140.2 ms | 7.13 | 1.16× |
 | **tt-xla BFP8 weights + index_copy_ (shipped default)** | **132.1 ms** | **7.57** | **1.23×** |
+| Phase 1 — fork rebuilt against canonical pin, no A.1.a/A.2.a/A.3.a | 132.52 ms | 7.55 | 1.23× (= baseline) |
+| Phase 2 — A.1.a (`classifyArgs` + explicit `argumentTypeMap`) | 132.65 ms | 7.54 | 1.23× (no movement; within noise) |
+| Phase 3 — A.2.a (to_layout-pair fold) | _SKIPPED_ | — | gate: 4 cancellable triples « 50 |
+| Phase 4 — A.3.a (auto-detect pass) | _SKIPPED_ | — | upstream `annotateArgumentAttributesFromCustomCall` already paints every arg |
 | tt_transformers_paged (production reference) | 37.4 ms | 26.7 | 4.35× |
+
+**Tilize-attack outcome (Phase 0–4):** the classification-axis fixes (A.1.a, A.3.a) did not move TPOT because the upstream tt-xla pjrt frontend pass `annotateArgumentAttributesFromCustomCall` already lifts `tt.mark_argument` custom_calls into per-arg `ttcore.argument_type` attrs and falls back to `Input` for any arg missing the attr. `ConstEvalHoistTransform` already fires (88 wrappers observed) but the hoisted wrappers do not bake into compile-time tile-layout tensors — the residual Tilize bottleneck lives **downstream** of classification, not at it. Phase 0.1 also showed that **only 14.07% of Tilizes are on weight shapes** — the remaining ~86% are activation Tilizes, which no const-eval-hoist style fix can address. See `docs/superpowers/specs/2026-05-17-tt-xla-phase4-skip.md` and the new memory `tenstorrent-tt-xla-argument-type-already-set-upstream.md`.
 
 **Probe-path (direct torch.compile, no sglang server) with same BFP8:** 91.1 ms TPOT. The 41 ms gap from server is host-side overhead, unexplained.
 
@@ -153,6 +159,8 @@ docker exec tt-xla-eval python3 /sglang/python/sglang/srt/hardware_backend/tenst
 ---
 
 ## Open work — concrete next steps
+
+> **SUPERSEDED (2026-05-18).** This section describes the OLD framing of A.1/A.2/A.3 as Python-side pre-tilize work, in-MLIR Tilize/Untilize fold patterns, and a StableHLOToTTIR-only A.3. Through 17 review rounds it became clear those framings were either not implementable or already done upstream. The actual landed implementation is described in `docs/superpowers/specs/2026-05-17-tt-xla-tilize-attack-design.md` (3 phase pairs: A.1.a explicit `argumentTypeMap` + heuristic classifier; A.2.a `to_layout`-pair fold; A.3.a auto-detect pass). Phase 2 (A.1.a) landed with **no TPOT movement** because the upstream pjrt frontend already populates `ttcore.argument_type` on every arg; Phases 3 and 4 were SKIPPED. The real residual bottleneck is **downstream of classification** (hoisted const-eval wrappers don't bake into compile-time tile-layout tensors) and is dominated by **activation Tilizes (~86%)**, not weight Tilizes (14.07%). The three Priority-A bullets below are kept for historical context only.
 
 ### Priority A — close the gap to tt_transformers (~3.5×)
 
