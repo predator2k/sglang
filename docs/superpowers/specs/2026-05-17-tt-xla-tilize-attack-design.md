@@ -78,9 +78,19 @@ All references in the spec to dump files therefore use globbing in the `/irs/` s
 
 Phase 0 is a gate, not a formality. The Phase 0.3 quantitative threshold is the ONLY automatic de-scope trigger in this plan.
 
+**Phase 0.0 — Pre-Phase-1 binary baseline (5 min, no investigation, just snapshot).** Before any edits to tt-xla CMakeLists.txt or any rebuild attempt, capture the canonical-link SHA baseline that Phase 1's verification will diff against:
+
+```
+docker exec tt-xla-eval bash -c \
+  'sha256sum /tt-xla/third_party/tt-mlir/install/lib/*.so' \
+  > /tmp/canonical-lib-shas.txt
+```
+
+If this step is skipped, Phase 1 step 6's diff has nothing to compare against — every subsequent verification becomes meaningless.
+
 | Step | Action | Mechanism | Output | Gate |
 |---|---|---|---|---|
-| 0.1 | Bucket Tracy Tilizes by tensor shape (weight tilize vs activation tilize) | The aggregator at `_fixtures/tracy_aggregate.py` only reads `OP CODE`; it does NOT have shape columns. Use the RAW `ops_perf_results_*.csv` directly. **Tracy's actual shape encoding**: it emits four padded-logical-dim columns per input (`INPUT_0_W_PAD[LOGICAL]`, `INPUT_0_Z_PAD[LOGICAL]`, `INPUT_0_Y_PAD[LOGICAL]`, `INPUT_0_X_PAD[LOGICAL]`) plus `INPUT_0_LAYOUT`, `INPUT_0_DATATYPE`, `INPUT_0_MEMORY`. Shape is reassembled from the four W/Z/Y/X columns. Confirm column names by inspecting `head -1 ops_perf_results_*.csv | tr ',' '\n'` from the existing run dir. Write a small one-shot Python script that filters rows where `OP CODE == "TilizeWithValPadding"`, assembles the shape from the four pad columns, and joins against known weight shapes derived from `hf_model.config` (e.g., `[vocab, hidden]`, `[hidden, 3*hidden]`, etc., padded to tile boundaries). Match modulo tile-padding. | % split | If weights ≪ 5 %, document in Phase 5 and proceed (no descope — A.1.a/A.3 still land, just with lower expected gain) |
+| 0.1 | Bucket Tracy Tilizes by tensor shape (weight tilize vs activation tilize) | The aggregator at `_fixtures/tracy_aggregate.py` only reads `OP CODE`; it does NOT have shape columns. Use the RAW `ops_perf_results_*.csv` directly. **Tracy's actual shape encoding**: it emits four padded-logical-dim columns per input (`INPUT_0_W_PAD[LOGICAL]`, `INPUT_0_Z_PAD[LOGICAL]`, `INPUT_0_Y_PAD[LOGICAL]`, `INPUT_0_X_PAD[LOGICAL]`) plus `INPUT_0_LAYOUT`, `INPUT_0_DATATYPE`, `INPUT_0_MEMORY`. Shape is reassembled from the four W/Z/Y/X columns. Confirm column names by inspecting `head -1 ops_perf_results_*.csv | tr ',' '\n'` from the existing run dir. Write a small one-shot Python script that filters rows where `OP CODE == "TilizeWithValPadding"`, assembles the shape from the four pad columns, and joins against known weight shapes **computed from `hf_model.config` attributes** (`hidden_size`, `intermediate_size`, `vocab_size`, `num_attention_heads`, `head_dim` — `hf_model.config` does NOT have a `.weight_shapes` field; derive shapes like `[vocab_size, hidden_size]` for the embed table, `[hidden_size, 3*hidden_size]` for q/k/v fused, etc., padded to tile boundaries). Match modulo tile-padding. Alternatively, just call `list(hf_model.named_parameters())` and use the actual tensor shapes directly. | % split | If weights ≪ 5 %, document in Phase 5 and proceed (no descope — A.1.a/A.3 still land, just with lower expected gain) |
 | 0.2 | Dump tt-xla StableHLO + TTIR for one decode step. Inspect block-arg attrs | Set `torch_xla.set_custom_compile_options({"export_path": "/tmp/shlo_dump", "enable_const_eval": True})` before warm-up. Run probe with `--decode 1`. **First confirm the round-trip works**: after one decode, `ls /tmp/shlo_dump/irs/shlo_*.mlir` must list at least one file (note: `irs/` is the actual subdir created by `printModule` at `module_builder.cc:1230`; filenames are `shlo_<timestamp>.mlir` if model_name unset, `shlo_<model>_<timestamp>.mlir` if set — the glob covers both). If the directory itself doesn't exist OR is empty, the Python→C++ option-key serialization didn't reach `module_builder.cc`. **Caveat:** `compile_options.cc:78–82` ABORTs the plugin when `export_path` is MISSING and the backend is NOT `TTNNFlatbuffer`. The default tt-xla backend IS `TTNNFlatbuffer`, so a missing/empty `export_path` won't trigger ABORT in practice — the symptom of a failed round-trip is just "no files written", not a crash. Then grep the matched `shlo_*.mlir` file for `mhlo.`/`xla.`/`tf.`/`jax.`/`torch.`/`_xla` -prefixed arg attrs. | Confirmed torch_xla marker name(s) on block args, OR "no per-arg marker" | "No per-arg marker" → Strategy C (heuristic) handles via Phase 4 auto-detect. NOT a descope. |
 | 0.3 | Count `to_layout`-pair patterns in TTNN IR | Open the `ttnn`-stage MLIR file from 0.2 (glob `<export_path>/irs/ttnn_*.mlir`). Count `ttnn.to_layout → <allowlist_op from Phase 3> → ttnn.to_layout` chains where the final to_layout's output layout matches the first's input layout. **MLIR isn't a nested-paren language** — string parsing won't work because ops are SSA-numbered flat statements (`%2 = "ttnn.to_layout"(%1) ...`). Implementation:
 - Option (a) `ttmlir-opt --print-op-stats`: the binary lives at `/tt-xla/third_party/tt-mlir/src/tt-mlir/build/tools/ttmlir-opt` BEFORE Phase 1 (canonical clone); after Phase 1 the fork's build at `/home/mhnie/tt-mlir-sglang/build/bin/ttmlir-opt` is the right one. Phase 0 runs pre-Phase-1, so use the canonical-clone path.
@@ -116,7 +126,7 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
 
 6. `pjrt_plugin_tt/__init__.py:83–95` validates `TT_METAL_RUNTIME_ROOT` only via `Path(user_override).exists()`. Any existing directory passes. No additional file-presence checks.
 
-7. `pip3 show pjrt-plugin-tt` doesn't emit a separate `tt-mlir-commit=` field — that's part of the `Version:` string (e.g., `0.1.260428+dev.470f0fad8`). Use `pip3 show pjrt-plugin-tt | grep Version` AND grep the package's own `.so` for the commit triple: `strings $(python3 -c 'import pjrt_plugin_tt, os; print(os.path.dirname(pjrt_plugin_tt.__file__))')/pjrt_plugin_tt.so | grep "tt-mlir-commit="`.
+7. **DO NOT rely on `pip3 show pjrt-plugin-tt` for verification.** The metadata it emits comes from `setup.py:106`'s regex over `third_party/CMakeLists.txt`, evaluated at WHEEL-BUILD time. `build_and_install.sh` step `[4/4]` only `docker cp`'s the freshly-built `.so` over the editable install — it does NOT rebuild the wheel. So `pip3 show` reports the SHA captured at the original `pip install -e` time regardless of any CMakeLists edits. Also: `strings .../pjrt_plugin_tt.so | grep tt-mlir-commit=` returns empty — the commit triple is not embedded in the .so. Use the binary SHA-diff in step 6 instead.
 
 8. `rm -rf` on a symlink without a trailing slash removes only the link, not the target (POSIX). The toolchain path's `ln -sfn` followed by Phase 1's `rm -rf` cleanup is safe IF no trailing slash is used. Verified.
 
@@ -144,13 +154,7 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
 
 6. **Hard verification — the load-bearing step.** Two prior verification approaches (strings-grep on .so, pip3-show metadata) were unsound — `pip3 show` reads from `setup.py`'s wheel-build-time metadata that doesn't refresh on rebuild; the strings-grep returned empty because the commit triple isn't in the .so binary. Use a **binary differential SHA** check instead:
 
-   **Pre-Phase-1 snapshot (run BEFORE step 5):**
-   ```
-   docker exec tt-xla-eval bash -c \
-     'sha256sum /tt-xla/third_party/tt-mlir/install/lib/*.so' \
-     > /tmp/canonical-lib-shas.txt
-   ```
-   Save this as the canonical baseline.
+   **Pre-Phase-1 snapshot already captured in Phase 0.0** (`/tmp/canonical-lib-shas.txt`). If skipped, this verification has nothing to diff against — go back and capture it before continuing.
 
    **Post-Phase-1 check (run AFTER step 5):**
    ```
@@ -159,11 +163,11 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
      > /tmp/post-phase1-lib-shas.txt
    diff /tmp/canonical-lib-shas.txt /tmp/post-phase1-lib-shas.txt
    ```
-   At least one `.so` MUST differ — typically `libTTMLIRStableHLOToTTIR.so` (B.2 v3 patches it). If the diff is empty, the fork's source did NOT replace the canonical's binary — the rebuild path didn't take. **STOP. Investigate. Do NOT proceed to Phase 2.**
+   At least one `.so` MUST differ. **Expected to change: `libTTMLIRCompiler.so`** — this is the monolithic compiler library that statically links the `TTMLIRStableHLOToTTIR` archive (where B.2 v3 patches `StableHLOToTTIRPatterns.cpp`). Note: there is NO standalone `libTTMLIRStableHLOToTTIR.so` — `add_mlir_conversion_library` produces static archives that get folded into `libTTMLIRCompiler.so`. The full set of `.so` files actually present in `/tt-xla/third_party/tt-mlir/install/lib/` is approximately: `_ttnn.so`, `_ttnncpp.so`, `libTTMLIRCompiler.so`, `libTTMLIRRuntime.so`, `libtracy.so`, `libtt-alchemist-python-runner.so`, `libtt-umd.so`, `libtt_metal.so`, `libtt_stl.so` (probe with `ls /tt-xla/third_party/tt-mlir/install/lib/*.so` to confirm at run time). If the diff is empty, the fork's source did NOT replace the canonical's binary — the rebuild path didn't take. **STOP. Investigate. Do NOT proceed to Phase 2.**
 
    **Path note:** the `stat -c "%Y"` + path comparison previously suggested won't help here because (a) `cmake --install` does NOT preserve mtimes — installed file gets a fresh mtime regardless of source, and (b) host vs container paths differ (`/home/mhnie/tt-mlir-sglang` on host, `/tt-mlir-sglang` in container). The container-side SHA check above sidesteps both issues.
 
-   **Behavioural cross-check (additional):** run the smoke bench at step 7 and confirm TPOT is within ±5% of the pre-Phase-1 baseline (~132 ms). Both a regression or a surprise improvement could indicate the fork built but with a different compile path — investigate either way.
+   **Behavioural cross-check (additional):** run the smoke bench at step 7 BEFORE landing Phase 2's `argumentTypeMap`, with `enable_const_eval` at default. The fork's 5 patches are all behavior-preserving build/IR-correctness tweaks (B.2 v3, B.2 v2, link/distributed flags, build script), so TPOT should land within ±5% of the pre-Phase-1 baseline (~132 ms). Regression OR surprise improvement at this point means something other than expected was rebuilt — investigate before proceeding to Phase 2.
 
 7. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
 
@@ -297,7 +301,7 @@ Fixtures saved alongside commit: `_fixtures/v146_3run_server_q8b_<phase>.json`.
 
 | Risk | Mitigation |
 |---|---|
-| Phase 1 CMake edit doesn't take (build still pulls canonical tt-mlir) | Hard verification in Phase 1 (commit SHA from `pip3 show pjrt-plugin-tt` + symbol grep in libTTMLIR*.so). If still canonical, the `SOURCE_DIR` override didn't apply — re-check whether `${TTPJRT_SOURCE_DIR}/third_party/tt-mlir` was pre-populated correctly or whether ExternalProject still cached the old clone. Re-bisect from a clean `build/` dir. |
+| Phase 1 CMake edit doesn't take (build still pulls canonical tt-mlir) | Binary SHA-diff verification (see Phase 1 step 6). If no `.so` differs between pre-Phase-1 and post-Phase-1 snapshots, the fork source wasn't linked — re-check whether `SOURCE_DIR` was correctly applied, whether stale stamps were cleaned, and whether `ExternalProject_Add`'s `INSTALL_COMMAND` actually fired. Re-bisect from a clean `build/` dir. |
 | Phase 1 smoke-test regresses TPOT or breaks build (any of 5 fork patches culpable, not just B.2 v3) | Bisect by reverting fork commits individually starting from HEAD. If B.2 v3 is the offender, `git revert 2fc1d119e` and document. |
 | A.1.a `argumentTypeMap` doesn't reach the pass (e.g., field name typo) | Phase 2 verification dumps IR and greps for `ttcore.argument_type`; the INFO log line in `module_builder.cc` reports strategy + counts. |
 | `enable_const_eval` defaults change in a future tt-mlir bump | Explicitly set `compile_options.enable_const_eval = true` in `module_builder.cc` if the existing default is removed; surface as a build break, not a silent regression. |
