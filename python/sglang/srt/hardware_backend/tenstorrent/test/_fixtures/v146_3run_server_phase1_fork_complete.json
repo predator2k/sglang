@@ -1,0 +1,22 @@
+{
+  "version": "v146",
+  "backend": "tt_xla",
+  "input_len": 1024,
+  "output_len": 1024,
+  "context_len": 2048,
+  "hw": "2x P150a (post-B.2 canonical wheel)",
+  "max_batch_size": 1,
+  "tag": "phase1_fork_complete",
+  "logdir": "/sglang/python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/bench_3run_phase1_fork_complete",
+  "results": [
+    {
+      "model": "Qwen3-8B",
+      "model_id": "Qwen/Qwen3-8B",
+      "status": "FAIL_LAUNCH",
+      "t_ready_s": 8.005732422025176,
+      "run1": null,
+      "run2": null,
+      "run3": null
+    }
+  ]
+}
