@@ -92,22 +92,53 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
 
 **Build-flow choice.** The script already builds the fork independently in steps [1-2]/4 at `/home/mhnie/tt-mlir-sglang/build`. tt-xla's `ExternalProject_Add(tt-mlir …)` is currently structured to ALSO configure + build tt-mlir, with a DIFFERENT set of CMake args than the script uses. The two would collide on the same `CMakeCache.txt` if pointed at the same `BUILD_DIR`. The cleanest fix is to **neuter `ExternalProject_Add` to a passive reference** — let the script's pre-built fork supply the artifacts, and have tt-xla's CMakeLists treat the ExternalProject only as a target-dependency stub that points at pre-built outputs.
 
-Concrete mechanism:
+**Goal-first framing.** Each spec revision has tried to engineer the exact CMake mechanics and each has been caught with build-system surprises. This Phase 1 describes the GOAL, the CONSTRAINTS, and the VERIFICATION; the implementation plan and the executor iterate on the exact CMake invocations until verification passes. The verification step is load-bearing — do NOT skip it.
 
-1. Edit `/home/mhnie/tt-xla/third_party/CMakeLists.txt`. In the `ExternalProject_Add(tt-mlir …)` block at lines 47–85:
-   - Remove `GIT_REPOSITORY` (line 82), `GIT_TAG` (line 83), `GIT_PROGRESS` (line 84).
-   - Add `SOURCE_DIR /home/mhnie/tt-mlir-sglang`.
-   - Add `DOWNLOAD_COMMAND ""`, `CONFIGURE_COMMAND ""`, `BUILD_COMMAND ""` to make ExternalProject a passive stub (no re-configure, no re-build of the fork).
-   - Update `TTMLIR_BUILD_DIR` at line 35 from `${TTMLIR_SOURCE_DIR}/src/tt-mlir/build` to `/home/mhnie/tt-mlir-sglang/build` so `BINARY_DIR` (line 56) and the `INSTALL_COMMAND` (lines 60–61) point at the fork's pre-built install.
-   - Remove the `TT_METAL_RUNTIME_ROOT` hard-code at lines 36–39 (set to a path inside the now-deleted canonical clone). Replace with: read `TT_METAL_RUNTIME_ROOT` from environment; if unset, error out and require the caller to set it (the fork's build already exports the correct path via its own toolchain). The script `build_and_install.sh` must be edited (step 3 below) to set `TT_METAL_RUNTIME_ROOT` to wherever the fork's tt-metal install lives — find the path during Phase 1 execution via `find /home/mhnie/tt-mlir-sglang -name "tt_metal_runtime.so" -o -name "metal_libs" -type d | head` and export it.
-   - If the toolchain path at lines 13–27 is exercised, replace its `git clone …` with `ln -sfn /home/mhnie/tt-mlir-sglang ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir`. Note for cleanup step 2: `rm -rf` without a trailing slash on this symlink only removes the link, NOT the target. Don't add a trailing slash.
-2. Clean stale stamps and build dirs from the prior canonical build BEFORE rebuilding: `rm -rf /home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir-stamp /home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir /home/mhnie/tt-xla/build-local /home/mhnie/tt-xla/build` (no trailing slashes; `src/tt-mlir` may be a directory or a symlink, both handled correctly by `rm -rf` without trailing slash).
-3. Remove the dead `-DTTMLIR_SOURCE_DIR_OVERRIDE="$TTMLIR_DIR"` flag from `build_and_install.sh:38`. Add an export at the top of the script: `export TT_METAL_RUNTIME_ROOT="$(find $TTMLIR_DIR -name "tt-metal" -type d | head -1)"` (or the path found during Phase 1 execution).
+**Goal.** When the rebuilt `pjrt-plugin-tt` is loaded inside `tt-xla-eval`, its `tt-mlir-commit` SHA matches the fork HEAD (`2fc1d119e` at time of writing), not the canonical pin `f3ddbfb6`.
+
+**Constraints / known surprises (each one bit a prior reviewer):**
+
+1. tt-mlir is NOT a git submodule. `/home/mhnie/tt-xla/third_party/CMakeLists.txt:47–85` brings it in via `ExternalProject_Add` with `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` + `GIT_TAG ${TT_MLIR_VERSION}` hardcoded. Default `USE_CUSTOM_TT_MLIR_VERSION` only controls which SHA gets assigned to the var — it does NOT skip cloning.
+
+2. `build_and_install.sh:38` passes `-DTTMLIR_SOURCE_DIR_OVERRIDE` but no CMakeLists.txt reads this var (grep confirms). Dead flag. Live plugin reports `tt-mlir-commit=f3ddbfb6` — fork has never been live.
+
+3. `third_party/CMakeLists.txt:35` declares `TTMLIR_BUILD_DIR = ${TTMLIR_SOURCE_DIR}/src/tt-mlir/build`. Lines 36–39 hardcode `TT_METAL_RUNTIME_ROOT` to a path inside the canonical clone (`${TTPJRT_SOURCE_DIR}/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal`).
+
+4. Fork's `build/` dir doesn't exist on a fresh checkout. `cmake --install <BINARY_DIR>` on an empty dir fails because `cmake_install.cmake` doesn't exist there yet. The build script's step `[1-2]/4` (`cmake -B $TTMLIR_DIR/build -S $TTMLIR_DIR` then `ninja -C $TTMLIR_DIR/build`) creates it. ORDER MATTERS: fork must be configured + built BEFORE tt-xla configure consumes it.
+
+5. Fork's tt-metal lives at `/home/mhnie/tt-mlir-sglang/third_party/tt-metal/src/tt-metal/` (per fork's own ExternalProject_Add for tt-metal). That path EXISTS only after fork configure has run once.
+
+6. `pjrt_plugin_tt/__init__.py:83–95` validates `TT_METAL_RUNTIME_ROOT` only via `Path(user_override).exists()`. Any existing directory passes. No additional file-presence checks.
+
+7. `pip3 show pjrt-plugin-tt` doesn't emit a separate `tt-mlir-commit=` field — that's part of the `Version:` string (e.g., `0.1.260428+dev.470f0fad8`). Use `pip3 show pjrt-plugin-tt | grep Version` AND grep the package's own `.so` for the commit triple: `strings $(python3 -c 'import pjrt_plugin_tt, os; print(os.path.dirname(pjrt_plugin_tt.__file__))')/pjrt_plugin_tt.so | grep "tt-mlir-commit="`.
+
+8. `rm -rf` on a symlink without a trailing slash removes only the link, not the target (POSIX). The toolchain path's `ln -sfn` followed by Phase 1's `rm -rf` cleanup is safe IF no trailing slash is used. Verified.
+
+**Concrete steps (executor refines until verification passes):**
+
+1. Edit `/home/mhnie/tt-xla/third_party/CMakeLists.txt`, ExternalProject_Add block at lines 47–85:
+   - Replace `GIT_REPOSITORY ... + GIT_TAG ... + GIT_PROGRESS ON` with `SOURCE_DIR /home/mhnie/tt-mlir-sglang` + `DOWNLOAD_COMMAND ""`.
+   - Set `CONFIGURE_COMMAND ""` and `BUILD_COMMAND ""` (build_and_install.sh handles those for the fork in steps [1-2]/4).
+   - LEAVE `INSTALL_COMMAND` in place — but precondition the install on the fork's `build/cmake_install.cmake` existing (it will, after script step [2/4] succeeds). The install copies fork's build outputs to `${TTMLIR_INSTALL_PREFIX}` which is then globbed by `file(GLOB TTMLIR_LIBRARIES "${TTMLIR_LIB_DIR}/*.so")` at line 101. If install fails because of stale CMakeCache mismatch, ALSO set `INSTALL_COMMAND ""` and adjust line 101 to glob from `/home/mhnie/tt-mlir-sglang/build/lib/*.so` directly.
+   - Update `TTMLIR_BUILD_DIR` at line 35 to `/home/mhnie/tt-mlir-sglang/build`.
+   - Remove the hardcoded `TT_METAL_RUNTIME_ROOT` at lines 36–39; require the caller to set it (build_and_install.sh handles, see step 3).
+   - If the toolchain path at lines 13–27 is exercised, replace its `git clone …` with `ln -sfn /home/mhnie/tt-mlir-sglang ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir`.
+
+2. Clean stale stamps and build dirs from prior canonical build: `rm -rf /home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir-stamp /home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir /home/mhnie/tt-xla/build-local /home/mhnie/tt-xla/build` (no trailing slashes).
+
+3. Edit `build_and_install.sh`:
+   - Remove the dead `-DTTMLIR_SOURCE_DIR_OVERRIDE="$TTMLIR_DIR"` flag from line 38.
+   - Insert before step `[3/4]`: `export TT_METAL_RUNTIME_ROOT="/home/mhnie/tt-mlir-sglang/third_party/tt-metal/src/tt-metal"`. This path will exist after script step [1-2]/4 completes (fork's own ExternalProject pulls tt-metal there during fork configure+build).
+   - Hardcode rather than `find`, because the find returns empty on fresh checkouts. The fork's CMakeLists.txt is what populates the path.
+
 4. Save the CMakeLists.txt edit and the build-script edit as checked-in patches under `/home/mhnie/sglang/python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-source-dir-fork.patch` and `.../patches/tt-mlir-sglang-build-script-cleanup.patch` so they can be re-applied after container restart.
-5. Rebuild via `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang, NOT tt-xla, committed at `95d656c8f`).
-6. **Hard verification that the live build is the fork, not canonical:**
-   - Run `pip3 show pjrt-plugin-tt | grep tt-mlir-commit=` in the `tt-xla-eval` container. Must show `2fc1d119e` (fork HEAD), NOT `f3ddbfb6` (canonical pin). If still `f3ddbfb6`, the edit didn't take — STOP and investigate (do NOT proceed to Phase 2 against a canonical-tt-mlir-backed plugin).
-   - Additionally grep one of the fork-specific commit identifiers in the built library: `strings $(python3 -c 'import pjrt_plugin_tt, os; print(os.path.dirname(pjrt_plugin_tt.__file__))')/lib/libTTMLIR*.so | grep -E "B\.2.*v3|tenstorrent-p1"` — should match at least one fork-specific symbol/string.
+
+5. Run `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang). It builds fork first (steps [1-2]/4), THEN configures+builds tt-xla which consumes the pre-built fork (step [3]/4), THEN installs plugin (step [4]/4). Ordering matters.
+
+6. **Hard verification — the load-bearing step:**
+   - Run `pip3 show pjrt-plugin-tt | grep Version` in `tt-xla-eval`. The Version string's trailing SHA must match fork HEAD. Cross-check with `strings $(python3 -c 'import pjrt_plugin_tt, os; print(os.path.dirname(pjrt_plugin_tt.__file__))')/pjrt_plugin_tt.so | grep "tt-mlir-commit="` — must show `2fc1d119e` (or current fork HEAD), NOT `f3ddbfb6`.
+   - If still canonical, the edits didn't take. **STOP. Investigate. Do NOT proceed to Phase 2 against a canonical-tt-mlir-backed plugin.**
+
 7. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
 
 This re-activates **all 5 fork patches** that are ahead of canonical `f3ddbfb6` (B.2 v3 `2fc1d119e`, B.2 v2 `e62086947`, link tweak `4899ff291`, distributed-disable `8eb2e5b46`, build script `95d656c8f`). B.2 v3 is documented as working in memory `tenstorrent-tt-mlir-sglang-fork`; the other 4 are build-system tweaks expected to be neutral. If smoke regresses TPOT or build breaks: bisect by reverting fork commits individually.
@@ -187,11 +218,13 @@ For each block arg of every `func::FuncOp` in the module, classify as `Parameter
    - Operand of `stablehlo.dynamic_slice` or `stablehlo.slice` (rotary cos/sin tables sliced by current position).
 3. **No mutating uses**: arg is never operand of any op that produces a result aliasing the arg (no `stablehlo.scatter` writing back to the arg, no in-place updates).
 4. **Not in dynamic-input position**: arg's first dim is not used as a batch dim by any `stablehlo.dynamic_slice(arg, [batch_index, ...])`. (Excludes input_ids, position_ids, attention_mask if it dodged Rule 1, cache_pos, and kv-cache args.)
-5. **Softmax-path exclusion** (belt-and-suspenders for attention_mask): the arg is rejected (stays `Input`) iff there exists a forward use chain from the arg to a `stablehlo.exponential` op such that the chain contains at least one `stablehlo.add`, `stablehlo.subtract`, or `stablehlo.multiply` consuming a value derived from the arg as an operand. The classifier walks consumers (BFS) up to depth 6 from the arg; intermediate ops can be any non-side-effecting op. If the BFS reaches `stablehlo.exponential` AND the path-to-exponential includes at least one of the add/sub/multiply ops (with arg-lineage on one operand and any value on the other), the arg fails Rule 5. Worklist size is capped at 256 ops per arg to avoid pathological compile times.
+5. **Softmax-path exclusion** (belt-and-suspenders for attention_mask): the arg is rejected (stays `Input`) iff there exists a forward use chain from the arg to a `stablehlo.exponential` op such that the chain contains at least one `stablehlo.add`, `stablehlo.subtract`, or `stablehlo.multiply` consuming a value derived from the arg as an operand. The classifier walks consumers (BFS) from the arg. **"Depth" = number of `stablehlo.*` ops on the path counting ONLY non-layout-only ops** — `stablehlo.transpose`, `stablehlo.reshape`, `stablehlo.broadcast_in_dim`, `stablehlo.convert`, `stablehlo.slice` are NOT counted toward depth, but they are traversed. Depth-bound = **8** (chosen to safely cover the HF Qwen3 attention path `arg → broadcast → add(scores, mask) → reduce(max) → subtract → exponential` which has 4 non-layout ops; 8 gives ≥2× headroom for HF-emitter variations). If the BFS reaches `stablehlo.exponential` AND the path-to-exponential includes at least one of the add/sub/multiply ops (with arg-lineage on one operand and any value on the other), the arg fails Rule 5. Worklist size is capped at 256 ops per arg to avoid pathological compile times; if cap is hit, fail closed (reject the arg = stays Input).
 
-Implement as an analysis with worklist over uses; depth-bound at 3 hops through layout-only ops for Rule 2, depth 6 with the 256-op cap for Rule 5. False positives are critical (mark a runtime-varying arg as Parameter → silent corruption). False negatives are tolerable (arg stays Input → no const-eval gain, no regression). The rules above are biased toward false negatives.
+Implement as an analysis with worklist over uses; for Rule 2 use 3 hops through layout-only ops; for Rule 5 use depth 8 as defined above with a 256-op cap. False positives are critical (mark a runtime-varying arg as Parameter → silent corruption). False negatives are tolerable (arg stays Input → no const-eval gain, no regression). The rules above are biased toward false negatives.
 
-**Where the classifier runs.** Phase 2's classifier runs in `module_builder.cc` BEFORE pipeline construction, so it sees the module as torch_xla emitted it (pre-inliner). `tt-populate-argument-types` runs AFTER `StableHLOPipelines.cpp:20` inliner. If the inliner changes arg counts for any function in Phase 2's map, the pass aborts via `PopulateArgumentTypes.cpp:240–248 signalPassFailure`. Mitigation: the classifier should emit map entries only for the top-level entry function (typically `main`), whose arg signature is stable across inlining. Document this constraint in the classifier's contract and emit a log warning if the module has multiple top-level funcs.
+**Where the classifier runs.** Phase 2's classifier runs in `module_builder.cc` BEFORE pipeline construction, so it sees the module as torch_xla emitted it (pre-inliner). `tt-populate-argument-types` runs AFTER `StableHLOPipelines.cpp:20` inliner. If the inliner changes arg counts for any function in Phase 2's map, the pass aborts via `PopulateArgumentTypes.cpp:240–248 signalPassFailure`. Mitigation: the classifier emits map entries only for the **unique non-private `func::FuncOp`** in the module (torch_xla emits one such function per compile; tt-xla calls compile separately for prefill vs decode, so each module has exactly one). If the module contains zero or multiple non-private funcs, log a warning and emit no map entries (downstream Phase 4 auto-detect handles those modules).
+
+**Behaviour on Strategy A/B/C mixed input.** If a function carries BOTH per-arg markers AND a module-level cluster marker (rare; some torch_xla emitter versions only emit one), the classifier emits a warning to `module_builder.cc` log and falls through to Strategy C (heuristic). It does NOT abort compile. Aborting on a build-artifact mismatch would turn graceful degradation into a hard outage.
 
 **Mandatory mini-test for the heuristic before Phase 2 ships:** the classifier must be unit-tested against a small synthetic MLIR module containing: (a) an embedding-gather pattern, (b) an RMSNorm-multiply pattern, (c) an attention add-mask-then-softmax pattern, (d) a dot_general matmul. Expected: a,b,d → Parameter; c (the mask) → Input.
 
