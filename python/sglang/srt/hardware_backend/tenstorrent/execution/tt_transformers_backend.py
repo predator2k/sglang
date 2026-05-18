@@ -182,12 +182,10 @@ class TTTransformersExecutionBackend(TTExecutionBackend):
                 "python_env/bin/activate)"
             )
 
-        # tt_transformers' ModelArgs reads LLAMA_DIR / HF_MODEL from env
-        # and asserts exactly one is set (model_config.py:499). The
-        # tt-inference-server docker image pre-sets BOTH, so clear HF_MODEL
-        # before writing LLAMA_DIR or the assert fires.
-        os.environ.pop("HF_MODEL", None)
-        os.environ["LLAMA_DIR"] = model_path
+        # tt-metal model_config.py (post-LLAMA_DIR removal) requires HF_MODEL
+        # to be set. CKPT_DIR/TOKENIZER_PATH are derived from HF_MODEL, so
+        # point it at the local model_path for offline operation.
+        os.environ["HF_MODEL"] = model_path
 
         _DTYPE_MAP = {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}
         if dtype not in _DTYPE_MAP:

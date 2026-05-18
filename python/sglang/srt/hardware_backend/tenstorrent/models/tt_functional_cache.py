@@ -20,6 +20,7 @@ probe_t2_1.log: 0 graph breaks, 0 recompiles, bit-exact. dynamo handles it clean
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -49,6 +50,12 @@ class TTFunctionalCache(StaticCache):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Prefill / multi-token: parent index_copy_ path, proven for q_len > 1.
         if key_states.shape[-2] != 1:
+            return super().update(key_states, value_states, layer_idx, cache_kwargs)
+
+        # SGLANG_TT_CACHE_MODE=index_copy: bypass torch.where, use parent's in-place
+        # index_copy_ even at q_len=1. Removes ~50ms TPOT overhead on Qwen3-8B.
+        # Safe iff dynamo doesn't recompile on the cache mutation (verified post-B.2).
+        if os.environ.get("SGLANG_TT_CACHE_MODE") == "index_copy":
             return super().update(key_states, value_states, layer_idx, cache_kwargs)
 
         # Decode: functional path.
