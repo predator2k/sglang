@@ -231,7 +231,7 @@ Verification:
 
 Risks:
 - Allowlist too aggressive → wrong layout reaches a kernel that secretly assumes one layout. Mitigation: bench accuracy test (greedy-only, 10 prompts, byte-exact vs Phase 1 baseline) is a release gate.
-- Pass placement wrong → other passes re-insert redundant layout kernels after this fold runs. Mitigation: dump IR after each pipeline pass via `enableVerboseIRPrinting` in `module_builder.cc:1247` (gated on `loguru::g_stderr_verbosity >= LOG_DEBUG`). Set the loguru verbosity through the existing logging infrastructure (or add a temporary env-var trigger in pjrt-plugin-tt for this debugging session) and verify the fold's output survives.
+- Pass placement wrong → other passes re-insert redundant layout kernels after this fold runs. Mitigation: dump IR after each pipeline pass via `enableVerboseIRPrinting` in `module_builder.cc:1247` (the early-return at line 1248 is `if (loguru::g_stderr_verbosity < LOG_VERBOSE)` — i.e., the function fires when verbosity ≥ `LOG_VERBOSE`, which is 2 in `inc/utils/logging.h:16–17`; `LOG_DEBUG = 1` is NOT high enough). Set the loguru verbosity through the existing logging infrastructure (or add a temporary env-var trigger in pjrt-plugin-tt for this debugging session) and verify the fold's output survives.
 - The existing `foldConsecutiveToLayoutOp` may catch cases the new pattern thought it needed to handle — verify by inspecting IR before/after the existing fold runs in pipeline.
 
 ### Phase 4 — A.3.a (auto-detect parameter markers in tt-mlir)
