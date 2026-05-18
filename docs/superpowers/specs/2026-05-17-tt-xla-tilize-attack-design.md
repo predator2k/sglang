@@ -88,19 +88,25 @@ If 0.2 also produces a clean per-arg parameter marker, capture an arg attr examp
 - Toolchain build path (`if (TOOLCHAIN STREQUAL "ON")` at lines 13–27) clones via `execute_process`.
 - Normal path (`else()` at lines 28–95) clones via `ExternalProject_Add` at lines 47–85, which has `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` + `GIT_TAG ${TT_MLIR_VERSION}` hard-coded.
 
-Concrete mechanism (must edit CMakeLists.txt, not just symlink):
+**Reality check up front: the fork is NOT currently the live build despite appearances.** `build_and_install.sh:38` passes `-DTTMLIR_SOURCE_DIR_OVERRIDE="$TTMLIR_DIR"` but no CMakeLists.txt in `/home/mhnie/tt-xla/` actually reads this variable (`grep -rn TTMLIR_SOURCE_DIR_OVERRIDE /home/mhnie/tt-xla/` returns only the stale `build-local/CMakeCache.txt`). The current live `pjrt-plugin-tt` reports `tt-mlir-commit=f3ddbfb6` (canonical). Memory `tenstorrent-tt-xla-tpot-workstream-a`'s claim "B.2 v3 patch built into canonical wheel" reflects a separate manual operation, not anything this script automated. After Phase 1 succeeds, update that memory entry.
+
+Concrete mechanism (must edit CMakeLists.txt, clean stamps, and fix the build script):
 
 1. Edit `/home/mhnie/tt-xla/third_party/CMakeLists.txt`. In the `ExternalProject_Add(tt-mlir …)` block at lines 47–85:
-   - Replace `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` and `GIT_TAG ${TT_MLIR_VERSION}` with `SOURCE_DIR /home/mhnie/tt-mlir-sglang` + `DOWNLOAD_COMMAND ""`.
-   - If the toolchain path at lines 13–27 is also exercised in our build, replace its `git clone …` with a `ln -sfn /home/mhnie/tt-mlir-sglang ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir`.
-2. Save the edit as a checked-in patch under `/home/mhnie/sglang/python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-source-dir-fork.patch` so it can be re-applied after container restart.
-3. Rebuild via `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang, NOT tt-xla, committed at `95d656c8f`).
-4. **Hard verification that the live build is the fork, not canonical:**
-   - Run `pip3 show pjrt-plugin-tt | grep commit` in the `tt-xla-eval` container. The `tt-mlir-commit=` line should show `2fc1d119e` (fork HEAD), NOT `f3ddbfb6` (canonical pin).
+   - Remove `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` (line 82) and `GIT_TAG ${TT_MLIR_VERSION}` (line 83).
+   - Add `SOURCE_DIR /home/mhnie/tt-mlir-sglang` and `DOWNLOAD_COMMAND ""`.
+   - Redirect `TTMLIR_BUILD_DIR` (currently `${TTMLIR_SOURCE_DIR}/src/tt-mlir/build` at line 35) to `/home/mhnie/tt-mlir-sglang/build` so the fork's existing build tree is reused; OR keep it as-is and accept that two separate build dirs are maintained. Pick redirection — fewer rebuilds.
+   - If the toolchain path at lines 13–27 is exercised in our build, replace its `git clone …` with `ln -sfn /home/mhnie/tt-mlir-sglang ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir`.
+2. Clean stale stamps from the prior canonical build BEFORE rebuilding: `rm -rf /home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir-stamp /home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir /home/mhnie/tt-xla/build-local /home/mhnie/tt-xla/build`. ExternalProject's stamp tracking sees `SOURCE_DIR` differing from prior stamps and may behave unpredictably otherwise.
+3. Remove the dead `-DTTMLIR_SOURCE_DIR_OVERRIDE="$TTMLIR_DIR"` flag from `build_and_install.sh:38` (it has no effect; leaving it is misleading evidence).
+4. Save the CMakeLists.txt edit and the build-script edit as checked-in patches under `/home/mhnie/sglang/python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-source-dir-fork.patch` and `.../patches/tt-mlir-sglang-build-script-cleanup.patch` so they can be re-applied after container restart.
+5. Rebuild via `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang, NOT tt-xla, committed at `95d656c8f`).
+6. **Hard verification that the live build is the fork, not canonical:**
+   - Run `pip3 show pjrt-plugin-tt | grep tt-mlir-commit=` in the `tt-xla-eval` container. Must show `2fc1d119e` (fork HEAD), NOT `f3ddbfb6` (canonical pin). If still `f3ddbfb6`, the edit didn't take — STOP and investigate (do NOT proceed to Phase 2 against a canonical-tt-mlir-backed plugin).
    - Additionally grep one of the fork-specific commit identifiers in the built library: `strings $(python3 -c 'import pjrt_plugin_tt, os; print(os.path.dirname(pjrt_plugin_tt.__file__))')/lib/libTTMLIR*.so | grep -E "B\.2.*v3|tenstorrent-p1"` — should match at least one fork-specific symbol/string.
-5. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
+7. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
 
-This re-activates **all 5 fork patches** that are ahead of canonical `f3ddbfb6` (B.2 v3 `2fc1d119e`, B.2 v2 `e62086947`, link tweak `4899ff291`, distributed-disable `8eb2e5b46`, build script `95d656c8f`). Per memory `tenstorrent-tt-xla-tpot-workstream-a` and `tenstorrent-tt-mlir-sglang-fork`, B.2 v3 has been built into the canonical wheel and known to work; the other 4 are build-system tweaks expected to be neutral. If smoke regresses TPOT or build breaks: bisect by reverting fork commits individually.
+This re-activates **all 5 fork patches** that are ahead of canonical `f3ddbfb6` (B.2 v3 `2fc1d119e`, B.2 v2 `e62086947`, link tweak `4899ff291`, distributed-disable `8eb2e5b46`, build script `95d656c8f`). B.2 v3 is documented as working in memory `tenstorrent-tt-mlir-sglang-fork`; the other 4 are build-system tweaks expected to be neutral. If smoke regresses TPOT or build breaks: bisect by reverting fork commits individually.
 
 ### Phase 2 — A.1.a (set argumentTypeMap in module_builder.cc)
 
@@ -115,8 +121,8 @@ The central design choice in Phase 2 is **the argument classifier**: how to deci
 Implementation (in `/home/mhnie/tt-xla/pjrt_implementation/src/api/module_builder/module_builder.cc`):
 
 1. Implement `classifyArgs(mlir::ModuleOp module) -> TTArgumentTypeMap` (or call a helper in tt-mlir if more natural). Internally, it tries Strategy A → B → C in order; returns the map keyed by function symbol name.
-2. Assign `stablehlo_pipeline_options.argumentTypeMap = classifyArgs(mlir_module);` around line 828–855 (where `stablehlo_pipeline_options` is constructed). Confirm exact line in writing-plans.
-3. Assign `options.argumentTypeMap = classifyArgs(mlir_module);` around line 980 (the variable in that block is named `options`, of type `TTIRToTTNNCommonPipelineOptions`). Confirm exact line in writing-plans.
+2. Assign `stablehlo_pipeline_options.argumentTypeMap = classifyArgs(mlir_module);` at `module_builder.cc:831` (immediately after `stablehlo_pipeline_options` is constructed; reviewer verified 831 is the right insertion point).
+3. Assign `options.argumentTypeMap = classifyArgs(mlir_module);` at `module_builder.cc:985` (the variable in that block is named `options`, of type `TTIRToTTNNCommonPipelineOptions`; reviewer verified 985 is the right insertion point).
 4. Existing `compile_options.enable_const_eval` (default `true` at `inc/api/compile_options.h:83`) handles the rest: `tt-populate-argument-types` populates `ttcore.argument_type` on block args, `ConstEvalHoistTransform` fires (three invocations at `TTNNPipelines.cpp:309, 372, 386`), `TTNNPrepareConstEvalCaching` + `TTNNConstEvalInputsToSystemMemory` close the loop.
 5. Add an INFO log line `"[TT-XLA] argumentTypeMap: strategy=<A|B|C>, function=<name>, K_inputs=%d, K_params=%d"` so plumbing failures are obvious in `tt-xla-eval` logs.
 
@@ -161,24 +167,27 @@ Why not `AnalyzeMesh.cpp`: `AnalyzeMesh.cpp:120–132` emits errors when a block
 
 Implementation:
 - Add a new small pass `populateArgumentTypesAutoDetect` in `lib/Dialect/StableHLO/Transforms/` (or fold into `StableHLOToTTIRPass.cpp` if simpler).
-- For each `func::FuncOp`: classify block args using the same A→B→C strategy as Phase 2 (Strategy A: per-arg marker; B: module-level cluster marker; C: heuristic).
-- For each classified `Parameter` arg, set the function's arg attr at `ttcore.argument_type = #ttcore<argument_type parameter>`.
-- Schedule the new pass in `StableHLOPipelines.cpp` BEFORE the existing `createTTPopulateArgumentTypes` invocation, so the pre-existing pass-option-based map (from Phase 2) overrides if also set. Order in the pipeline: `populateArgumentTypesAutoDetect → tt-populate-argument-types`. The latter overwrites only entries that conflict; auto-detect provides defaults.
+- For each `func::FuncOp`: classify block args using the same A→B→C strategy as Phase 2 (Strategy A: per-arg marker; B: module-level cluster marker; C: heuristic). Strategy A→B priority: scan all block args once; if ANY block arg carries a per-arg marker, use Strategy A for the entire function and ignore module-level cluster markers (do not mix); otherwise look for module-level cluster marker (Strategy B); otherwise fall to heuristic (Strategy C). Mixing two markers in one function is undefined and the classifier must assert.
+- For each classified `Parameter` arg, set the function's arg attr at `ttcore.argument_type = #ttcore<argument_type parameter>`. **Skip args that already carry `ArgumentTypeAttr`** (don't overwrite Phase 2's explicit map).
+- Schedule the new pass in `StableHLOPipelines.cpp` AFTER the existing `createTTPopulateArgumentTypes` invocation. Order in the pipeline: `tt-populate-argument-types → populateArgumentTypesAutoDetect`. **Reason:** `tt-populate-argument-types` at `PopulateArgumentTypes.cpp:286–313` unconditionally OVERWRITES `ArgumentTypeAttr` whenever the map provides a value for that function (it doesn't merge; it emits a warning and replaces). If auto-detect ran first, every entry it set would be clobbered by Phase 2's explicit map. Running auto-detect AFTER (and short-circuiting on existing attr) means: explicit map wins for mapped functions; auto-detect fills in unmapped functions or args.
 
 A.3.b heuristic — concrete rules (used in Strategy C above, both for Phase 2 and Phase 4 — implement once, share):
 
 For each block arg of every `func::FuncOp` in the module, classify as `Parameter` iff ALL of:
-1. **Rank gate**: tensor rank ≥ 1 AND at least one dim ≥ 64 (excludes scalars and small bias-like tensors that are also static, but those don't dominate Tilize cost anyway).
-2. **Use-pattern allowlist** — every use of the arg is one of the following (or transitively reaches one of the following through layout-only ops `stablehlo.transpose`, `stablehlo.reshape`, `stablehlo.broadcast_in_dim` to depth ≤ 3):
+1. **Shape gate**: tensor rank ≥ 1 AND **every** dim ≥ 16 OR rank == 1 with that dim ≥ 64. (Tightened from "at least one dim ≥ 64" — excludes attention_mask shaped `[1, 1, seq, seq]` which has size-1 dims.)
+2. **Use-pattern allowlist** — every use of the arg is one of the following (or transitively reaches one of the following through layout-only ops `stablehlo.transpose`, `stablehlo.reshape`, `stablehlo.broadcast_in_dim`, `stablehlo.convert` to depth ≤ 3):
    - Operand of `stablehlo.dot_general` (matmul: q/k/v/o projections, gate/up/down projections).
    - Operand of `stablehlo.convolution`.
    - Operand of `stablehlo.gather` (embedding tables — Qwen3-8B's largest weight, vocab×hidden ≈ 152k×4096).
-   - Operand of `stablehlo.multiply` or `stablehlo.add` when the other operand is NOT another block arg (RMSNorm scale × activation, LayerNorm bias + activation).
+   - Operand of `stablehlo.multiply` or `stablehlo.add` when the other operand is NOT another block arg, AND the arg's use chain through this op does NOT reach a `stablehlo.exponential`, `stablehlo.reduce(..., max)`, or `stablehlo.reduce(..., add)` followed by a divide (the softmax fingerprint — excludes attention_mask, which is added to scores before softmax).
    - Operand of `stablehlo.dynamic_slice` or `stablehlo.slice` (rotary cos/sin tables sliced by current position).
 3. **No mutating uses**: arg is never operand of any op that produces a result aliasing the arg (no `stablehlo.scatter` writing back to the arg, no in-place updates).
-4. **Not in dynamic-input position**: arg's first dim is not used as a batch dim by any `stablehlo.dynamic_slice(arg, [batch_index, ...])`. (Excludes input_ids, position_ids, attention_mask, cache_pos, and kv-cache args.)
+4. **Not in dynamic-input position**: arg's first dim is not used as a batch dim by any `stablehlo.dynamic_slice(arg, [batch_index, ...])`. (Excludes input_ids, position_ids, attention_mask if it dodged Rule 1, cache_pos, and kv-cache args.)
+5. **Softmax-path exclusion** (belt-and-suspenders for attention_mask): the arg's forward dataflow (chase consumers up to depth 6 through any non-side-effecting op) must NOT pass through `stablehlo.exponential` while still flowing as an additive/multiplicative operand. If it does, the arg is a softmax input (mask or scaling factor that varies per request) and stays `Input`.
 
-Implement as an analysis with worklist over uses; depth-bound at 3 hops through layout-only ops. False positives are critical (mark a runtime-varying arg as Parameter → silent corruption). False negatives are tolerable (arg stays Input → no const-eval gain, no regression). The rules above are biased toward false negatives.
+Implement as an analysis with worklist over uses; depth-bound at 3 hops through layout-only ops for Rule 2, depth 6 for Rule 5. False positives are critical (mark a runtime-varying arg as Parameter → silent corruption). False negatives are tolerable (arg stays Input → no const-eval gain, no regression). The rules above are biased toward false negatives.
+
+**Mandatory mini-test for the heuristic before Phase 2 ships:** the classifier must be unit-tested against a small synthetic MLIR module containing: (a) an embedding-gather pattern, (b) an RMSNorm-multiply pattern, (c) an attention add-mask-then-softmax pattern, (d) a dot_general matmul. Expected: a,b,d → Parameter; c (the mask) → Input. Write this as a `lit` test or a pjrt-plugin-tt unit test before wiring into the live build. If the heuristic can't pass this, fix it before measuring TPOT.
 
 Verification:
 - Run server bench WITHOUT the Phase 2 `argumentTypeMap` set. To do so, plumb an env var `TT_DISABLE_PJRT_ARG_TYPE_MAP=1` in Phase 2 implementation that, when set, skips assigning `argumentTypeMap`. Verify const-eval still fires via `shlo_compiler.mlir` dump (weight args still carry `ttcore.argument_type = parameter`).
@@ -219,22 +228,27 @@ Fixtures saved alongside commit: `_fixtures/v146_3run_server_q8b_<phase>.json`.
 | Tracy OOM on a new pattern | Stick with `--decode 5`. Bench is the source of truth; Tracy is a structural-correctness check, not a numeric one. |
 | Phase 3 pass-placement wrong: other passes re-insert redundant layout kernels after the fold | Dump IR after every pipeline pass with `--mlir-print-ir-after-all` (enable via pjrt-plugin-tt CLI option or env var); reorder fold pass placement until output survives. |
 | `set_custom_compile_options` Python-bool serialization mismatch (`True` vs `"true"`) | Phase 0.2 sub-step: verify the round-trip by inspecting the parsed value via the existing INFO log line in `compile_options.cc:44–49`; if `parseBoolOption` rejects `"True"`, set `enable_const_eval` as a string `"true"` explicitly from Python. |
+| Phase 4 auto-detect runs BEFORE `tt-populate-argument-types` → explicit map overwrites auto-detected attrs every compile (with noisy per-arg warnings) | Spec now schedules auto-detect AFTER `tt-populate-argument-types` AND short-circuits on existing attr. Verified via reading `PopulateArgumentTypes.cpp:286–313` (unconditional overwrite + warning). |
+| Heuristic Rule 2 bullet 4 false-positives on attention_mask (mask + scores → mask marked Parameter → silent corruption) | Spec now adds Rule 5 (softmax-path exclusion: if dataflow reaches `stablehlo.exponential` via additive/multiplicative op, arg stays Input) AND tightens Rule 1 to require all dims ≥ 16 (mask has size-1 dims). Mandatory mini-test verifies before live use. |
+| ExternalProject stale stamps from prior canonical build cause Phase 1 rebuild to silently use old checkout | Phase 1 step 2: explicit `rm -rf` of stamps + source dir + build dirs before rebuild. |
+| Phase 2 strategy A and B both produce values; mixing is undefined | Spec now mandates: A short-circuits on first per-arg marker hit; B only consulted when ZERO block args carry per-arg markers in that function; classifier asserts on mixed input. |
+| Empty `argumentTypeMap` produces a per-compile warning from `tt-populate-argument-types` | Cosmetic. Document in Phase 5 final reporting that the warning is benign and expected on functions where auto-detect alone handles classification. |
 
 ## 8. Estimated wall-clock
 
 - Phase 0: ~1.5 hours (0.1 ≈ 30 min, 0.2 ≈ 45 min including `export_path` wire-up + Python-bool round-trip, 0.3 ≈ 15 min)
-- Phase 1: ~1 hour (CMakeLists.txt edit + rebuild + verify-fork-loaded + smoke)
-- Phase 2: ~3 hours (≈ 1.5h C++ classifier with all three strategies + 30 min rebuild + 1h bench/verify/commit). If Phase 0.2 finds no marker, the shared classifier accounts for most of the time — but the Phase 4 work then shrinks by the same amount.
+- Phase 1: ~1.5 hours (CMakeLists.txt edit + build-script edit + stamp/dir cleanup + rebuild + verify-fork-loaded + smoke). Bumped from 1h to account for the cleanup step and the dead-flag removal.
+- Phase 2: ~4 hours (≈ 1.5h C++ classifier with all three strategies + 1h mini-test scaffolding and execution + 30 min rebuild + 1h bench/verify/commit). The mini-test (mandatory before live use) is what bumped this.
 - Phase 3: ~3 hours (only if Phase 0.3 ≥ 50 cancellable pairs)
-- Phase 4: ~2 hours (most logic is reused from Phase 2 classifier; new work is the schedule-in-StableHLOPipelines and verification under `TT_DISABLE_PJRT_ARG_TYPE_MAP=1`)
+- Phase 4: ~2 hours (most logic is reused from Phase 2 classifier; new work is the schedule-in-StableHLOPipelines + short-circuit-on-existing-attr + verification under `TT_DISABLE_PJRT_ARG_TYPE_MAP=1`)
 - Phase 5: ~30 min
 
-Total: ~8 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~11 hours maximum (all phases).
+Total: ~9.5 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~12.5 hours maximum (all phases).
 
 ## 9. Open items to confirm in writing-plans
 
-- Exact line numbers in `module_builder.cc` for the two `argumentTypeMap` assignments — review cited "around 828–855" and "around 980" (variable name at the second site is `options` of type `TTIRToTTNNCommonPipelineOptions`, not `ttnn_pipeline_options`). Pin them down by reading the file at plan-writing time.
 - Naming for the new fold pass — confirm against existing TTNN pass-naming conventions (`TTNNFoldRedundantLayoutKernels` is a placeholder).
 - Phase 3 layout-agnostic-op allowlist: define the `(dtype × layout)` compatibility predicate concretely. tile layout supports bf16/bfp8/fp32; row-major has dtype restrictions on Blackhole. The fold pass must table-drive this.
-- Patch storage strategy for the tt-xla `module_builder.cc` change and the `third_party/CMakeLists.txt` change — both live as `.patch` files under `python/sglang/srt/hardware_backend/tenstorrent/patches/` and get applied at container setup. Plan picks file names and apply mechanism.
 - Phase 2 shared classifier: decide whether the C++ helper lives in pjrt-plugin-tt (closer to caller, no tt-mlir rebuild needed when tweaking) or in tt-mlir as a library function (reused directly by Phase 4). The plan picks one location.
+- Phase 4 mini-test placement: lit test under `tt-mlir-sglang/test/Conversion/StableHLOToTTIR/` vs pjrt-plugin-tt unit test under `tt-xla/pjrt_implementation/tests/`. Plan picks one.
+- Phase 0.2 candidate markers to grep for in StableHLO dumps (prior to settling on Strategy A): `mhlo.parameter_replication`, `xla_hlo.parameter_buffer_assignments`, `tf.aliasing_output`, `tf.entry_function`, `jax.arg_info`, `torch.placeholder`, `mhlo.layout_mode`. None are guaranteed; Phase 0.2's job is to find what's actually present.
