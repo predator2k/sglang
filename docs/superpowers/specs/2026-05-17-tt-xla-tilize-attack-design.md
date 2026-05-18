@@ -17,10 +17,12 @@ The implementation plan derived from this spec MUST instruct the executor to ful
 - "takes too long to compile"
 - "requires code modification in another repo" (this work spans three: `/home/mhnie/sglang`, `/home/mhnie/tt-mlir-sglang`, `/home/mhnie/tt-xla/pjrt_implementation`)
 - "I'll defer this to a follow-up"
+- "the build broke, I'll skip ahead to the next phase" (a build failure is a blocker; surface as a question, do not auto-skip)
+- "the verification step would take too long, I'll trust the diff" (every phase's verification is mandatory)
 
-Genuine blockers (e.g., a build that won't link due to an upstream API rename) are surfaced as questions, not unilateral descope decisions.
+Genuine blockers are surfaced as questions, not unilateral descope decisions.
 
-Phase 0 contains explicit measurement gates that **may** legitimately de-scope Phase 3 / Phase 4 — but only on the specific quantitative criteria stated in the Phase 0 table. Any other descope requires the user's approval.
+Phase 0 contains explicit measurement gates that **may** legitimately de-scope Phase 3 — but only on the specific quantitative criterion stated in the Phase 0 table (≥ 50 cancellable pairs). Phase 4's fallback to A.3.b is also explicitly authorized. Any other descope requires the user's approval.
 
 ## 1. Goal
 
@@ -45,10 +47,10 @@ Out of scope:
 
 | Step | Repo | Files |
 |---|---|---|
-| Phase 1 wiring | `/home/mhnie/tt-xla` (host clone, detached at `470f0fad`) | `third_party/CMakeLists.txt:5–28`; set `USE_CUSTOM_TT_MLIR_VERSION=ON` and pre-populate `third_party/tt-mlir/src/tt-mlir/` via symlink to `/home/mhnie/tt-mlir-sglang/`. tt-mlir is NOT a git submodule — it's brought in via `ExternalProject_Add` with a clone-then-checkout step (skipped when `USE_CUSTOM_TT_MLIR_VERSION=ON`). |
+| Phase 1 wiring | `/home/mhnie/tt-xla` (host clone, detached at `470f0fad`) | Edit `third_party/CMakeLists.txt:47–85` (the `ExternalProject_Add(tt-mlir …)` block): replace `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` + `GIT_TAG ${TT_MLIR_VERSION}` with `SOURCE_DIR /home/mhnie/tt-mlir-sglang` + `DOWNLOAD_COMMAND ""` so CMake never clones from canonical. tt-mlir is NOT a git submodule and `USE_CUSTOM_TT_MLIR_VERSION` only controls which SHA gets assigned to `TT_MLIR_VERSION` — it does NOT skip the `ExternalProject_Add` block (lines 28–95 always run when `TOOLCHAIN!="ON"`). |
 | A.1.a | `/home/mhnie/tt-xla/pjrt_implementation/src/api/module_builder/module_builder.cc` | Build a `TTArgumentTypeMap` and assign it to both `stablehlo_pipeline_options.argumentTypeMap` (StableHLO PM, around line 828–855) and `ttnn_pipeline_options.argumentTypeMap` (TTNN PM, around line 980). Pipeline-option fields already exist in `TTNNPipelines.h:319–334` and `StableHLOPipelines.h:47–61`. Plug-in source lives at `/home/mhnie/tt-xla/pjrt_implementation/{inc,src}/`. |
 | A.2.a | `/home/mhnie/tt-mlir-sglang` (branch `tenstorrent-p1`) | new `lib/Dialect/TTNN/Transforms/TTNNFoldRedundantLayoutKernels.cpp` + `Passes.td` registration + `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp` insertion (see Phase 3 for exact insertion point) |
-| A.3.a | `/home/mhnie/tt-mlir-sglang` | either `lib/Dialect/StableHLO/Transforms/AnalyzeMesh.cpp` (preferred — already reads `ArgumentTypeAttr` at lines 128, 135–137, 158–160, 227 and has an `automaticArgAnalysis` path at line 353) OR `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp`. Phase 4 prereq decides which. |
+| A.3.a | `/home/mhnie/tt-mlir-sglang` | `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp` (or a small new pass scheduled in `StableHLOPipelines.cpp` before `createTTPopulateArgumentTypes`). Note: `AnalyzeMesh.cpp` *reads* `ArgumentTypeAttr` and emits errors (`AnalyzeMesh.cpp:120–132`) when an arg isn't already annotated — it doesn't populate, so extending it would change its semantics, not "tweak a config". Don't go there. |
 | Build/install | `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (committed at `95d656c8f`) | Rebuilds tt-mlir under the live tt-xla tree and reinstalls the pjrt plugin into `tt-xla-eval`. **Run from `tt-mlir-sglang`, NOT from `tt-xla`.** |
 | Verification | `/home/mhnie/sglang` | bench/probe scripts already in `python/sglang/srt/hardware_backend/tenstorrent/test/` |
 
@@ -64,6 +66,8 @@ The gate is whether anyone sets `ArgumentTypeAttr` on the lowered func's block a
 
 **4.4 IR dumping is a built-in compile_options field, not a research item.** `compile_options.h:121` defines `std::optional<std::string> export_path`. When set, `ModuleBuilder::printModule` emits stage IR files: `vhlo`, `shlo`, `shlo_frontend`, `shlo_compiler`, `ttir`, `ttnn` (calls at `module_builder.cc:262, 270, 276, 315, 351, 357, 432, 452, 465, 843`). Trigger via `torch_xla.set_custom_compile_options({"export_path": "/tmp/dump"})`. Use for Phase 0.2 (block-arg attrs in `shlo`) and Phase 0.3 (kernel-pair count in `ttnn`).
 
+**4.5 The TTNN pipeline already runs `ConstEvalHoist` three times, sandwiching weight-dtype-conversion.** `TTNNPipelines.cpp:309, 372, 386` invoke `createConstEvalHoistTransform()`; `TTNNWeightDtypeConversion` runs at line 339 between the first two. The comment around line 365–370 explicitly states the second invocation exists to "pick up any const-evalable ops created in weight dtype conversion." This means the BFP8-cast-outside-consteval risk is already mitigated by the pipeline design; if the dump shows otherwise, it's a real bug, not an expected limitation.
+
 ## 5. Phase plan
 
 ### Phase 0 — Investigations (no rebuilds, ~1.5 hours total)
@@ -78,38 +82,53 @@ Phase 0 is a gate, not a formality. The Phase 0.3 quantitative threshold is the 
 
 If 0.2 also produces a clean per-arg parameter marker, capture an arg attr example for the Phase 4 implementation.
 
-### Phase 1 — Repoint tt-xla third_party at the fork (~45 min)
+### Phase 1 — Repoint tt-xla third_party at the fork (~1 hour)
 
-`/home/mhnie/tt-xla/third_party/CMakeLists.txt:5` defines `option(USE_CUSTOM_TT_MLIR_VERSION ... OFF)`. When ON, the clone-and-checkout block at lines 7–28 is skipped, and the build uses whatever already exists at `/home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir/`.
+`USE_CUSTOM_TT_MLIR_VERSION` does NOT skip cloning. `third_party/CMakeLists.txt:7–9` only controls which SHA gets assigned to `TT_MLIR_VERSION`. The actual cloning happens unconditionally:
+- Toolchain build path (`if (TOOLCHAIN STREQUAL "ON")` at lines 13–27) clones via `execute_process`.
+- Normal path (`else()` at lines 28–95) clones via `ExternalProject_Add` at lines 47–85, which has `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` + `GIT_TAG ${TT_MLIR_VERSION}` hard-coded.
 
-Concrete mechanism:
-1. From `/home/mhnie/tt-xla`, run `cmake -B build -DUSE_CUSTOM_TT_MLIR_VERSION=ON -DTT_MLIR_VERSION=<fork-HEAD-sha>` (or wire into the existing CMake invocation in `scripts/build_and_install.sh`).
-2. Replace `/home/mhnie/tt-xla/third_party/tt-mlir/src/tt-mlir/` with a symlink to `/home/mhnie/tt-mlir-sglang/`. Back up the old directory under `.../tt-mlir/src/tt-mlir.canonical-bak/` for fast revert.
-3. Rebuild via `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh`. Note: this script lives in tt-mlir-sglang, NOT in tt-xla.
-4. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 of the handoff doc — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
+Concrete mechanism (must edit CMakeLists.txt, not just symlink):
 
-This re-activates **all 5 fork patches** that are ahead of canonical `f3ddbfb6` (B.2 v3 `2fc1d119e`, B.2 v2 `e62086947`, link tweak `4899ff291`, distributed-disable `8eb2e5b46`, build script `95d656c8f`). Per memory `tenstorrent-tt-xla-tpot-workstream-a` and `tenstorrent-tt-mlir-sglang-fork`, B.2 v3 has been built into the canonical wheel and known to work; the other 4 are build-system tweaks expected to be neutral or strictly better. If smoke regresses TPOT or build breaks: bisect by reverting fork commits individually.
+1. Edit `/home/mhnie/tt-xla/third_party/CMakeLists.txt`. In the `ExternalProject_Add(tt-mlir …)` block at lines 47–85:
+   - Replace `GIT_REPOSITORY https://github.com/tenstorrent/tt-mlir.git` and `GIT_TAG ${TT_MLIR_VERSION}` with `SOURCE_DIR /home/mhnie/tt-mlir-sglang` + `DOWNLOAD_COMMAND ""`.
+   - If the toolchain path at lines 13–27 is also exercised in our build, replace its `git clone …` with a `ln -sfn /home/mhnie/tt-mlir-sglang ${PROJECT_SOURCE_DIR}/tt-mlir/src/tt-mlir`.
+2. Save the edit as a checked-in patch under `/home/mhnie/sglang/python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-source-dir-fork.patch` so it can be re-applied after container restart.
+3. Rebuild via `/home/mhnie/tt-mlir-sglang/scripts/build_and_install.sh` (lives in tt-mlir-sglang, NOT tt-xla, committed at `95d656c8f`).
+4. **Hard verification that the live build is the fork, not canonical:**
+   - Run `pip3 show pjrt-plugin-tt | grep commit` in the `tt-xla-eval` container. The `tt-mlir-commit=` line should show `2fc1d119e` (fork HEAD), NOT `f3ddbfb6` (canonical pin).
+   - Additionally grep one of the fork-specific commit identifiers in the built library: `strings $(python3 -c 'import pjrt_plugin_tt, os; print(os.path.dirname(pjrt_plugin_tt.__file__))')/lib/libTTMLIR*.so | grep -E "B\.2.*v3|tenstorrent-p1"` — should match at least one fork-specific symbol/string.
+5. Smoke test: Qwen3-8B BFP8 server bench with `BYPASS_PREWARM=1 SGLANG_TT_CACHE_MODE=index_copy` (per Pitfall #4 — required for the rebuilt plugin). Expect ≈ 132 ms TPOT, no regression.
+
+This re-activates **all 5 fork patches** that are ahead of canonical `f3ddbfb6` (B.2 v3 `2fc1d119e`, B.2 v2 `e62086947`, link tweak `4899ff291`, distributed-disable `8eb2e5b46`, build script `95d656c8f`). Per memory `tenstorrent-tt-xla-tpot-workstream-a` and `tenstorrent-tt-mlir-sglang-fork`, B.2 v3 has been built into the canonical wheel and known to work; the other 4 are build-system tweaks expected to be neutral. If smoke regresses TPOT or build breaks: bisect by reverting fork commits individually.
 
 ### Phase 2 — A.1.a (set argumentTypeMap in module_builder.cc)
 
+The central design choice in Phase 2 is **the argument classifier**: how to decide which block args are `Input` vs `Parameter` for the lowered HLO function. Phase 0.2's outcome determines which of three strategies to use, in priority order:
+
+**Strategy A (used if Phase 0.2 finds per-arg marker).** Read the per-arg torch_xla marker name found in Phase 0.2 (e.g., `mhlo.parameter_replication`, `jax.arg_info`, or whatever shows up). For each block arg, if the marker says "parameter" → `ArgumentType::Parameter`; else `Input`.
+
+**Strategy B (used if Phase 0.2 finds a module-level cluster marker).** Some HLO emitters mark parameters at module level via an array attr like `mhlo.parameter_replication = [false, false, true, true, true]`. Parse the array, map 1:1 onto block-arg indices.
+
+**Strategy C (used if Phase 0.2 finds no marker).** Use a **classifier identical to A.3.b** (see Phase 4 for the rule set), applied to the incoming MLIR module before pipeline construction. The classifier walks each `func::FuncOp`, examines each block arg's use chain, and decides `Parameter` vs `Input`. **Phase 2 must implement this classifier even if Strategy A/B suffice**, because Phase 4 will reuse it; isolate it into a shared C++ helper to avoid code duplication.
+
 Implementation (in `/home/mhnie/tt-xla/pjrt_implementation/src/api/module_builder/module_builder.cc`):
 
-1. Build a `TTArgumentTypeMap` from the HLO function signature. For tt-xla → torch_xla, the convention is: the first K args are dynamic inputs (input_ids, attention_mask, position_ids, cache_pos, kv caches), the remainder are static parameters (model weights). K depends on the wrapped HF model's forward signature. Use the per-arg marker found in Phase 0.2 if available; otherwise derive K from `compile_options` metadata or from arg-attr inspection on the incoming module.
-2. Build the map keyed by the forward function's symbol name (e.g., `"main" -> SmallVector<ArgumentType>{Input, Input, …, Parameter, Parameter, …}`).
-3. Assign `stablehlo_pipeline_options.argumentTypeMap = ttArgumentTypeMap;` around line 828–855 (where `stablehlo_pipeline_options` is constructed before invoking the StableHLO pipeline).
-4. Assign `ttnn_pipeline_options.argumentTypeMap = ttArgumentTypeMap;` around line 980 (TTNN PM construction).
-5. Existing `compile_options.enable_const_eval` (default `true`) handles the rest: `tt-populate-argument-types` populates `ttcore.argument_type` on block args, `ConstEvalHoistTransform` fires, `TTNNPrepareConstEvalCaching` + `TTNNConstEvalInputsToSystemMemory` close the loop.
-6. Add an INFO log line `"[TT-XLA] argumentTypeMap set: K_inputs=%d, K_params=%d"` so plumbing failures are obvious in `tt-xla-eval` logs.
+1. Implement `classifyArgs(mlir::ModuleOp module) -> TTArgumentTypeMap` (or call a helper in tt-mlir if more natural). Internally, it tries Strategy A → B → C in order; returns the map keyed by function symbol name.
+2. Assign `stablehlo_pipeline_options.argumentTypeMap = classifyArgs(mlir_module);` around line 828–855 (where `stablehlo_pipeline_options` is constructed). Confirm exact line in writing-plans.
+3. Assign `options.argumentTypeMap = classifyArgs(mlir_module);` around line 980 (the variable in that block is named `options`, of type `TTIRToTTNNCommonPipelineOptions`). Confirm exact line in writing-plans.
+4. Existing `compile_options.enable_const_eval` (default `true` at `inc/api/compile_options.h:83`) handles the rest: `tt-populate-argument-types` populates `ttcore.argument_type` on block args, `ConstEvalHoistTransform` fires (three invocations at `TTNNPipelines.cpp:309, 372, 386`), `TTNNPrepareConstEvalCaching` + `TTNNConstEvalInputsToSystemMemory` close the loop.
+5. Add an INFO log line `"[TT-XLA] argumentTypeMap: strategy=<A|B|C>, function=<name>, K_inputs=%d, K_params=%d"` so plumbing failures are obvious in `tt-xla-eval` logs.
 
-No new env var required — A.1.a is unconditional. If desired, expose a `disable_const_eval=true` escape hatch (just set `compile_options.enable_const_eval = false` from Python), but default behavior is "weights get const-evaled."
+No new compile_options field required — A.1.a is unconditional once `argumentTypeMap` is set. To disable for negative-control benches, set `enable_const_eval=False` via `set_custom_compile_options`.
 
 Verification:
 - Re-dump IR with `export_path` (mechanism from Phase 0.2). Confirm `shlo_compiler.mlir` shows `ttcore.argument_type = #ttcore<argument_type parameter>` on weight block args.
-- Confirm `ttnn.mlir` contains a `consteval_<fn>` wrapper function (per `TTNNPrepareConstEvalCaching.cpp:30–34`).
-- Confirm **BFP8 cast lives inside the consteval wrapper** (not in the main forward). If cast is outside, the weight-dtype-conversion pass runs after const-eval-hoist and BFP8 weights aren't pre-quantized. Check pipeline order in `TTNNPipelines.cpp` — if `targetDtype` consumption (around line 338 per review) runs after `ConstEvalHoistTransform`, file as a follow-up but still ship A.1.a.
-- Tracy probe: weight tilizes should drop. To attribute Tilize ops to weights vs activations, diff Tilize **count** in the aggregated Tracy CSV before/after, and correlate with shapes from the `ttnn.mlir` dump (weight matmul shapes are known from `hf_model.config`).
+- Confirm `ttnn.mlir` contains a `consteval_<fn>` wrapper function (per `TTNNPrepareConstEvalCaching.cpp:41`).
+- Confirm **BFP8 cast lives inside the consteval wrapper.** Pipeline order in `TTNNPipelines.cpp` is: `ConstEvalHoist` at line 309 → `TTNNWeightDtypeConversion` at line 339 → `ConstEvalHoist` again at line 372 → `ConstEvalHoist` again at line 386. The line-372 re-invocation (with explicit comment about catching const-eval-able ops created by weight-dtype-conversion) means BFP8 casts on hoisted weights should themselves be hoisted. **If the dump shows BFP8 cast OUTSIDE the consteval wrapper, file as a real bug** — the pipeline order is supposed to handle this and a failure here is a tt-mlir bug worth reporting upstream (not a workaround).
+- Tracy probe: weight tilizes should drop. To attribute Tilize ops to weights vs activations, diff Tilize **count** in the aggregated Tracy CSV before/after, and correlate with shapes from the `ttnn.mlir` dump (weight matmul shapes are known from `hf_model.config`). Expected: weight-tilize fraction of total Tilize count drops to near zero.
 - Server bench: TPOT should drop. Magnitude depends on Phase 0.1 weight-tilize share.
-- Negative control: bench with `enable_const_eval=False`, confirm 132 ms baseline restored.
+- Negative control: bench with `enable_const_eval=False` via `torch_xla.set_custom_compile_options({"enable_const_eval": False})`, confirm 132 ms baseline restored.
 
 Commits: tt-xla side (`module_builder.cc` change) lives in `/home/mhnie/tt-xla/pjrt_implementation/` — since `/home/mhnie/tt-xla/` is a host clone of canonical tt-xla, the diff lives as a local patch; sync to `/home/mhnie/tt-mlir-sglang/` if a fork branch is later set up for it. For now, save the diff under `python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-argument-type-map.patch` in sglang and `git apply` from the container. Sglang commit captures the patch + bench fixture.
 
@@ -123,7 +142,7 @@ Implementation:
 - Allowlist (start conservative): `ttnn.add`, `ttnn.multiply`, `ttnn.subtract`, `ttnn.relu`, `ttnn.gelu`, `ttnn.silu`, `ttnn.typecast` (when output dtype is layout-preserving). Expand only after measuring stable.
 - Mirror the DRAM↔L1 safety guard from `foldConsecutiveToLayoutOp` (`TTNNOps.cpp:2078–2089`): don't fold when source op stages to DRAM and the eventual consumer expects L1 (or vice versa).
 - Register pass via `Passes.td` (in `include/ttmlir/Dialect/TTNN/Transforms/Passes.td`).
-- Wire into `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp` immediately after `TTNNDecomposeLayouts` (line ~251). Verify placement does NOT precede any pass between lines 251 and ~307 that re-inserts redundant layout kernels (read the passes in that range; reorder if needed).
+- Wire into `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp` inside the helper `createTTNNPipelineLayoutDecompositionPass` (defined at line 249): add `pm.addPass(createTTNNFoldRedundantLayoutKernels());` immediately after the existing `pm.addPass(createTTNNDecomposeLayouts());` at line 251. The helper is invoked from the top-level pipeline at line 407 (inside `devicePm`), so placement inside the helper ensures the new fold runs in every context where layout decomposition runs. Verify by reading any other pass added inside the helper after the decompose call (today: none — decompose is the last op there).
 
 Verification:
 - Re-dump `ttnn.mlir` via `export_path`. Re-run Phase 0.3 counting script. Confirm cancellable-pair count drops.
@@ -134,27 +153,38 @@ Risks:
 - Allowlist too aggressive → wrong layout reaches a kernel that secretly assumes one layout. Mitigation: bench accuracy test (greedy-only, 10 prompts, byte-exact vs Phase 1 baseline) is a release gate.
 - Pass placement wrong → other passes re-insert redundant layout kernels after this fold runs. Mitigation: dump IR after each pipeline pass with `--mlir-print-ir-after-all` (set via env var or extra pass option in pjrt-plugin-tt) and verify the fold's output survives.
 
-### Phase 4 — A.3.a (auto-detect parameter markers)
+### Phase 4 — A.3.a (auto-detect parameter markers in tt-mlir)
 
-**Prerequisite step (10 min, no rebuild): determine where the marker logic belongs.** Read `lib/Dialect/StableHLO/Transforms/AnalyzeMesh.cpp:128–174` and `:353–401`. If `AnalyzeMesh` already runs in the StableHLO pipeline AND `automaticArgAnalysis` can be triggered on standard tt-xla compiles, extend `AnalyzeMesh.cpp` to also mark `Parameter` (today it appears to focus on `BatchParallelism`). Otherwise put the logic in `StableHLOToTTIRPass.cpp` as originally planned.
+Phase 4 takes the classifier logic implemented in Phase 2's `classifyArgs` helper and moves/duplicates it into a tt-mlir pass that runs without a pjrt-side `argumentTypeMap`. The host moves from `pjrt_implementation/module_builder.cc` (per-compile, before pipeline) to `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp` (or a new pass in `StableHLOPipelines.cpp` scheduled before `tt-populate-argument-types`).
 
-Implementation (primary, A.3.a):
-- Walk every `func::FuncOp` in the module. For each block arg, examine its arg-attr dict.
-- If the arg carries the torch_xla parameter marker(s) found in Phase 0.2 (e.g., a specific `mhlo.parameter_replication` or `jax.arg_info` attr — record the exact name from Phase 0.2 here), set `ttcore.argument_type = #ttcore<argument_type parameter>`.
-- If marker is per-arg, apply 1:1. If marker is module-level with an arg-index list, parse the list.
+Why not `AnalyzeMesh.cpp`: `AnalyzeMesh.cpp:120–132` emits errors when a block arg lacks `ArgumentTypeAttr`. It is a *consumer* of the annotation, not a producer. Extending it would change its semantics and contract.
 
-Fallback (A.3.b) — activated when Phase 0.2 finds no per-arg marker:
-- Heuristic: for each block arg of every `func::FuncOp`, classify as `Parameter` iff ALL of:
-  1. Tensor rank ≥ 2.
-  2. Every use is as the static (non-batch) operand of `stablehlo.dot_general`, `stablehlo.convolution`, OR as an operand of an `stablehlo.transpose`/`stablehlo.reshape` whose sole use is one of the above.
-  3. Argument is not in the "dynamic input" position (HLO convention: dynamic inputs typically have batch-like dim 0, indexed by `stablehlo.dynamic_slice` or similar — exclude args with such uses).
-- Implement as a small analysis pass that walks each arg's use chain to fixed depth (3 hops). Mark only on positive confirmation.
-- Treat false negatives as acceptable (worst case: arg stays as `Input` → no const-eval gain, no regression). Treat false positives as critical (would silently corrupt: a runtime-varying arg gets const-evaled). The "every use must be matmul/conv operand or layout-only transform thereof" rule guards against false positives.
+Implementation:
+- Add a new small pass `populateArgumentTypesAutoDetect` in `lib/Dialect/StableHLO/Transforms/` (or fold into `StableHLOToTTIRPass.cpp` if simpler).
+- For each `func::FuncOp`: classify block args using the same A→B→C strategy as Phase 2 (Strategy A: per-arg marker; B: module-level cluster marker; C: heuristic).
+- For each classified `Parameter` arg, set the function's arg attr at `ttcore.argument_type = #ttcore<argument_type parameter>`.
+- Schedule the new pass in `StableHLOPipelines.cpp` BEFORE the existing `createTTPopulateArgumentTypes` invocation, so the pre-existing pass-option-based map (from Phase 2) overrides if also set. Order in the pipeline: `populateArgumentTypesAutoDetect → tt-populate-argument-types`. The latter overwrites only entries that conflict; auto-detect provides defaults.
+
+A.3.b heuristic — concrete rules (used in Strategy C above, both for Phase 2 and Phase 4 — implement once, share):
+
+For each block arg of every `func::FuncOp` in the module, classify as `Parameter` iff ALL of:
+1. **Rank gate**: tensor rank ≥ 1 AND at least one dim ≥ 64 (excludes scalars and small bias-like tensors that are also static, but those don't dominate Tilize cost anyway).
+2. **Use-pattern allowlist** — every use of the arg is one of the following (or transitively reaches one of the following through layout-only ops `stablehlo.transpose`, `stablehlo.reshape`, `stablehlo.broadcast_in_dim` to depth ≤ 3):
+   - Operand of `stablehlo.dot_general` (matmul: q/k/v/o projections, gate/up/down projections).
+   - Operand of `stablehlo.convolution`.
+   - Operand of `stablehlo.gather` (embedding tables — Qwen3-8B's largest weight, vocab×hidden ≈ 152k×4096).
+   - Operand of `stablehlo.multiply` or `stablehlo.add` when the other operand is NOT another block arg (RMSNorm scale × activation, LayerNorm bias + activation).
+   - Operand of `stablehlo.dynamic_slice` or `stablehlo.slice` (rotary cos/sin tables sliced by current position).
+3. **No mutating uses**: arg is never operand of any op that produces a result aliasing the arg (no `stablehlo.scatter` writing back to the arg, no in-place updates).
+4. **Not in dynamic-input position**: arg's first dim is not used as a batch dim by any `stablehlo.dynamic_slice(arg, [batch_index, ...])`. (Excludes input_ids, position_ids, attention_mask, cache_pos, and kv-cache args.)
+
+Implement as an analysis with worklist over uses; depth-bound at 3 hops through layout-only ops. False positives are critical (mark a runtime-varying arg as Parameter → silent corruption). False negatives are tolerable (arg stays Input → no const-eval gain, no regression). The rules above are biased toward false negatives.
 
 Verification:
-- Run server bench WITHOUT any user-supplied `argumentTypeMap` (i.e., revert the Phase 2 A.1.a flag plumbing temporarily, or set `enable_argument_type_map=false` if Phase 2 exposed such a knob). Const-eval should now fire automatically. Confirm via `shlo_compiler.mlir` dump that weight args carry `ttcore.argument_type = parameter`.
-- Run server bench WITH A.1.a plumbing also on. Behaviour should be identical (idempotent — A.1.a's map wins via overwrite, but the values match).
-- Negative control: run on a non-weight-carrying function (e.g., a tt-xla unit test compile of a function with all dynamic inputs). Confirm no args get falsely marked.
+- Run server bench WITHOUT the Phase 2 `argumentTypeMap` set. To do so, plumb an env var `TT_DISABLE_PJRT_ARG_TYPE_MAP=1` in Phase 2 implementation that, when set, skips assigning `argumentTypeMap`. Verify const-eval still fires via `shlo_compiler.mlir` dump (weight args still carry `ttcore.argument_type = parameter`).
+- **Coverage check**: parse the `ttnn.mlir` dump after auto-detect, count block args marked `parameter` and total block args expected to be weights (from `len([p for p in hf_model.named_parameters() if p[1].numel() > 1000])`). Coverage should be ≥ 95% — the embedding table and rotary tables in particular must be marked. If coverage misses a large-tensor category, expand the Rule 2 allowlist.
+- Run server bench WITH Phase 2 `argumentTypeMap` also set. Behaviour should be identical (idempotent — the explicit map from Phase 2 overrides, but the values match).
+- Negative control: a synthetic test function with only dynamic inputs (e.g., 2 args, both used as `stablehlo.dot_general` LHS via batch dim 0). Confirm neither is marked.
 
 ### Phase 5 — Final reporting (~30 min)
 
@@ -179,30 +209,32 @@ Fixtures saved alongside commit: `_fixtures/v146_3run_server_q8b_<phase>.json`.
 
 | Risk | Mitigation |
 |---|---|
+| Phase 1 CMake edit doesn't take (build still pulls canonical tt-mlir) | Hard verification in Phase 1 (commit SHA from `pip3 show pjrt-plugin-tt` + symbol grep in libTTMLIR*.so). If still canonical, the `SOURCE_DIR` override didn't apply — re-check whether `${TTPJRT_SOURCE_DIR}/third_party/tt-mlir` was pre-populated correctly or whether ExternalProject still cached the old clone. Re-bisect from a clean `build/` dir. |
 | Phase 1 smoke-test regresses TPOT or breaks build (any of 5 fork patches culpable, not just B.2 v3) | Bisect by reverting fork commits individually starting from HEAD. If B.2 v3 is the offender, `git revert 2fc1d119e` and document. |
-| A.1.a `argumentTypeMap` doesn't reach the pass (e.g., field name typo) | Phase 2 verification dumps IR and greps for `ttcore.argument_type`; the INFO log line in `module_builder.cc` reports map construction. |
+| A.1.a `argumentTypeMap` doesn't reach the pass (e.g., field name typo) | Phase 2 verification dumps IR and greps for `ttcore.argument_type`; the INFO log line in `module_builder.cc` reports strategy + counts. |
 | `enable_const_eval` defaults change in a future tt-mlir bump | Explicitly set `compile_options.enable_const_eval = true` in `module_builder.cc` if the existing default is removed; surface as a build break, not a silent regression. |
-| BFP8 weight-dtype-conversion pass runs AFTER `ConstEvalHoistTransform` → hoisted weights NOT quantized to BFP8 → memory stays high | Phase 2 verification explicitly inspects `ttnn.mlir` for whether `cast`/`typecast` to BFP8 lives inside the `consteval_<fn>` wrapper. If outside, file a follow-up to reorder passes in `TTNNPipelines.cpp` and ship A.1.a anyway (still a Tilize win, just not the BFP8 memory win). |
-| A.3.a marker not found (Phase 0.2 produces no per-arg marker) | A.3.b heuristic activates (fleshed out in Phase 4). If A.3.b's accuracy gate fails (false positives detected), ship A.1.a only and document A.3 as "needs torch_xla upstream change to emit a marker." |
+| Phase 0.2 finds no per-arg marker → Phase 2 must implement Strategy C heuristic too | Acknowledged in Phase 2 — the classifier is implemented unconditionally as a shared helper, with Strategy C as the fallback path. Same helper is reused in Phase 4. |
+| A.3.b heuristic misses large-but-non-matmul weights (embeddings, RMSNorm, rotary tables) | Rule 2 allowlist in Phase 4 explicitly covers `stablehlo.gather` (embeddings), `stablehlo.multiply`/`add` with non-block-arg counterpart (RMSNorm/LayerNorm), and `stablehlo.dynamic_slice`/`slice` (rotary). Coverage check in Phase 4 verification asserts ≥ 95% of expected-weight args are marked. |
 | Plugin rebuild breaks (CMake or link error) after a phase commit | Each phase commit captures a working state; revert the offending change in tt-mlir-sglang or tt-xla patch, re-bisect. |
 | Tracy OOM on a new pattern | Stick with `--decode 5`. Bench is the source of truth; Tracy is a structural-correctness check, not a numeric one. |
-| Phase 4 prereq surprise: `AnalyzeMesh` already marks `Parameter` for HF weights | If so, A.3 is mostly done — just verify it fires for tt-xla compiles. May reduce Phase 4 to a config tweak (e.g., enable `automaticArgAnalysis`). Not a descope — a simplification. |
 | Phase 3 pass-placement wrong: other passes re-insert redundant layout kernels after the fold | Dump IR after every pipeline pass with `--mlir-print-ir-after-all` (enable via pjrt-plugin-tt CLI option or env var); reorder fold pass placement until output survives. |
+| `set_custom_compile_options` Python-bool serialization mismatch (`True` vs `"true"`) | Phase 0.2 sub-step: verify the round-trip by inspecting the parsed value via the existing INFO log line in `compile_options.cc:44–49`; if `parseBoolOption` rejects `"True"`, set `enable_const_eval` as a string `"true"` explicitly from Python. |
 
 ## 8. Estimated wall-clock
 
-- Phase 0: ~1.5 hours (0.1 ≈ 30 min, 0.2 ≈ 45 min including `export_path` wire-up, 0.3 ≈ 15 min)
-- Phase 1: ~45 min (CMake config + symlink + rebuild + smoke)
-- Phase 2: ~2.5 hours (≈ 1h C++ in `module_builder.cc` + 30 min rebuild + 1h bench/verify/commit)
-- Phase 3: ~3 hours (only if Phase 0.3 justifies — ≥ 50 cancellable pairs)
-- Phase 4: ~3 hours (≈ 1h prereq + C++ + 30 min rebuild + 1h bench/verify/commit; A.3.b path adds 30–60 min if needed)
+- Phase 0: ~1.5 hours (0.1 ≈ 30 min, 0.2 ≈ 45 min including `export_path` wire-up + Python-bool round-trip, 0.3 ≈ 15 min)
+- Phase 1: ~1 hour (CMakeLists.txt edit + rebuild + verify-fork-loaded + smoke)
+- Phase 2: ~3 hours (≈ 1.5h C++ classifier with all three strategies + 30 min rebuild + 1h bench/verify/commit). If Phase 0.2 finds no marker, the shared classifier accounts for most of the time — but the Phase 4 work then shrinks by the same amount.
+- Phase 3: ~3 hours (only if Phase 0.3 ≥ 50 cancellable pairs)
+- Phase 4: ~2 hours (most logic is reused from Phase 2 classifier; new work is the schedule-in-StableHLOPipelines and verification under `TT_DISABLE_PJRT_ARG_TYPE_MAP=1`)
 - Phase 5: ~30 min
 
-Total: ~6.5 hours minimum (Phase 0 + 1 + 2 + 5), ~10.5 hours maximum (all phases).
+Total: ~8 hours minimum (Phase 0 + 1 + 2 + 5, no Phase 3/4), ~11 hours maximum (all phases).
 
 ## 9. Open items to confirm in writing-plans
 
-- Exact line numbers in `module_builder.cc` for the two `argumentTypeMap` assignments — review cited "around 828–855" and "around 980"; the implementation plan should pin them down by reading the current file.
+- Exact line numbers in `module_builder.cc` for the two `argumentTypeMap` assignments — review cited "around 828–855" and "around 980" (variable name at the second site is `options` of type `TTIRToTTNNCommonPipelineOptions`, not `ttnn_pipeline_options`). Pin them down by reading the file at plan-writing time.
 - Naming for the new fold pass — confirm against existing TTNN pass-naming conventions (`TTNNFoldRedundantLayoutKernels` is a placeholder).
-- Whether the symlink at `tt-mlir/src/tt-mlir/` should symlink the whole repo or just specific subdirs (e.g., `lib/`, `include/`) — depends on how `ExternalProject_Add`'s `BUILD_BYPRODUCTS` paths resolve. Decide in Phase 1 setup.
-- Patch storage strategy for the tt-xla `module_builder.cc` change — drop under `python/sglang/srt/hardware_backend/tenstorrent/patches/tt-xla-argument-type-map.patch` and apply at container build, or maintain a `tt-xla-sglang` fork. The implementation plan picks one.
+- Phase 3 layout-agnostic-op allowlist: define the `(dtype × layout)` compatibility predicate concretely. tile layout supports bf16/bfp8/fp32; row-major has dtype restrictions on Blackhole. The fold pass must table-drive this.
+- Patch storage strategy for the tt-xla `module_builder.cc` change and the `third_party/CMakeLists.txt` change — both live as `.patch` files under `python/sglang/srt/hardware_backend/tenstorrent/patches/` and get applied at container setup. Plan picks file names and apply mechanism.
+- Phase 2 shared classifier: decide whether the C++ helper lives in pjrt-plugin-tt (closer to caller, no tt-mlir rebuild needed when tweaking) or in tt-mlir as a library function (reused directly by Phase 4). The plan picks one location.
