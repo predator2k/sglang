@@ -10,6 +10,7 @@ sync if the upstream test changes.
 Phase A.4 of the Option A prefetcher plan.
 """
 
+import math
 import os
 
 import torch
@@ -18,6 +19,7 @@ from transformers import AutoConfig
 
 from models.tt_transformers.tt.common import Mode
 from models.tt_transformers.tt.generator_sglang import (
+    allocate_sglang_kv_cache,
     initialize_sglang_text_transformer,
 )
 
@@ -25,6 +27,12 @@ from models.tt_transformers.tt.generator_sglang import (
 MODEL_ID = "Qwen/Qwen3-8B"
 MAX_BATCH = 1
 MAX_SEQ_LEN = 2048
+
+# Paged KV-cache parameters.  These must match whatever allocate_sglang_kv_cache
+# allocates so that paged_update_cache / paged_sdpa can find valid blocks.
+BLOCK_SIZE = 32
+# num_blocks: enough to cover MAX_SEQ_LEN for every user in the batch.
+NUM_KV_BLOCKS = math.ceil(MAX_SEQ_LEN * MAX_BATCH / BLOCK_SIZE)
 
 
 def open_2x_blackhole_mesh():
@@ -102,7 +110,54 @@ def build_prefetcher_on_model(mesh_device, n_layers=None):
     return tt_models[0], model_args[0]
 
 
-def decode_one_step(model, model_args, step: int, token_id: int = 42) -> torch.Tensor:
+def build_paged_kv_cache(model, model_args):
+    """Allocate a paged KV cache on the TT device for standalone decode tests.
+
+    initialize_sglang_text_transformer always uses use_paged_kv_cache=True, so
+    layer.attention.layer_past is never set and ttnn_decode_forward requires an
+    explicit kv_cache=[k_ttnn, v_ttnn] per layer passed as kv_cache kwarg.
+
+    Returns (kv_cache, page_table_host) where:
+      kv_cache — list of [k_ttnn, v_ttnn] per layer, on mesh_device.
+      page_table_host — torch.Tensor [MAX_BATCH, num_blocks_per_user] with block IDs.
+    """
+    # Shape: [num_kv_blocks, n_kv_heads, block_size, head_dim]
+    # n_kv_heads here is the per-device count (TP-sharded); allocate_sglang_kv_cache
+    # replicates across both devices, attention ops shard it at runtime.
+    n_kv_heads = model_args.n_kv_heads  # total, e.g. 8 for Qwen3-8B
+    head_dim = model_args.head_dim
+    kv_cache_shape = (NUM_KV_BLOCKS, n_kv_heads, BLOCK_SIZE, head_dim)
+
+    kv_cache = allocate_sglang_kv_cache(
+        kv_cache_shape=kv_cache_shape,
+        dtype=torch.bfloat16,
+        num_layers=model_args.n_layers,
+        dp_model=[model],
+        tt_cache_path=model_args.weight_cache_path(ttnn.bfloat8_b),
+    )
+    # allocate_sglang_kv_cache returns kv_cache[dp_idx][layer] = [k_ttnn, v_ttnn]
+    # We have dp=1, so kv_cache[0] is the per-layer list.
+    kv_cache_single = kv_cache[0]
+
+    # Page table: trivial linear mapping — block i goes to block i.
+    # Shape [batch, blocks_per_user]. Each user gets its own contiguous slice.
+    blocks_per_user = math.ceil(MAX_SEQ_LEN / BLOCK_SIZE)
+    page_table_host = torch.zeros(MAX_BATCH, blocks_per_user, dtype=torch.int32)
+    for user_id in range(MAX_BATCH):
+        start_block = user_id * blocks_per_user
+        page_table_host[user_id] = torch.arange(start_block, start_block + blocks_per_user, dtype=torch.int32)
+
+    return kv_cache_single, page_table_host
+
+
+def decode_one_step(
+    model,
+    model_args,
+    step: int,
+    token_id: int = 42,
+    kv_cache=None,
+    page_table_host=None,
+) -> torch.Tensor:
     """Run one decode step and return logits as a CPU torch.Tensor.
 
     Decode call pattern discovered from:
@@ -115,6 +170,11 @@ def decode_one_step(model, model_args, step: int, token_id: int = 42) -> torch.T
       (b) model.prepare_inputs_decode handles tilize/shard onto the mesh.
       (c) model.ttnn_decode_forward runs embedding + transformer forward + all-gather.
       (d) ttnn.to_torch + reshape yields [batch, 1, vocab_size] CPU logits.
+
+    initialize_sglang_text_transformer always sets use_paged_kv_cache=True, so
+    layer.attention.layer_past is never populated. The caller MUST supply a
+    kv_cache allocated by build_paged_kv_cache(); a matching page_table_host is
+    also expected. Both are created lazily on first call if not provided.
 
     Reused by capture_pcc_baseline.py (prefetcher=False) and
     test_prefetcher_pcc.py (both paths). Works for both use_prefetcher=True/False
@@ -131,20 +191,22 @@ def decode_one_step(model, model_args, step: int, token_id: int = 42) -> torch.T
     current_pos = torch.tensor([step] * batch_size)    # shape [batch], 0-indexed
 
     # (b) Prepare device tensors: tilize tokens, shard current_pos, compute
-    #     rope rotation indices. page_table=None uses linear (non-paged) KV.
-    #     prepare_inputs_decode takes *inputs positionally (delegates to
-    #     prepare_decode_inputs_host(tokens, current_pos, page_table)).
+    #     rope rotation indices.  Pass the page_table_host so prepare_decode
+    #     converts it to a device tensor (tt_page_table).
     tt_tokens, tt_current_pos, tt_rot_mat_idxs, tt_page_table = (
-        model.prepare_inputs_decode(tokens, current_pos, None)
+        model.prepare_inputs_decode(tokens, current_pos, page_table_host)
     )
 
     # (c) Run one decode step: embedding lookup, all transformer layers,
     #     final norm + lm_head, optional all-gather, and untilize.
+    #     kv_cache must be passed because initialize_sglang_text_transformer
+    #     uses use_paged_kv_cache=True, so attention.layer_past is never set.
     tt_logits, _tt_log_probs = model.ttnn_decode_forward(
         tt_tokens,
         tt_current_pos,
         rot_mat_idxs=tt_rot_mat_idxs,
         page_table=tt_page_table,
+        kv_cache=kv_cache,
     )
 
     # (d) Bring logits back to CPU host.
