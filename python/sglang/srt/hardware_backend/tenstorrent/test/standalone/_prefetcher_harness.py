@@ -173,8 +173,9 @@ def decode_one_step(
 
     initialize_sglang_text_transformer always sets use_paged_kv_cache=True, so
     layer.attention.layer_past is never populated. The caller MUST supply a
-    kv_cache allocated by build_paged_kv_cache(); a matching page_table_host is
-    also expected. Both are created lazily on first call if not provided.
+    kv_cache (allocated by build_paged_kv_cache()) and a matching page_table_host.
+    Calling without them passes None through to ttnn_decode_forward, which then
+    raises AttributeError when the attention layer reaches for layer_past.
 
     Reused by capture_pcc_baseline.py (prefetcher=False) and
     test_prefetcher_pcc.py (both paths). Works for both use_prefetcher=True/False
