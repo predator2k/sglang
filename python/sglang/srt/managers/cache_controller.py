@@ -900,7 +900,19 @@ class HiCacheController:
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
-        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+        # Thread the tier / radix-depth hint through to the storage backend.
+        # Backends that don't care about ``extra_info`` are unaffected because
+        # ``HiCacheStorage.batch_get`` accepts ``**kwargs`` style — kw-passing
+        # falls through to ``target_sizes`` for legacy backends, and the
+        # parameter is keyword-only here so positional argument compatibility
+        # is preserved.
+        try:
+            page_data = self.storage_backend.batch_get(
+                hash_values, dummy_page_dst, extra_info=extra_info
+            )
+        except TypeError:
+            # Backend predates the extra_info kwarg — drop it transparently.
+            page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return
         for i in range(len(hash_values)):
@@ -935,7 +947,17 @@ class HiCacheController:
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            # `radix_depth` = ancestor count = how deep this batch's first page
+            # is in the radix tree. `tier` records that we're going storage→host
+            # so backends can pick a low-latency decode profile.
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={
+                    "tier": "l3_to_l2",
+                    "radix_depth": len(prefix_keys) if prefix_keys else 0,
+                    "is_eviction": False,
+                },
+            )
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
@@ -996,7 +1018,13 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={
+                    "tier": "hit_query",
+                    "radix_depth": len(prefix_keys) if prefix_keys else 0,
+                },
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
@@ -1076,7 +1104,12 @@ class HiCacheController:
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
-        return self.storage_backend.batch_set(hash_values, data)
+        try:
+            return self.storage_backend.batch_set(
+                hash_values, data, extra_info=extra_info
+            )
+        except TypeError:
+            return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
         return all(
@@ -1133,7 +1166,17 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            # Tag the call with tier=l2_to_l3 (we're writing host→storage) and
+            # carry the radix tree depth so layered policies can choose a more
+            # aggressive codec for cold / deep / leaf pages.
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={
+                    "tier": "l2_to_l3",
+                    "radix_depth": len(prefix_keys) if prefix_keys else 0,
+                    "is_eviction": True,
+                },
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(
