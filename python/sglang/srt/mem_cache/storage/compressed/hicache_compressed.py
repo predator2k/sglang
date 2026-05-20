@@ -217,15 +217,28 @@ class CompressedHiCacheFile(HiCacheFile):
         default_profile.get_codec()
 
         # ---- policy ----
+        # YAML / inline doc may include a "runtime:" block whose keys we merge
+        # into ``extra`` (so the YAML can set batch_threads / slab_threads /
+        # strict_dtype centrally, in one place).
+        from sglang.srt.mem_cache.storage.compressed.policy import extract_runtime
+
         self.policy: Optional[LayeredPolicy] = None
         yaml_path = extra.get("profiles_yaml")
         inline_profiles = extra.get("profiles")
         if yaml_path:
-            self.policy = LayeredPolicy.from_yaml(yaml_path)
-            # Default in YAML wins over CLI default; if YAML has no default,
-            # the constructor inside from_yaml falls back to zstd/auto/1.
+            import yaml as _yaml
+
+            with open(yaml_path, "r") as f:
+                policy_doc = _yaml.safe_load(f)
+            self.policy = LayeredPolicy.from_dict(policy_doc)
+            runtime_overrides = extract_runtime(policy_doc or {})
+            for k, v in runtime_overrides.items():
+                extra.setdefault(k, v)
         elif inline_profiles:
             self.policy = LayeredPolicy.from_dict(inline_profiles)
+            runtime_overrides = extract_runtime(inline_profiles)
+            for k, v in runtime_overrides.items():
+                extra.setdefault(k, v)
         else:
             # No policy: build a trivial one whose default == our default_profile.
             self.policy = LayeredPolicy(default=default_profile)
@@ -430,12 +443,17 @@ class CompressedHiCacheFile(HiCacheFile):
         )
 
     def _find_codec_for_kind(self, codec_kind: int) -> codecs.Codec:
-        """Find a codec instance compatible with the given kind, from the
-        policy's profiles. Build a fresh default-config codec if none match."""
+        """Return a codec instance compatible with the given kind.
+
+        ``Profile.get_codec()`` returns a *thread-local* codec, so calling
+        this from a slab_pool worker yields a per-thread instance and the
+        underlying library doesn't see concurrent calls on the same object.
+        """
         for p in self.policy.all_profiles():
-            if p.get_codec().kind == codec_kind:
+            if p.codec_kind() == codec_kind:
                 return p.get_codec()
-        # Fallback: build with default kwargs.
+        # Fallback: build with default kwargs. Decode-time parameters don't
+        # have to match the encoder, the codec format is self-describing.
         codec_name = codecs.CK_NAMES[codec_kind]
         return codecs.build_codec(codec_name, {"compression_level": 1})
 

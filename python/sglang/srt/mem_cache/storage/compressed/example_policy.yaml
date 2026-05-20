@@ -1,35 +1,67 @@
-# Example YAML policy for CompressedHiCacheFile.
+# Example v3-schema policy for CompressedHiCacheFile.
 #
-# Wire it in via:
+# Wire it in:
 #   --hicache-storage-backend compressed_file
-#   --hicache-storage-backend-extra-config '{"profiles_yaml": "/path/to/this/file"}'
+#   --hicache-storage-backend-extra-config '{"profiles_yaml":"/path/to/this/file"}'
 #
-# Rules are applied in order; later matches override earlier ones. Within a rule,
-# `K:` / `V:` sub-blocks override the rule's top-level codec/layout for that
-# direction only.
+# All compression knobs live inside named profiles; `extends:` cuts duplication.
+# `default:` and `rules[].profile` accept a profile name, an inline dict, or a
+# shorthand string ("codec[:level][:inner]@layout"). The `runtime:` block is
+# applied at backend-construction time.
 
-default:
-  codec: zstd
-  compression_level: 1            # zstd-1 is the measured sweet spot on sem_split data
-  layout: sem_split_channel
-  batch_threads: 4
-  slab_threads: 4
-
-rules:
-  # Layer 0: K is normal, V is the famous outlier (4.5–4.7× on raw zstd).
-  - layers: [0]
-    K: { codec: zstd,  compression_level: 1, layout: sem_split_channel }
-    V: { codec: zstd,  compression_level: 9, layout: sem_split_channel }
-
-  # Middle layers: maximum throughput tier with blosc2.
-  - layers: "1-15"
-    codec: blosc2
-    blosc2_inner_codec: zstd
-    blosc2_nthreads: 0            # 0 = auto = os.cpu_count()
+profiles:
+  # Measured sweet spot (~1.6x median on BF16 KV at ~890 MB/s decomp single-thread)
+  balanced:
+    codec: zstd
     compression_level: 1
     layout: sem_split_channel
 
-  # Late layers: low-latency, throughput-first.
-  - layers: "16-31"
+  # When ratio matters more than speed; useful for cold L3 storage.
+  aggressive:
+    extends: balanced
+    compression_level: 9
+
+  # Maximum ratio. Decomp speed degrades but is still useful for archive.
+  archive:
+    extends: balanced
+    compression_level: 19
+    layout: bit_plane
+
+  # Speed-first: blosc2 with lz4 inner is multi-thread by default.
+  fast:
+    codec: blosc2
+    blosc2_inner_codec: lz4
+    blosc2_nthreads: 0       # 0 = os.cpu_count()
+    layout: sem_split_channel
+
+  # Lightest weight tier. Pair with cheap layout.
+  fast_lite:
     codec: lz4
-    layout: byte_hi_lo_channel    # cheaper layout, lz4 doesn't need full sem split
+    layout: byte_hi_lo_channel
+
+  # The "layer-0 V outlier" special — V values at the first transformer block
+  # are tightly clustered (std ≈ 0.04), so raw zstd alone gets 4.5–4.7x.
+  layer0_v_special:
+    codec: zstd
+    compression_level: 1
+    layout: raw
+
+# Top-level default — used for any (layer, K|V) slot not matched by a rule.
+default: balanced
+
+rules:
+  - match: { layers: [0], kv: V }
+    profile: layer0_v_special
+
+  - match: { layers: "1-15" }
+    profile: fast
+
+  - match: { layers: "16-31" }
+    K: aggressive               # different per-direction inside one match
+    V: archive
+
+# Backend-wide settings. These don't belong to any one profile.
+runtime:
+  batch_threads: 4              # cross-page parallelism (batch_get/set)
+  slab_threads: 4               # within-page parallelism (multi-slab)
+  strict_dtype: true
