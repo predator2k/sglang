@@ -84,7 +84,11 @@ from typing import Any, List, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheFile,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.compressed import codecs, layouts
 from sglang.srt.mem_cache.storage.compressed.policy import (
@@ -93,6 +97,20 @@ from sglang.srt.mem_cache.storage.compressed.policy import (
     LayeredPolicy,
     Profile,
 )
+
+
+def _extra_to_dict(extra_info) -> Optional[dict]:
+    """Normalize the ``HiCacheStorageExtraInfo`` instance (or a raw dict) into
+    a plain dict the policy resolver understands.  ``None`` if no useful info."""
+    if extra_info is None:
+        return None
+    if isinstance(extra_info, dict):
+        return extra_info
+    if isinstance(extra_info, HiCacheStorageExtraInfo):
+        ei = extra_info.extra_info
+        if isinstance(ei, dict):
+            return ei
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +482,13 @@ class CompressedHiCacheFile(HiCacheFile):
         key: str,
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
+        extra_info: Optional[Any] = None,
     ) -> torch.Tensor | None:
+        # extra_info is accepted for symmetry with set(); for decode the file
+        # is self-describing so we don't need the hint, but we still take the
+        # kwarg so a caller can pass the same value to both calls without
+        # branching on tier.
+        _ = extra_info
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
@@ -537,6 +561,7 @@ class CompressedHiCacheFile(HiCacheFile):
         value: Optional[Any] = None,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        extra_info: Optional[Any] = None,
     ) -> bool:
         if value is None:
             logger.error("CompressedHiCacheFile.set called with value=None")
@@ -547,16 +572,31 @@ class CompressedHiCacheFile(HiCacheFile):
 
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        extra_dict = _extra_to_dict(extra_info)
 
         # Decide single vs multi slab.
         slabs: List[tuple[int, int, torch.Tensor, Profile]] = []
         if self._use_multi_slab(value):
             for kv_kind, layer_idx, slab in self._slab_iter(value):
-                profile = self.policy.resolve(kv_kind, layer_idx)
+                profile = self.policy.resolve(kv_kind, layer_idx, extra=extra_dict)
                 slabs.append((kv_kind, layer_idx, slab, profile))
         else:
-            # Single slab. Use the default (policy's default).
-            slabs.append((-1, -1, value, self.policy.default))
+            # Single slab. The whole page is treated as one layer/kv-agnostic
+            # slab; only the extra_info-based portion of the policy contributes.
+            if self.policy.rules and extra_dict:
+                # Even without layer info we still let extra_info pick a rule —
+                # iterate rules looking for one with no layer/kv constraint.
+                fallback_profile = self.policy.default
+                for rule in self.policy.rules:
+                    if rule.layers is not None or rule.kvs is not None:
+                        continue
+                    if not rule.matches_extra(extra_dict):
+                        continue
+                    p = rule.K_profile or rule.V_profile or fallback_profile
+                    fallback_profile = p
+                slabs.append((-1, -1, value, fallback_profile))
+            else:
+                slabs.append((-1, -1, value, self.policy.default))
 
         def _enc(idx):
             kv_kind, layer_idx, slab, profile = slabs[idx]
@@ -599,11 +639,15 @@ class CompressedHiCacheFile(HiCacheFile):
         keys: List[str],
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
+        extra_info: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
         targets = target_locations or [None] * len(keys)
         if self._batch_pool is None or len(keys) <= 1:
-            return [self.get(k, t) for k, t in zip(keys, targets)]
-        futures = [self._batch_pool.submit(self.get, k, t) for k, t in zip(keys, targets)]
+            return [self.get(k, t, extra_info=extra_info) for k, t in zip(keys, targets)]
+        futures = [
+            self._batch_pool.submit(self.get, k, t, extra_info=extra_info)
+            for k, t in zip(keys, targets)
+        ]
         return [f.result() for f in futures]
 
     def batch_set(
@@ -612,14 +656,67 @@ class CompressedHiCacheFile(HiCacheFile):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        extra_info: Optional[Any] = None,
     ) -> bool:
         if self._batch_pool is None or len(keys) <= 1:
             for k, v in zip(keys, values):
-                if not self.set(k, v):
+                if not self.set(k, v, extra_info=extra_info):
                     return False
             return True
-        futures = [self._batch_pool.submit(self.set, k, v) for k, v in zip(keys, values)]
+        futures = [
+            self._batch_pool.submit(self.set, k, v, extra_info=extra_info)
+            for k, v in zip(keys, values)
+        ]
         return all(f.result() for f in futures)
+
+    # ------------------------------------------------------------------ v2 path
+
+    def _read_page(self, pool_name, key, host_pool, page_offset, extra_info=None):
+        storage_key = self._log_key(pool_name, key)
+        data_page = self.get(
+            storage_key, host_pool.get_dummy_flat_data_page(), extra_info=extra_info
+        )
+        if data_page is None:
+            return False
+        host_pool.set_from_flat_data_page(page_offset, data_page)
+        return True
+
+    def _write_page(self, pool_name, key, host_pool, page_offset, extra_info=None):
+        storage_key = self._log_key(pool_name, key)
+        data_page = host_pool.get_data_page(page_offset, flat=True)
+        return self.set(storage_key, data_page, extra_info=extra_info)
+
+    def _batch_io_v2_with_extra(self, transfers, op_fn, extra_info):
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            expected = len(keys) * page_size
+            host_indices = transfer.host_indices
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "%s indices length mismatch for %s: expected %s, got %s",
+                    op_fn.__name__, transfer.name, expected,
+                    host_indices.numel() if host_indices is not None else 0,
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+            results[transfer.name] = [
+                op_fn(
+                    transfer.name, key, host_pool,
+                    host_indices[i * page_size].item(),
+                    extra_info=extra_info,
+                )
+                for i, key in enumerate(keys)
+            ]
+        return results
+
+    def batch_get_v2(self, transfers, extra_info=None):
+        return self._batch_io_v2_with_extra(transfers, self._read_page, extra_info)
+
+    def batch_set_v2(self, transfers, extra_info=None):
+        return self._batch_io_v2_with_extra(transfers, self._write_page, extra_info)
 
     # ------------------------------------------------------------------ stats
 

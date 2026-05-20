@@ -1,0 +1,49 @@
+# Example policy used by all launch scripts in this directory.
+# Copy or edit before running. See storage/compressed/example_policy.yaml for
+# a more annotated version and storage/compressed/policy.py for the schema.
+
+profiles:
+  balanced:
+    codec: zstd
+    compression_level: 1
+    layout: sem_split_channel
+
+  aggressive:
+    extends: balanced
+    compression_level: 9
+
+  archive:
+    extends: balanced
+    compression_level: 19
+    layout: bit_plane
+
+  fast:
+    codec: blosc2
+    blosc2_inner_codec: lz4
+    blosc2_nthreads: 0
+    layout: sem_split_channel
+
+  layer0_v_special:
+    codec: zstd
+    compression_level: 1
+    layout: raw
+
+default: balanced
+
+rules:
+  # The well-known layer-0 V outlier: 4–5x on raw zstd alone.
+  - match: { layers: [0], kv: V }
+    profile: layer0_v_special
+
+  # Tier-aware rules. Only fire when the controller passes a tier hint via
+  # ``HiCacheStorageExtraInfo.extra_info["tier"]``. Until that wiring lands,
+  # they're inert and the layer/kv rules above carry the policy.
+  - match: { tier: "l2_to_l3" }
+    profile: archive
+  - match: { tier: "l1_to_l2" }
+    profile: fast
+
+runtime:
+  batch_threads: 4
+  slab_threads:  4
+  strict_dtype:  true

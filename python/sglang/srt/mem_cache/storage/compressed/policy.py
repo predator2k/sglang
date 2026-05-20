@@ -86,10 +86,24 @@ Match keys
 ----------
 ``match`` is a small dict. Supported keys:
 
-  layers : int | list[int] | "lo-hi" | "all"
-  kv     : "K" | "V" | ["K", "V"]   (default = both)
+  layers           : int | list[int] | "lo-hi" | "all"
+  kv               : "K" | "V" | ["K", "V"]      (default = both)
+  tier             : str — one of "l1_to_l2", "l2_to_l3", "l3_archive",
+                     "evict", "promote", "demote", "backup". Or a list.
+                     Matched against ``extra_info["tier"]`` at runtime.
+  is_eviction      : bool — matches ``extra_info["is_eviction"]``.
+  radix_depth_lt   : int — match when ``extra_info["radix_depth"] < N``.
+  radix_depth_gt   : int — match when ``extra_info["radix_depth"] > N``.
+  radix_depth      : int | list[int] — exact depth match.
 
-(Tier / radix-depth keys are reserved for future versions.)
+Tier / depth / is_eviction keys are *advisory* — if the caller doesn't supply
+that signal in ``extra_info``, the rule still matches (the rule is treated as
+"don't constrain on this dimension"). This keeps backward compatibility with
+callers that haven't been upgraded.
+
+In other words: when both a caller and a YAML say something about a signal,
+they have to agree; if either is silent, the rule still applies on every
+other dimension.
 """
 
 from __future__ import annotations
@@ -296,6 +310,49 @@ class _Rule:
     kvs: Optional[List[int]]         # None = both
     K_profile: Optional[Profile]
     V_profile: Optional[Profile]
+    tiers: Optional[List[str]] = None              # None = match-any
+    is_eviction: Optional[bool] = None             # None = match-any
+    radix_depth_exact: Optional[List[int]] = None  # None = no constraint
+    radix_depth_lt: Optional[int] = None
+    radix_depth_gt: Optional[int] = None
+
+    def matches_extra(self, extra: Optional[dict]) -> bool:
+        """Return True if the runtime extra_info is compatible with this rule.
+
+        Semantics:
+        - If the rule does **not** constrain a signal, the rule passes that
+          dimension unconditionally.
+        - If the rule **does** constrain a signal, the caller **must** supply
+          that signal in ``extra_info`` and the value must match. Legacy
+          callers that pass no ``extra_info`` therefore do **not** trigger
+          tier / depth / eviction rules — those rules silently belong to
+          the upgraded code path.
+        """
+        if extra is None:
+            extra = {}
+        if self.tiers is not None:
+            tier = extra.get("tier")
+            if tier is None or tier not in self.tiers:
+                return False
+        if self.is_eviction is not None:
+            v = extra.get("is_eviction")
+            if v is None or bool(v) != self.is_eviction:
+                return False
+        if (
+            self.radix_depth_exact is not None
+            or self.radix_depth_lt is not None
+            or self.radix_depth_gt is not None
+        ):
+            depth = extra.get("radix_depth")
+            if depth is None:
+                return False
+            if self.radix_depth_exact is not None and depth not in self.radix_depth_exact:
+                return False
+            if self.radix_depth_lt is not None and not (depth < self.radix_depth_lt):
+                return False
+            if self.radix_depth_gt is not None and not (depth > self.radix_depth_gt):
+                return False
+        return True
 
     def describe(self) -> str:
         ls = "all" if self.layers is None else (
@@ -306,6 +363,16 @@ class _Rule:
         parts = [f"layers={ls}"]
         if self.kvs is not None:
             parts.append("kv=" + "/".join(KV_NAMES[k] for k in self.kvs))
+        if self.tiers is not None:
+            parts.append("tier=" + "/".join(self.tiers))
+        if self.is_eviction is not None:
+            parts.append(f"is_eviction={self.is_eviction}")
+        if self.radix_depth_exact is not None:
+            parts.append(f"depth={self.radix_depth_exact}")
+        if self.radix_depth_lt is not None:
+            parts.append(f"depth<{self.radix_depth_lt}")
+        if self.radix_depth_gt is not None:
+            parts.append(f"depth>{self.radix_depth_gt}")
         if self.K_profile is self.V_profile and self.K_profile is not None:
             parts.append(self.K_profile.describe())
         else:
@@ -389,6 +456,32 @@ class LayeredPolicy:
                 match["kv"] = raw_rule["kv"]
             layers = _parse_layer_spec(match.get("layers", "all"))
             kvs = _parse_kv_spec(match.get("kv"))
+            # Extra runtime-signal constraints. None ⇒ "don't constrain".
+            tiers_raw = match.get("tier")
+            if tiers_raw is None:
+                tiers = None
+            elif isinstance(tiers_raw, str):
+                tiers = [tiers_raw]
+            elif isinstance(tiers_raw, list):
+                tiers = [str(x) for x in tiers_raw]
+            else:
+                raise ValueError(f"unrecognized tier spec: {tiers_raw!r}")
+            is_eviction = match.get("is_eviction")
+            if is_eviction is not None:
+                is_eviction = bool(is_eviction)
+            depth_exact_raw = match.get("radix_depth")
+            if depth_exact_raw is None:
+                depth_exact = None
+            elif isinstance(depth_exact_raw, int):
+                depth_exact = [depth_exact_raw]
+            elif isinstance(depth_exact_raw, list):
+                depth_exact = [int(x) for x in depth_exact_raw]
+            else:
+                raise ValueError(f"unrecognized radix_depth spec: {depth_exact_raw!r}")
+            depth_lt = match.get("radix_depth_lt")
+            depth_gt = match.get("radix_depth_gt")
+            depth_lt = int(depth_lt) if depth_lt is not None else None
+            depth_gt = int(depth_gt) if depth_gt is not None else None
 
             # Profile assignment forms:
             #   profile: <name|dict|shorthand>   → both K and V
@@ -424,16 +517,48 @@ class LayeredPolicy:
                     else None
                 )
             )
-            rules.append(_Rule(layers=layers, kvs=kvs, K_profile=K_prof, V_profile=V_prof))
+            rules.append(_Rule(
+                layers=layers,
+                kvs=kvs,
+                K_profile=K_prof,
+                V_profile=V_prof,
+                tiers=tiers,
+                is_eviction=is_eviction,
+                radix_depth_exact=depth_exact,
+                radix_depth_lt=depth_lt,
+                radix_depth_gt=depth_gt,
+            ))
 
         return cls(default=default_profile, rules=rules, library=library)
 
     # ----- resolve -----
 
-    def resolve(self, kv_kind: int, layer_idx: int) -> Profile:
-        key = (kv_kind, layer_idx)
-        if key in self._resolved:
-            return self._resolved[key]
+    def resolve(
+        self,
+        kv_kind: int,
+        layer_idx: int,
+        extra: Optional[dict] = None,
+    ) -> Profile:
+        """Pick a profile for the given (kv_kind, layer_idx) slot.
+
+        If ``extra`` is supplied, rules that constrain on ``tier`` /
+        ``is_eviction`` / ``radix_depth`` are also considered. Without
+        ``extra`` (legacy callers) only the layer+kv portion of each rule
+        is enforced — the cache result is keyed on ``(kv_kind, layer_idx,
+        sorted_extra_items)`` so adding hints doesn't invalidate the
+        no-hint path.
+        """
+        cache_key: Any
+        if extra:
+            cache_key = (
+                kv_kind,
+                layer_idx,
+                tuple(sorted((k, v) for k, v in extra.items() if isinstance(v, (int, str, bool)))),
+            )
+        else:
+            cache_key = (kv_kind, layer_idx)
+        if cache_key in self._resolved:
+            return self._resolved[cache_key]
 
         chosen = self.default
         for rule in self.rules:
@@ -441,10 +566,12 @@ class LayeredPolicy:
                 continue
             if rule.kvs is not None and kv_kind not in rule.kvs:
                 continue
+            if not rule.matches_extra(extra):
+                continue
             profile = rule.K_profile if kv_kind == KV_K else rule.V_profile
             if profile is not None:
                 chosen = profile
-        self._resolved[key] = chosen
+        self._resolved[cache_key] = chosen
         return chosen
 
     # ----- introspection -----

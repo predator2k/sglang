@@ -60,6 +60,25 @@ rules:
     K: aggressive               # different per-direction inside one match
     V: archive
 
+  # ----- tier-aware rules -----
+  # These only kick in if the HiCacheController (or any caller) populates
+  # ``extra_info["tier"]`` / ``extra_info["is_eviction"]`` /
+  # ``extra_info["radix_depth"]`` on the set/get call. When the signal is
+  # absent the rule silently doesn't constrain on that dimension, so legacy
+  # callers still match.
+
+  # L3 (slow, cold storage) — go for the highest ratio we have.
+  - match: { tier: "l2_to_l3" }
+    profile: archive
+
+  # L1→L2 demotion is "still hot, may be re-loaded soon": speed first.
+  - match: { tier: "l1_to_l2" }
+    profile: fast
+
+  # Deep prefix leaves are rarely shared / rarely re-hit; compress harder.
+  - match: { radix_depth_gt: 5 }
+    profile: aggressive
+
 # Backend-wide settings. These don't belong to any one profile.
 runtime:
   batch_threads: 4              # cross-page parallelism (batch_get/set)
