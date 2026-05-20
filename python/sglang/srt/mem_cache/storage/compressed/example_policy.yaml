@@ -1,0 +1,35 @@
+# Example YAML policy for CompressedHiCacheFile.
+#
+# Wire it in via:
+#   --hicache-storage-backend compressed_file
+#   --hicache-storage-backend-extra-config '{"profiles_yaml": "/path/to/this/file"}'
+#
+# Rules are applied in order; later matches override earlier ones. Within a rule,
+# `K:` / `V:` sub-blocks override the rule's top-level codec/layout for that
+# direction only.
+
+default:
+  codec: zstd
+  compression_level: 1            # zstd-1 is the measured sweet spot on sem_split data
+  layout: sem_split_channel
+  batch_threads: 4
+  slab_threads: 4
+
+rules:
+  # Layer 0: K is normal, V is the famous outlier (4.5–4.7× on raw zstd).
+  - layers: [0]
+    K: { codec: zstd,  compression_level: 1, layout: sem_split_channel }
+    V: { codec: zstd,  compression_level: 9, layout: sem_split_channel }
+
+  # Middle layers: maximum throughput tier with blosc2.
+  - layers: "1-15"
+    codec: blosc2
+    blosc2_inner_codec: zstd
+    blosc2_nthreads: 0            # 0 = auto = os.cpu_count()
+    compression_level: 1
+    layout: sem_split_channel
+
+  # Late layers: low-latency, throughput-first.
+  - layers: "16-31"
+    codec: lz4
+    layout: byte_hi_lo_channel    # cheaper layout, lz4 doesn't need full sem split

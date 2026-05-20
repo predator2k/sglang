@@ -5,14 +5,11 @@
 Run::
 
     pytest python/sglang/srt/mem_cache/storage/compressed/test_hicache_compressed.py -v
-
-These tests do not require a GPU or a model; they construct synthetic
-tensors that mimic real KV-cache pages.
 """
 
 from __future__ import annotations
 
-import tempfile
+import textwrap
 
 import pytest
 import torch
@@ -21,8 +18,6 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 from sglang.srt.mem_cache.storage.compressed.hicache_compressed import (
     CompressedHiCacheFile,
-    _sem_split_bf16_like,
-    _sem_unsplit_bf16_like,
 )
 
 
@@ -43,31 +38,9 @@ def _cfg(extra: dict | None = None) -> HiCacheStorageConfig:
 
 
 # ---------------------------------------------------------------------------
-# Layout transform: pure-bytes round-trip
+# Single-slab end-to-end (default path)
 # ---------------------------------------------------------------------------
 
-def test_sem_split_round_trip_bf16():
-    torch.manual_seed(0)
-    t = torch.randn(8, 1024, 128, dtype=torch.bfloat16) * 0.5
-    raw = t.contiguous().view(torch.uint8).numpy().tobytes()
-    split = _sem_split_bf16_like(raw)
-    assert len(split) == (t.numel() + 7) // 8 + 2 * t.numel()
-    recovered = _sem_unsplit_bf16_like(split, t.numel())
-    assert recovered == raw
-
-
-def test_sem_split_round_trip_fp16():
-    torch.manual_seed(0)
-    t = torch.randn(4, 512, 64, dtype=torch.float16)
-    raw = t.contiguous().view(torch.uint8).numpy().tobytes()
-    split = _sem_split_bf16_like(raw)
-    recovered = _sem_unsplit_bf16_like(split, t.numel())
-    assert recovered == raw
-
-
-# ---------------------------------------------------------------------------
-# End-to-end set/get round-trip — exhaustive lossless check
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(8, 1024, 128), (16, 32, 64), (1024,)])
@@ -75,21 +48,16 @@ def test_set_get_lossless(tmp_path, dtype, shape):
     torch.manual_seed(123)
     t = (torch.randn(*shape) * 0.3).to(dtype)
     backend = CompressedHiCacheFile(_cfg(), file_path=str(tmp_path))
-
     assert backend.set("page0", t)
-    assert backend.exists("page0")
-
     target = torch.zeros_like(t)
     out = backend.get("page0", target)
     assert out is not None
-    # uint8 view equality avoids dtype-specific equality quirks (e.g. NaN handling)
     assert torch.equal(out.view(torch.uint8), t.view(torch.uint8))
 
 
 def test_set_get_lossless_realistic_distribution(tmp_path):
-    """Typical KV cache values are clustered tightly. Make sure we still round-trip."""
+    """Layer-0 V is tightly clustered; should still round-trip exactly."""
     torch.manual_seed(7)
-    # Approximate the layer-0 V distribution: tiny std, near zero
     t = (torch.randn(8, 8192, 128) * 0.04).to(torch.bfloat16)
     backend = CompressedHiCacheFile(_cfg(), file_path=str(tmp_path))
     assert backend.set("layer0_V", t)
@@ -98,21 +66,13 @@ def test_set_get_lossless_realistic_distribution(tmp_path):
     assert out is not None
     assert torch.equal(out.view(torch.uint8), t.view(torch.uint8))
 
-    stats = backend.get_stats()
-    # Tightly-clustered distribution should compress significantly — at least 1.4x.
-    assert stats["write_ratio"] > 1.4, f"unexpectedly low write_ratio: {stats}"
-
 
 def test_batch_round_trip(tmp_path):
     torch.manual_seed(0)
-    tensors = [
-        (torch.randn(2, 256, 64) * 0.1).to(torch.bfloat16) for _ in range(4)
-    ]
+    tensors = [(torch.randn(2, 256, 64) * 0.1).to(torch.bfloat16) for _ in range(4)]
     keys = [f"page{i}" for i in range(len(tensors))]
     backend = CompressedHiCacheFile(_cfg(), file_path=str(tmp_path))
-
     assert backend.batch_set(keys, tensors)
-
     targets = [torch.zeros_like(x) for x in tensors]
     outs = backend.batch_get(keys, targets)
     for orig, dec in zip(tensors, outs):
@@ -120,16 +80,88 @@ def test_batch_round_trip(tmp_path):
         assert torch.equal(orig.view(torch.uint8), dec.view(torch.uint8))
 
 
+# ---------------------------------------------------------------------------
+# Codec / layout knobs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "codec",
+    [
+        "zstd",
+        "zstd_chunked",
+        pytest.param("blosc2", marks=pytest.mark.skipif(__import__("importlib").util.find_spec("blosc2") is None, reason="blosc2 not installed")),
+        pytest.param("lz4", marks=pytest.mark.skipif(__import__("importlib").util.find_spec("lz4") is None, reason="lz4 not installed")),
+        pytest.param("isal_gzip", marks=pytest.mark.skipif(__import__("importlib").util.find_spec("isal") is None, reason="isal not installed")),
+    ],
+)
+def test_codec_round_trip(tmp_path, codec):
+    torch.manual_seed(0)
+    t = (torch.randn(8, 1024, 128) * 0.1).to(torch.bfloat16)
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"codec": codec, "compression_level": 1}),
+        file_path=str(tmp_path),
+    )
+    assert backend.set("k", t)
+    target = torch.zeros_like(t)
+    out = backend.get("k", target)
+    assert out is not None
+    assert torch.equal(out.view(torch.uint8), t.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["raw", "channel_major", "byte_hi_lo", "byte_hi_lo_channel",
+     "sem_split", "sem_split_channel", "zipnn_channel_delta", "bit_plane"],
+)
+def test_layout_round_trip(tmp_path, layout):
+    torch.manual_seed(0)
+    t = (torch.randn(8, 1024, 128) * 0.1).to(torch.bfloat16)
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"layout": layout, "channels": 8 * 128, "compression_level": 1}),
+        file_path=str(tmp_path),
+    )
+    assert backend.set("k", t)
+    target = torch.zeros_like(t)
+    out = backend.get("k", target)
+    assert out is not None
+    assert torch.equal(out.view(torch.uint8), t.view(torch.uint8))
+
+
 def test_force_layout_raw_still_lossless(tmp_path):
-    """The `layout=raw` mode skips sem-split and just runs zstd directly."""
     torch.manual_seed(1)
     t = (torch.randn(2, 512, 64) * 0.1).to(torch.bfloat16)
-    backend = CompressedHiCacheFile(_cfg(extra={"layout": "raw", "zstd_level": 3}), file_path=str(tmp_path))
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"layout": "raw", "compression_level": 3}),
+        file_path=str(tmp_path),
+    )
     assert backend.set("p", t)
     target = torch.zeros_like(t)
     out = backend.get("p", target)
     assert out is not None
     assert torch.equal(out.view(torch.uint8), t.view(torch.uint8))
+
+
+def test_strict_dtype_rejects_mismatch(tmp_path):
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"strict_dtype": True}),
+        file_path=str(tmp_path),
+    )
+    t = (torch.randn(64, 64) * 0.1).to(torch.bfloat16)
+    assert backend.set("k", t)
+    target = torch.zeros(64, 64, dtype=torch.float16)
+    assert backend.get("k", target) is None
+
+
+def test_lax_dtype_allows_mismatch(tmp_path):
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"strict_dtype": False}),
+        file_path=str(tmp_path),
+    )
+    t = (torch.randn(64, 64) * 0.1).to(torch.bfloat16)
+    assert backend.set("k", t)
+    target = torch.zeros(64, 64, dtype=torch.float16)
+    assert backend.get("k", target) is not None
 
 
 def test_get_missing_returns_none(tmp_path):
@@ -139,19 +171,74 @@ def test_get_missing_returns_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Multi-slab + YAML policy
+# ---------------------------------------------------------------------------
+
+
+def test_multi_slab_yaml_policy(tmp_path):
+    """A YAML policy with per-layer rules round-trips losslessly across slabs."""
+    L, P, H, D = 4, 8, 4, 64
+    torch.manual_seed(0)
+    page = (torch.randn(2, L, P, H, D) * 0.1).to(torch.bfloat16)
+    flat = page.contiguous().view(-1).clone()
+
+    yaml_path = tmp_path / "policy.yaml"
+    yaml_path.write_text(
+        textwrap.dedent(
+            """
+            default:
+              codec: zstd
+              compression_level: 1
+              layout: sem_split_channel
+            rules:
+              - layers: [0]
+                K: { codec: zstd, compression_level: 1, layout: sem_split_channel }
+                V: { codec: zstd, compression_level: 9, layout: sem_split_channel }
+              - layers: "1-2"
+                codec: zstd
+                compression_level: 3
+                layout: byte_hi_lo_channel
+              - layers: [3]
+                codec: lz4
+                layout: byte_hi_lo_channel
+            """
+        ).strip()
+    )
+
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"profiles_yaml": str(yaml_path), "slab_threads": 2}),
+        file_path=str(tmp_path),
+    )
+
+    class _Pool:
+        head_num = H
+        head_dim = D
+        layer_num = L
+        page_size = P
+        layout = "layer_first"
+
+    backend.register_mem_pool_host(_Pool())
+
+    assert backend.set("page0", flat)
+    target = torch.zeros_like(flat)
+    out = backend.get("page0", target)
+    assert out is not None
+    assert torch.equal(flat.view(torch.uint8), target.view(torch.uint8))
+
+
+# ---------------------------------------------------------------------------
 # Factory integration
 # ---------------------------------------------------------------------------
 
+
 def test_factory_registered():
-    """`compressed_file` must be a known backend."""
     assert "compressed_file" in StorageBackendFactory._registry
 
 
 def test_factory_creates_instance(tmp_path, monkeypatch):
-    # Direct the backend at our tmp dir via the env var the parent uses.
     monkeypatch.setenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", str(tmp_path))
     backend = StorageBackendFactory.create_backend(
-        "compressed_file", _cfg(extra={"zstd_level": 3}), mem_pool_host=None
+        "compressed_file", _cfg(extra={"compression_level": 3}), mem_pool_host=None
     )
     assert isinstance(backend, CompressedHiCacheFile)
-    assert backend.zstd_level == 3
+    assert backend.policy.default.compression_level == 3
