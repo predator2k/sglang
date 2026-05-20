@@ -242,3 +242,123 @@ def test_factory_creates_instance(tmp_path, monkeypatch):
     )
     assert isinstance(backend, CompressedHiCacheFile)
     assert backend.policy.default.compression_level == 3
+
+
+# ---------------------------------------------------------------------------
+# Tier-aware routing (HiCacheStorageController integration)
+# ---------------------------------------------------------------------------
+
+
+def _build_multi_slab_backend(tmp_path, profiles: dict, L=4, P=8, H=4, D=64):
+    """Helper: build a backend bound to a fake host pool with known geometry."""
+    backend = CompressedHiCacheFile(
+        _cfg(extra={"profiles": profiles, "slab_threads": 2}),
+        file_path=str(tmp_path),
+    )
+
+    class _Pool:
+        head_num = H
+        head_dim = D
+        layer_num = L
+        page_size = P
+        layout = "layer_first"
+
+    backend.register_mem_pool_host(_Pool())
+    return backend, (L, P, H, D)
+
+
+def test_tier_routing_changes_size(tmp_path):
+    """Same page, three tier hints → three different on-disk sizes; all lossless."""
+    profiles = {
+        "profiles": {
+            "balanced": {"codec": "zstd", "compression_level": 1, "layout": "sem_split_channel"},
+            "fast":     {"codec": "lz4",  "layout": "byte_hi_lo_channel"},
+            "archive":  {"codec": "zstd", "compression_level": 19, "layout": "bit_plane"},
+        },
+        "default": "balanced",
+        "rules": [
+            {"match": {"tier": "l2_to_l3"}, "profile": "archive"},
+            {"match": {"tier": "l1_to_l2"}, "profile": "fast"},
+        ],
+    }
+
+    backend, (L, P, H, D) = _build_multi_slab_backend(tmp_path, profiles)
+    torch.manual_seed(0)
+    page = (torch.randn(2, L, P, H, D) * 0.1).to(torch.bfloat16)
+    flat = page.contiguous().view(-1).clone()
+
+    import os
+
+    def _trip(name: str, extra: dict | None):
+        assert backend.set(name, flat, extra_info=extra)
+        size = os.path.getsize(
+            os.path.join(str(tmp_path), name + backend.config_suffix + ".bin")
+        )
+        target = torch.zeros_like(flat)
+        out = backend.get(name, target, extra_info=extra)
+        assert out is not None
+        assert torch.equal(flat.view(torch.uint8), target.view(torch.uint8))
+        return size
+
+    cb_legacy = _trip("legacy", None)
+    cb_l2_l3 = _trip("evict_to_l3", {"tier": "l2_to_l3"})
+    cb_l1_l2 = _trip("demote",      {"tier": "l1_to_l2"})
+
+    # archive (l2_to_l3) should compress harder than balanced (legacy)
+    assert cb_l2_l3 < cb_legacy, f"l2_to_l3 not smaller than legacy: {cb_l2_l3} vs {cb_legacy}"
+    # fast/lz4 (l1_to_l2) gives lower ratio than balanced/zstd
+    assert cb_l1_l2 > cb_legacy, f"l1_to_l2 not larger than legacy: {cb_l1_l2} vs {cb_legacy}"
+
+
+def test_tier_routing_via_extra_info_obj(tmp_path):
+    """Accept HiCacheStorageExtraInfo instances (controller-style call)."""
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+
+    profiles = {
+        "profiles": {
+            "balanced": {"codec": "zstd", "compression_level": 1, "layout": "sem_split_channel"},
+            "archive":  {"codec": "zstd", "compression_level": 19, "layout": "bit_plane"},
+        },
+        "default": "balanced",
+        "rules": [{"match": {"tier": "l2_to_l3"}, "profile": "archive"}],
+    }
+    backend, (L, P, H, D) = _build_multi_slab_backend(tmp_path, profiles)
+    torch.manual_seed(0)
+    page = (torch.randn(2, L, P, H, D) * 0.1).to(torch.bfloat16)
+    flat = page.contiguous().view(-1).clone()
+
+    ei = HiCacheStorageExtraInfo(extra_info={"tier": "l2_to_l3", "radix_depth": 4})
+    assert backend.set("k", flat, extra_info=ei)
+    out = torch.zeros_like(flat)
+    assert backend.get("k", out, extra_info=ei) is not None
+    assert torch.equal(flat.view(torch.uint8), out.view(torch.uint8))
+
+
+def test_radix_depth_rule(tmp_path):
+    """radix_depth_gt rule should fire only when controller supplies depth."""
+    profiles = {
+        "profiles": {
+            "balanced": {"codec": "zstd", "compression_level": 1, "layout": "sem_split_channel"},
+            "deep":     {"codec": "zstd", "compression_level": 19, "layout": "bit_plane"},
+        },
+        "default": "balanced",
+        "rules": [{"match": {"radix_depth_gt": 5}, "profile": "deep"}],
+    }
+    backend, (L, P, H, D) = _build_multi_slab_backend(tmp_path, profiles)
+    torch.manual_seed(0)
+    page = (torch.randn(2, L, P, H, D) * 0.1).to(torch.bfloat16)
+    flat = page.contiguous().view(-1).clone()
+
+    import os
+
+    def _trip(name, extra):
+        backend.set(name, flat, extra_info=extra)
+        return os.path.getsize(
+            os.path.join(str(tmp_path), name + backend.config_suffix + ".bin")
+        )
+
+    cb_shallow = _trip("shallow", {"radix_depth": 2})   # balanced
+    cb_deep    = _trip("deep_node", {"radix_depth": 10})  # deep
+    cb_none    = _trip("no_depth", None)                # balanced (rule doesn't fire)
+    assert cb_deep < cb_shallow, "deep-rule should compress harder"
+    assert cb_none == cb_shallow, "no extra_info ⇒ same as shallow (balanced)"
