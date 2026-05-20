@@ -160,6 +160,8 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name == "file":
             return backend_class(storage_config)
+        elif backend_name == "compressed_file":
+            return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
@@ -228,4 +230,10 @@ StorageBackendFactory.register_backend(
     "simm",
     "sglang.srt.mem_cache.storage.simm.hicache_simm",
     "HiCacheSiMM",
+)
+
+StorageBackendFactory.register_backend(
+    "compressed_file",
+    "sglang.srt.mem_cache.storage.compressed.hicache_compressed",
+    "CompressedHiCacheFile",
 )
