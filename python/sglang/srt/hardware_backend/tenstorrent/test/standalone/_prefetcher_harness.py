@@ -129,20 +129,23 @@ def build_paged_kv_cache(model, model_args):
     reused across multiple model constructions. We delete these files before
     each allocation so every call starts from a truly-zero KV state.
     """
-    # Shape: [num_kv_blocks, n_kv_heads, block_size, head_dim]
-    # n_kv_heads here is the per-device count (TP-sharded); allocate_sglang_kv_cache
-    # replicates across both devices, attention ops shard it at runtime.
-    n_kv_heads = model_args.n_kv_heads  # total, e.g. 8 for Qwen3-8B
+    # Shape: [num_kv_blocks, n_local_kv_heads, block_size, head_dim]
+    # WS-A.10 fix: use the PER-DEVICE count, not the cluster total.
+    # ``allocate_sglang_kv_cache`` calls ``ttnn.as_tensor`` with
+    # ``ReplicateTensorToMesh``, so the per-device cache shape must already be
+    # the local slice. Previously we passed ``model_args.n_kv_heads`` (total),
+    # which gave the device extra empty cache slots beyond its local KV heads.
+    # ``paged_update_cache`` only writes into ``[0 : n_local_kv_heads)`` slots,
+    # so the trailing slots stayed zero — and SDPA's GQA grouping then read
+    # those zero slots for the late q-heads, dropping per-device q-heads 2-3
+    # to all-zero (the "WS-A.9 head-2/3 zeros" symptom). By using the
+    # per-device count, the cache has exactly the slots SDPA needs, all
+    # populated by the matching device. ``init_kv_cache`` in
+    # ``models/tt_transformers/tt/attention.py`` already uses
+    # ``self.n_local_kv_heads`` for the same reason.
+    n_local_kv_heads = model_args.n_kv_heads // model_args.num_devices
     head_dim = model_args.head_dim
-    # WS-A.8 Bug 2 companion: when KV-head replication is enabled in
-    # tt-metal-sglang/models/tt_transformers/tt/attention.py via
-    # SGLANG_TT_QWEN35_KV_REPLICATE=1, K and V are doubled along the
-    # kv-head axis BEFORE the paged cache write. The cache must therefore
-    # be allocated with 2x n_kv_heads so paged_update_cache has slots for
-    # the replicated heads. Default-off; no change for other models.
-    if os.environ.get("SGLANG_TT_QWEN35_KV_REPLICATE", "") == "1":
-        n_kv_heads = n_kv_heads * 2
-    kv_cache_shape = (NUM_KV_BLOCKS, n_kv_heads, BLOCK_SIZE, head_dim)
+    kv_cache_shape = (NUM_KV_BLOCKS, n_local_kv_heads, BLOCK_SIZE, head_dim)
 
     # Wipe any on-disk KV-cache .tensorbin files so the next allocation starts
     # from torch.zeros instead of whatever the previous run wrote.

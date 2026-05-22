@@ -141,7 +141,22 @@ def _install_qwen35_loader_shims():
         if "lm_head.weight" not in sd and "model.embed_tokens.weight" in sd:
             sd["lm_head.weight"] = sd["model.embed_tokens.weight"].clone()
         sd = standardize_hf_keys(sd)
-        sd = convert_hf_to_meta_no_qkv_permute(sd, self.head_dim, self.n_heads, self.n_kv_heads)
+        # WS-A.10: load-time KV-head replicate. Pass the ORIGINAL HF n_kv_heads
+        # (recorded as ``self._n_kv_heads_orig`` when the factor was applied in
+        # ``_set_model_specific_params``) so the splitter still understands the
+        # un-replicated layout, plus ``kv_head_replicate_factor`` so the helper
+        # clones K/V rows to match the (already-multiplied) ``self.n_kv_heads``.
+        # For factor=1 (every non-Qwen3.5 model) both sides equal and the helper
+        # is byte-equivalent to the pre-WS-A.10 behavior.
+        _orig_kv = int(getattr(self, "_n_kv_heads_orig", self.n_kv_heads))
+        _kv_replicate = int(getattr(self, "kv_head_replicate_factor", 1))
+        sd = convert_hf_to_meta_no_qkv_permute(
+            sd,
+            self.head_dim,
+            self.n_heads,
+            _orig_kv,
+            kv_head_replicate_factor=_kv_replicate,
+        )
         return sd
 
     _mc.ModelArgs.load_state_dict = _direct_safetensors_loader  # type: ignore[assignment]
