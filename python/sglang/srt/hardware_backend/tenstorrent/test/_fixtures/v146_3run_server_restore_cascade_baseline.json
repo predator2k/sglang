@@ -1,0 +1,30 @@
+{
+  "version": "v146",
+  "backend": "tt_transformers_paged",
+  "input_len": 1024,
+  "output_len": 256,
+  "context_len": 2048,
+  "hw": "2x P150a (post-B.2 canonical wheel)",
+  "max_batch_size": 1,
+  "tag": "restore_cascade_baseline",
+  "logdir": "/sglang/python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/bench_3run_restore_cascade_baseline",
+  "results": [
+    {
+      "model": "Qwen3-8B",
+      "model_id": "Qwen/Qwen3-8B",
+      "status": "FAIL_RUN",
+      "t_ready_s": 38.06504247599514,
+      "input_len": 1024,
+      "output_len": 256,
+      "run1_cold": {
+        "ttft_ms": 121.61967600695789,
+        "tpot_ms_mean": null,
+        "tpot_ms_min": null,
+        "tpot_ms_max": null,
+        "n_chunks": 1,
+        "wall_s": 0.4354778599808924,
+        "error": "ChunkedEncodingError: Response ended prematurely"
+      }
+    }
+  ]
+}

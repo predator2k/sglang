@@ -1,5 +1,7 @@
 # tt_transformers DRAM-prefetcher Option A results (2026-05-21)
 
+> **SUPERSEDED-BY:** [`tt_prefetcher_v6_results_2026-05-22.md`](tt_prefetcher_v6_results_2026-05-22.md) — new TPOT 27.50 ms via v6 dynamic_worker_core_grid rect fix (+3.92 ms over the 31.35 ms in this doc).
+
 This document records the final outcome of the Option A prefetcher plan begun from the 2026-05-19 handoff. It follows the same structure as the original handoff and supersedes it with measured results.
 
 ## TL;DR
