@@ -114,8 +114,15 @@ def _install_qwen35_loader_shims():
             sd.update(st.load_file(p))
         # Strip the "model." prefix tt_transformers expects to be already gone
         # (standardize_hf_keys does this for normal HF models).
+        # WS-A.8 Bug 1 fix: Qwen3.5 uses use_hf_rope=True. The canonical
+        # loader path at model_config.py:3258-3260 selects
+        # convert_hf_to_meta_no_qkv_permute for use_hf_rope=True models, so
+        # the QKV rows are NOT permuted into Meta-rope format. Using
+        # convert_hf_to_meta (Meta-rope reverse_permute) here scrambles q_proj
+        # and k_proj rows, dropping q_after_split PCC to 0.0007. The
+        # no-permute path raises it to 0.9715.
         from models.tt_transformers.tt.load_checkpoints import (
-            convert_hf_to_meta,
+            convert_hf_to_meta_no_qkv_permute,
             standardize_hf_keys,
         )
         # Qwen3.5 nests text params under "model.language_model.*" (multimodal
@@ -134,7 +141,7 @@ def _install_qwen35_loader_shims():
         if "lm_head.weight" not in sd and "model.embed_tokens.weight" in sd:
             sd["lm_head.weight"] = sd["model.embed_tokens.weight"].clone()
         sd = standardize_hf_keys(sd)
-        sd = convert_hf_to_meta(sd, self.head_dim, self.n_heads, self.n_kv_heads)
+        sd = convert_hf_to_meta_no_qkv_permute(sd, self.head_dim, self.n_heads, self.n_kv_heads)
         return sd
 
     _mc.ModelArgs.load_state_dict = _direct_safetensors_loader  # type: ignore[assignment]

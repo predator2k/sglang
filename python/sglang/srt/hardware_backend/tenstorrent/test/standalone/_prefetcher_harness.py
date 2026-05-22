@@ -10,6 +10,7 @@ sync if the upstream test changes.
 Phase A.4 of the Option A prefetcher plan.
 """
 
+import glob
 import math
 import os
 
@@ -120,20 +121,42 @@ def build_paged_kv_cache(model, model_args):
     Returns (kv_cache, page_table_host) where:
       kv_cache — list of [k_ttnn, v_ttnn] per layer, on mesh_device.
       page_table_host — torch.Tensor [MAX_BATCH, num_blocks_per_user] with block IDs.
+
+    NOTE: allocate_sglang_kv_cache caches the KV buffers to disk
+    (``empty_{k,v}cache_paged_attention{shape}*.tensorbin``). If those files
+    exist from a prior run the tensors are initialised from them rather than
+    from torch.zeros, causing non-deterministic outputs when the same device is
+    reused across multiple model constructions. We delete these files before
+    each allocation so every call starts from a truly-zero KV state.
     """
     # Shape: [num_kv_blocks, n_kv_heads, block_size, head_dim]
     # n_kv_heads here is the per-device count (TP-sharded); allocate_sglang_kv_cache
     # replicates across both devices, attention ops shard it at runtime.
     n_kv_heads = model_args.n_kv_heads  # total, e.g. 8 for Qwen3-8B
     head_dim = model_args.head_dim
+    # WS-A.8 Bug 2 companion: when KV-head replication is enabled in
+    # tt-metal-sglang/models/tt_transformers/tt/attention.py via
+    # SGLANG_TT_QWEN35_KV_REPLICATE=1, K and V are doubled along the
+    # kv-head axis BEFORE the paged cache write. The cache must therefore
+    # be allocated with 2x n_kv_heads so paged_update_cache has slots for
+    # the replicated heads. Default-off; no change for other models.
+    if os.environ.get("SGLANG_TT_QWEN35_KV_REPLICATE", "") == "1":
+        n_kv_heads = n_kv_heads * 2
     kv_cache_shape = (NUM_KV_BLOCKS, n_kv_heads, BLOCK_SIZE, head_dim)
+
+    # Wipe any on-disk KV-cache .tensorbin files so the next allocation starts
+    # from torch.zeros instead of whatever the previous run wrote.
+    _tt_cache_path = model_args.weight_cache_path(ttnn.bfloat8_b)
+    for _pat in ("empty_kcache_paged_attention*", "empty_vcache_paged_attention*"):
+        for _f in glob.glob(str(_tt_cache_path / _pat)):
+            os.remove(_f)
 
     kv_cache = allocate_sglang_kv_cache(
         kv_cache_shape=kv_cache_shape,
         dtype=torch.bfloat16,
         num_layers=model_args.n_layers,
         dp_model=[model],
-        tt_cache_path=model_args.weight_cache_path(ttnn.bfloat8_b),
+        tt_cache_path=_tt_cache_path,
     )
     # allocate_sglang_kv_cache returns kv_cache[dp_idx][layer] = [k_ttnn, v_ttnn]
     # We have dp=1, so kv_cache[0] is the per-layer list.
@@ -169,7 +192,7 @@ def decode_one_step(
       (a) Build host token + current_pos tensors (padded to max_batch_size).
       (b) model.prepare_inputs_decode handles tilize/shard onto the mesh.
       (c) model.ttnn_decode_forward runs embedding + transformer forward + all-gather.
-      (d) ttnn.to_torch + reshape yields [batch, 1, vocab_size] CPU logits.
+      (d) Process the untilized all-gathered logits to return [batch, 1, vocab_size].
 
     initialize_sglang_text_transformer always sets use_paged_kv_cache=True, so
     layer.attention.layer_past is never populated. The caller MUST supply a
@@ -180,6 +203,10 @@ def decode_one_step(
     Reused by capture_pcc_baseline.py (prefetcher=False) and
     test_prefetcher_pcc.py (both paths). Works for both use_prefetcher=True/False
     because all dispatch happens inside ttnn_decode_forward.
+
+    Note: model.py's ttnn_decode_forward was patched to move tt_logits to DRAM
+    before all_gather_async, fixing a Blackhole P150a issue where L1 INTERLEAVED
+    input to all_gather_async returns a zero buffer.
     """
     # Ensure the model is in decode mode (initializes prefetcher sub-devices
     # when use_prefetcher=True; no-op when prefetcher is None).
@@ -211,17 +238,16 @@ def decode_one_step(
     )
 
     # (d) Bring logits back to CPU host.
-    #     ConcatMesh2dToTensor on dims=(1, -1) is the non-galaxy 2-device
-    #     reduction used in test_model.py's decode loop.
-    mesh_composer = ttnn.ConcatMesh2dToTensor(
-        model.mesh_device,
-        dims=(1, -1),
-        mesh_shape=model_args.cluster_shape,
-    )
-    logits_torch = (
-        ttnn.to_torch(tt_logits, mesh_composer=mesh_composer)
-        .permute(2, 1, 0, 3)
-        .squeeze(2)[: model_args.max_batch_size, 0:1, : model_args.vocab_size]
-    )
+    #     tt_logits is the untilized output of all_gather_async.
+    #     After all_gather every device has the full vocab; we take device 0.
+    #     Shape per device: [1, 1, 32, vocab_size] (row-major after untilize).
+    #     User 0 (the only active user in batch=1) appears at the row with
+    #     the highest L2 norm among the 32 tile-padded batch rows.
+    dev0 = ttnn.get_device_tensors(tt_logits)[0]
+    logits_host = ttnn.to_torch(dev0).float()          # [1, 1, 32, vocab_size]
+    logits_4d = logits_host[:, :, :, : model_args.vocab_size]  # clip vocab
+    row_norms = logits_4d[0, 0].norm(dim=-1)                    # [32]
+    best_row = int(row_norms.argmax())
+    logits_out = logits_4d[:, :, best_row : best_row + 1, :].squeeze(2)  # [1, 1, V]
     ttnn.deallocate(tt_logits)
-    return logits_torch.cpu()
+    return logits_out.cpu()
