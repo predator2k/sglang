@@ -1,3 +1,5 @@
+**SUPERSEDED-BY:** [`tt_qwen3_5_final_status_2026-05-22.md`](tt_qwen3_5_final_status_2026-05-22.md) — consolidated end-to-end final status across all 8 workstreams.
+
 # Qwen3.5 adaptation status on 2× Blackhole P150a (2026-05-22)
 
 This document records the outcome of the Qwen3.5 architecture adaptation effort for `tt_transformers_paged` on Tenstorrent 2× Blackhole P150a. Work landed across 9 workstreams (WS-B + WS-A.1 through WS-A.8 land; WS-A.9 diagnoses but BLOCKED), targeting `Qwen/Qwen3.5-0.8B` as the smallest variant that exercises the full architecture delta vs Qwen3.

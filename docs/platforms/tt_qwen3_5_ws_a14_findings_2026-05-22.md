@@ -1,3 +1,5 @@
+**SUPERSEDED-BY:** [`tt_qwen3_5_final_status_2026-05-22.md`](tt_qwen3_5_final_status_2026-05-22.md) — consolidated end-to-end final status across all 8 workstreams.
+
 # Qwen3.5 WS-A.14 — SDPA + post-SDPA precision floor confirmed (2026-05-22)
 
 This document records the WS-A.14 probe sweep, the per-op attribution at

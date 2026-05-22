@@ -1,3 +1,5 @@
+**SUPERSEDED-BY:** [`tt_qwen3_5_final_status_2026-05-22.md`](tt_qwen3_5_final_status_2026-05-22.md) — consolidated end-to-end final status across all 8 workstreams.
+
 # WS-A.9 — Per-op divergence with KV-replicate, 2026-05-22
 
 Companion to `tt_qwen3_5_adaptation_status_2026-05-22.md`. WS-A.9 was charged

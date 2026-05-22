@@ -1,3 +1,5 @@
+**SUPERSEDED-BY:** [`tt_qwen3_5_final_status_2026-05-22.md`](tt_qwen3_5_final_status_2026-05-22.md) — consolidated end-to-end final status across all 8 workstreams.
+
 # WS-A.11: Qwen3.5-0.8B step-0 cache verify + layer-compounding analysis
 
 Date: 2026-05-22
