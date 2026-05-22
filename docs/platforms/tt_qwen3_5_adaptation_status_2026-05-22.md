@@ -1,16 +1,18 @@
 # Qwen3.5 adaptation status on 2× Blackhole P150a (2026-05-22)
 
-This document records the outcome of the Qwen3.5 architecture adaptation effort for `tt_transformers_paged` on Tenstorrent 2× Blackhole P150a. Work landed across 8 workstreams (WS-B + WS-A.1 through WS-A.8), targeting `Qwen/Qwen3.5-0.8B` as the smallest variant that exercises the full architecture delta vs Qwen3.
+This document records the outcome of the Qwen3.5 architecture adaptation effort for `tt_transformers_paged` on Tenstorrent 2× Blackhole P150a. Work landed across 9 workstreams (WS-B + WS-A.1 through WS-A.8 land; WS-A.9 diagnoses but BLOCKED), targeting `Qwen/Qwen3.5-0.8B` as the smallest variant that exercises the full architecture delta vs Qwen3.
+
+See `tt_qwen3_5_ws_a9_results_2026-05-22.md` for the WS-A.9 layer-3 diagnosis.
 
 ---
 
 ## TL;DR
 
 - **Qwen3.5-0.8B loads and decodes end-to-end.** 24-layer forward pass produces structurally valid logits `[1, 1, 248320]`; no inf/NaN; max ~12.5; top-1 returns a valid vocab id.
-- **Linear-only (3-layer) sub-stack: PCC 0.9028, top-1 MATCH vs HF reference.** Full-stack PCC remains ~0.07 (step 0, with KV-replicate workaround active).
+- **Linear-only (3-layer) sub-stack: PCC 0.9028, top-1 MATCH vs HF reference.** Full-stack PCC = 0.1018 at step 0 **without** WS-A.8 KV-replicate. WS-A.9 confirms WS-A.8 KV-replicate hangs in the current environment (cannot reproduce the prior 0.07 claim).
 - **Host-fallback GatedDeltaNet is bit-exact vs HF reference** (PCC 1.0000 in unit test). Performance is not representative — ~50–200 ms per layer per step makes the full 24-layer TPOT unmeasurable until a TT-native GatedDeltaNet kernel is written.
-- **No regression to existing models.** Qwen3-8B canonical TPOT preserved at 27.50 ms.
-- **Remaining accuracy gap:** compounded error through 24 layers (18 host-fallback DeltaNet + 6 full_attention with KV-replicated SDPA). Two bugs were found with the per-op divergence probe (WS-A.7): Bug 1 (loader mismatch) is FIXED; Bug 2 (SDPA garbage on specific head config) is WORKED AROUND. Root cause of the residual ~0.07 PCC is most likely KV-replicate math equivalence or attn_output_gate per-head ordering.
+- **No regression to existing models.** Qwen3-8B `test_prefetcher_smoke` passes; canonical TPOT preserved at 27.50 ms.
+- **Root cause identified by WS-A.9:** SDPA decode kernel writes only 2 of 4 per-device q-heads (duplicates first into second, zeros heads 2-3) for the `(n_q_heads=4, n_kv_heads=1, head_dim=256)` Qwen3.5-0.8B config. This is a **tt-metal SDPA kernel bug**; not fixable at the tt_transformers / sglang layer. WS-A.10 picks up with load-time KV-replicate (workaround) or kernel fix (root cause) as the next attack vectors.
 
 ---
 
