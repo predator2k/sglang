@@ -25,6 +25,22 @@ def _build_tt_model_registry():
         "LlamaForCausalLM": TenstorrentLlamaForCausalLM,
         "Qwen2ForCausalLM": TenstorrentQwenForCausalLM,
         "Qwen3ForCausalLM": TenstorrentQwenForCausalLM,
+        # WS-B (qwen3_5): placeholder registration — reuse the Qwen3 dense bridge
+        # so SGLang's loader and tt_transformers' Qwen generator are at least reachable.
+        # The actual decode path will hit Gated-DeltaNet / MRoPE / partial-rotary /
+        # attn_output_gate gaps that WS-A is expected to close. We register both
+        # the standalone causal LM arch and the ConditionalGeneration arch that HF
+        # auto-selects for the multimodal Qwen3.5 release. Vision is intentionally
+        # routed to the same text-only bridge; multimodal is out of scope for first port.
+        "Qwen3_5ForCausalLM": TenstorrentQwenForCausalLM,
+        "Qwen3_5ForConditionalGeneration": TenstorrentQwenForCausalLM,
+        # TODO(WS-A): MoE (256 experts top-8) and MTP variants are out of scope for
+        # first port — registered here as the same placeholder so that an explicit
+        # arch mismatch isn't the first failure. They will fail later inside the
+        # bridge until the dedicated kernels land.
+        "Qwen3_5MoeForCausalLM": TenstorrentQwenForCausalLM,
+        "Qwen3_5MoeForConditionalGeneration": TenstorrentQwenForCausalLM,
+        "Qwen3_5ForCausalLMMTP": TenstorrentQwenForCausalLM,
         "MistralForCausalLM": TenstorrentMistralForCausalLM,
         "GptOssForCausalLM": TenstorrentGptOssForCausalLM,
     }
