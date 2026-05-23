@@ -511,14 +511,83 @@ class TTModels(nn.Module):
             if _timing:
                 _t2 = _time.perf_counter()
 
-            decode_output = self.tt_model.decode_forward(
-                tokens=tokens,
-                start_pos=start_pos,
-                page_table=page_table,
-                kv_cache=self.kv_caches,
-                enable_trace=True,
-                read_from_device=True,
-            )
+            # WS-A.19: device-0-only fast readback. After all_gather inside the
+            # decode trace, every device in the mesh holds the FULL [1,1,32,vocab]
+            # logits tensor.  The canonical ``decode_forward(read_from_device=True)``
+            # path calls ``read_decode_output`` which issues ``tt_out.cpu()`` on the
+            # mesh handle — that pulls EVERY device's shard to host, doubling the
+            # PCIe traffic for a TP=N mesh (~17.6 ms host-copy on 2× P150a for
+            # Qwen3.5-0.8B's 152K vocab × 32-row tile × bf16).
+            #
+            # The fast path here mirrors the standalone trace harness
+            # (``_qwen35_trace_harness.decode_one_step``): dispatch + read only
+            # device 0's view.  Logits are mathematically identical because the
+            # all_gather inside the trace replicates the full vocab to every
+            # device, so device 0 already carries the complete answer.
+            #
+            # Default ON (SGLANG_TT_WSA19_FAST_READ=1).  Set to "0" to revert
+            # to the canonical full-mesh readback (regression-bisect aid).
+            _fast_read = os.environ.get("SGLANG_TT_WSA19_FAST_READ", "1") == "1"
+            _wsa19_timing = os.environ.get("SGLANG_TT_WSA19_TIMING", "0") == "1"
+
+            if _fast_read:
+                import ttnn as _ttnn_wsa19
+                _t_disp0 = _time.perf_counter() if _wsa19_timing else 0.0
+                tt_out = self.tt_model.decode_forward(
+                    tokens=tokens,
+                    start_pos=start_pos,
+                    page_table=page_table,
+                    kv_cache=self.kv_caches,
+                    enable_trace=True,
+                    read_from_device=False,
+                )
+                _t_disp1 = _time.perf_counter() if _wsa19_timing else 0.0
+                # tt_out is a list of (tt_logits, tt_log_probs) per data_parallel rank.
+                # data_parallel is 1 for the SGLang server path so we always index [0].
+                _tt_logits_dev = tt_out[0][0] if isinstance(tt_out[0], tuple) else tt_out[0]
+                # Device-0-only readback: get_device_tensors returns the per-device
+                # storage list (host- or device-resident depending on storage state).
+                # Since _tt_logits_dev is device-resident, .cpu() on dev0 blocks for
+                # GPU finish then copies ONLY device 0's shard.
+                _dev0 = _ttnn_wsa19.get_device_tensors(_tt_logits_dev)[0]
+                _logits_host = _ttnn_wsa19.to_torch(_dev0)
+                _t_read1 = _time.perf_counter() if _wsa19_timing else 0.0
+                # Mirror ``process_output_decode``'s shape contract:
+                #   [1, 1, padded_batch, vocab_padded] -> [B, S=1, vocab_actual]
+                _B = self.tt_model.model_args[0].max_batch_size
+                _vocab = self.tt_model.model[0].vocab_size
+                _logits_t = _logits_host[:, :, :_B, :_vocab].view(_B, 1, -1).float()
+                decode_output = [_logits_t]
+                _t_proc1 = _time.perf_counter() if _wsa19_timing else 0.0
+                if _wsa19_timing and _timing:
+                    self._wsa19_split_accum = getattr(self, "_wsa19_split_accum", {
+                        "fwd_dispatch": 0.0, "fwd_read": 0.0, "fwd_process": 0.0,
+                        "_n": 0,
+                    })
+                    self._wsa19_split_accum["fwd_dispatch"] += (_t_disp1 - _t_disp0) * 1000
+                    self._wsa19_split_accum["fwd_read"] += (_t_read1 - _t_disp1) * 1000
+                    self._wsa19_split_accum["fwd_process"] += (_t_proc1 - _t_read1) * 1000
+                    self._wsa19_split_accum["_n"] += 1
+                    if self._wsa19_split_accum["_n"] % 50 == 0:
+                        n = self._wsa19_split_accum["_n"]
+                        logger.info(
+                            f"[WSA19] fwd-split FAST (avg over last 50): "
+                            f"dispatch={self._wsa19_split_accum['fwd_dispatch']/50:.2f}ms "
+                            f"read={self._wsa19_split_accum['fwd_read']/50:.2f}ms "
+                            f"process={self._wsa19_split_accum['fwd_process']/50:.2f}ms "
+                            f"cum_steps={n}"
+                        )
+                        for _k in ("fwd_dispatch", "fwd_read", "fwd_process"):
+                            self._wsa19_split_accum[_k] = 0.0
+            else:
+                decode_output = self.tt_model.decode_forward(
+                    tokens=tokens,
+                    start_pos=start_pos,
+                    page_table=page_table,
+                    kv_cache=self.kv_caches,
+                    enable_trace=True,
+                    read_from_device=True,
+                )
 
             if _timing:
                 _t3 = _time.perf_counter()
