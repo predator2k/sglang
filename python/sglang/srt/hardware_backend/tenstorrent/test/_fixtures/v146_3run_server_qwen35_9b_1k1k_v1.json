@@ -1,0 +1,48 @@
+{
+  "version": "v146",
+  "backend": "tt_transformers_paged",
+  "input_len": 1024,
+  "output_len": 1024,
+  "context_len": 2048,
+  "hw": "2x P150a (post-B.2 canonical wheel)",
+  "max_batch_size": 1,
+  "tag": "qwen35_9b_1k1k_v1",
+  "logdir": "/sglang/python/sglang/srt/hardware_backend/tenstorrent/test/_fixtures/bench_3run_qwen35_9b_1k1k_v1",
+  "results": [
+    {
+      "model": "Qwen3.5-9B-Base",
+      "model_id": "/tt-metal/models/weights/Qwen3.5-9B-Base",
+      "status": "PASS",
+      "t_ready_s": 76.11888982600067,
+      "input_len": 1024,
+      "output_len": 1024,
+      "run1_cold": {
+        "ttft_ms": 147761.7107500555,
+        "tpot_ms_mean": 79.14286758864698,
+        "tpot_ms_min": 73.96240893285722,
+        "tpot_ms_max": 4134.422390954569,
+        "n_chunks": 1022,
+        "wall_s": 228.56675688899122,
+        "error": null
+      },
+      "run2_warm_new_prompt": {
+        "ttft_ms": 147105.81379197538,
+        "tpot_ms_mean": 75.35687406959211,
+        "tpot_ms_min": 73.99334595538676,
+        "tpot_ms_max": 80.5128519423306,
+        "n_chunks": 1022,
+        "wall_s": 224.04531789803877,
+        "error": null
+      },
+      "run3_warm_kv_hit": {
+        "ttft_ms": 148648.68661703076,
+        "tpot_ms_mean": 75.07759883936428,
+        "tpot_ms_min": 73.8588790409267,
+        "tpot_ms_max": 78.80824594758451,
+        "n_chunks": 1022,
+        "wall_s": 225.3030421230942,
+        "error": null
+      }
+    }
+  ]
+}
