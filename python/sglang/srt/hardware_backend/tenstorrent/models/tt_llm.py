@@ -558,6 +558,33 @@ class TTModels(nn.Module):
                 _vocab = self.tt_model.model[0].vocab_size
                 _logits_t = _logits_host[:, :, :_B, :_vocab].view(_B, 1, -1).float()
                 decode_output = [_logits_t]
+                # ATTACK-2: env-gated logit-magnitude probe. Logs the L∞ norm,
+                # NaN/Inf flags, and top-token id of the first
+                # SGLANG_TT_LOGIT_PROBE_STEPS decode steps. Use to detect
+                # corruption / mode collapse pre-sampling.
+                _probe_n = int(os.environ.get("SGLANG_TT_LOGIT_PROBE_STEPS", "0") or 0)
+                if _probe_n > 0:
+                    _step_ctr = getattr(self, "_logit_probe_step", 0) + 1
+                    self._logit_probe_step = _step_ctr
+                    if _step_ctr <= _probe_n:
+                        try:
+                            _t = _logits_t.detach()
+                            _max_abs = float(_t.abs().max().item()) if _t.numel() else float("nan")
+                            _has_nan = bool(torch.isnan(_t).any().item())
+                            _has_inf = bool(torch.isinf(_t).any().item())
+                            _flat = _t.reshape(-1, _t.shape[-1])[0]
+                            _top_id = int(_flat.argmax().item())
+                            _top_val = float(_flat.max().item())
+                            # Top-5 ids for mode-collapse fingerprint.
+                            _top5 = _flat.topk(5)
+                            _top5_pairs = list(zip(_top5.indices.tolist(), [round(float(v), 2) for v in _top5.values.tolist()]))
+                            logger.warning(
+                                f"[LOGIT-PROBE] step={_step_ctr} shape={tuple(_t.shape)} "
+                                f"max_abs={_max_abs:.3e} has_nan={_has_nan} has_inf={_has_inf} "
+                                f"top_id={_top_id} top_val={_top_val:.3e} top5={_top5_pairs}"
+                            )
+                        except Exception as _probe_exc:
+                            logger.warning(f"[LOGIT-PROBE] step={_step_ctr} FAILED: {_probe_exc}")
                 _t_proc1 = _time.perf_counter() if _wsa19_timing else 0.0
                 if _wsa19_timing and _timing:
                     self._wsa19_split_accum = getattr(self, "_wsa19_split_accum", {
