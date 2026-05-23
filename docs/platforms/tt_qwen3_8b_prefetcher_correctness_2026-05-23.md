@@ -157,3 +157,74 @@ Recommended approach for the next session:
 4. **Compare WO and FF layouts.** WO matmul has the most complex DRAM
    prefetcher routing (smallest weights, most cross-device traffic).
    Compare its tile-stride math against FF1/FF3/FF2.
+
+## Update 2026-05-23 (afternoon): pre-trace warmup FAILS — confirms layout bug
+
+Followed recommendation #1 (pre-warm the prefetcher outside trace capture).
+Added env-gated `SGLANG_TT_PREFETCHER_WARMUP=N` knob in
+`tt-metal-sglang/models/tt_transformers/tt/generator.py:1513-1542`. When
+`N≥1`, before `begin_trace_capture`, runs N extra eager
+`_decode_forward_no_trace_text(...)` calls with `synchronize_device`
+sandwiches around each.  The extra eager path goes through `forward()`,
+which calls `prefetcher.run()` (kicks off `ttnn.dram_prefetcher` producer
++ all 36 layers of consumer matmuls) then `prefetcher.stop()` (deallocates
+producer handle).  Each warmup cycle therefore fully primes the GlobalCB
+sender/receiver handshake before the trace records the producer/consumer
+ordering.
+
+Result with `SGLANG_TT_PREFETCHER_WARMUP=1`, prefetcher ON, DT=1, on the
+chat-format gate:
+
+| Step | Observation |
+|---|---|
+| Trace capture | Compile run + warmup eager run + trace capture all completed cleanly (no TT_FATAL, no hang) |
+| Q1 first token | Garbage Hebrew/CJK tokens (`AtAמוןAtAמוןAtA…`) — same corruption signature as no-warmup |
+| Q2 prefill | Sampler crashes with `RuntimeError: probability tensor contains either inf, nan or element < 0` |
+| TPOT during Q1 | Server log gen-throughput ≈ 50 tok/s (≈ 20 ms TPOT) — the matmul speedup is real |
+| GSM8K(10) | 0/10 (same as no-warmup baseline) |
+
+The pre-trace warmup mechanism executes correctly (logs `[PREFETCHER-WARMUP]
+extra eager decode complete and synced` exactly as designed), but the
+corruption signature on the first trace-replay logits is identical to
+the no-warmup case.  This rules out "uninitialized GlobalCB" as the
+root cause and confirms the prior agent's "data-routing, not init-race"
+hypothesis.
+
+The env-gated warmup hook is kept in the tree (cost-zero when off)
+because it's still useful for follow-up investigations — e.g. measuring
+whether the producer needs N>1 prime cycles to stabilize, or as a
+scaffold for combining warmup with future layout-side fixes.
+
+### Confirmed shipping verdict
+
+**DO NOT ship the prefetcher under SGLANG_TT_USE_PREFETCHER=1.**
+The 1.66× decode speedup is real but the routing-side correctness bug is
+not addressable by any host-side ordering primitive available at the
+Python layer (synchronize_device is illegal inside trace; pre-trace
+warmup doesn't help; the prefetcher's `run()` is rebuilt fresh in every
+forward call, so there's no carried state to "prime"). A real fix needs
+either (a) tt-metal C++ changes to the `ttnn.dram_prefetcher` op's
+DRAM-shard tile-routing math, OR (b) a sub-device barrier inserted at
+the C++ level between producer.start() and consumer.read() inside the
+kernel binary itself.  Both are out of scope for SGLang-side work.
+
+### Updated next-session recommendations (priority order)
+
+1. **(layout-side, deep)** Instrument `ttnn.dram_prefetcher` in
+   `tt-metal/ttnn/.../dram_prefetcher_op.cpp` to log the actual
+   tile-bank addresses it writes for `wo_sharded_ring`; compare against
+   the addresses the WO ring-gather matmul reader kernel reads. The
+   prior agent's "matmul reads SOME data, just not the correct weights"
+   evidence + the no-help-from-warmup result narrows this to a
+   `wo_sharded_ring` layout transposition / stride mismatch.
+
+2. **(bisect, medium)** Per-layer prefetcher disable: wire an env var
+   `SGLANG_TT_PREFETCHER_LAST_N=K` so layers 0..(36-K) use the
+   canonical (non-prefetched) `self.wo` path and layers (36-K)..35 use
+   `self.wo_sharded_ring`. Sweep K from 0 → 36 and find the first K
+   that corrupts.  Tells you whether the bug is layer-specific.
+
+3. **(cheap, diagnostic)** Add a logit-magnitude probe before the
+   sampler.  Log L∞ norm and NaN count of the first 10 decode-step
+   logit tensors. Distinguish "first replay is dirty" (carryover) from
+   "every replay is dirty" (persistent layout bug).
