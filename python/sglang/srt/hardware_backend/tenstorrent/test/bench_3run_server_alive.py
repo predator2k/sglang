@@ -63,6 +63,13 @@ def launch_server(model_id: str, port: int, log_path: Path, ctx_len: int,
     # tt_transformers wants the HF name in HF_MODEL even though weights come from /models/<x>
     if hf_id:
         env["HF_MODEL"] = hf_id
+    # WS-A.18: Qwen3.5's DeltaNet host-fallback prefill OOMs at seq_len=2048
+    # (tt-metal's internal warmup probes every supported_length). Disable the
+    # internal warmup for Qwen3.5; the first real request will compile what
+    # it needs. Identity for every other model when the env var is unset.
+    if ("Qwen3.5" in (hf_id or "") or "Qwen3.5" in model_id
+            or "Qwen3_5" in (hf_id or "") or "Qwen3_5" in model_id):
+        env["SGLANG_TT_DISABLE_PREFILL_WARMUP"] = "1"
     # Optional Tracy/tt-metal profiler. Set TT_PROFILE=1 in outer shell.
     if os.environ.get("TT_PROFILE") == "1":
         env["TT_METAL_DEVICE_PROFILER"] = "1"
@@ -87,6 +94,17 @@ def launch_server(model_id: str, port: int, log_path: Path, ctx_len: int,
     ]
     if backend == "tt_transformers_paged":
         cmd += ["--trust-remote-code", "--attention-backend", "torch_native"]
+    # WS-A.18: Qwen3.5 is a hybrid GatedDeltaNet model, which SGLang's
+    # server_args path forces to page_size=1 + Mamba scheduling. Both crash
+    # tt-metal's KV-cache allocator (tile alignment + no_buffer assumption).
+    # We need page_size=64 like Qwen3-8B; the only way to keep it from being
+    # reset to 1 is to disable the radix cache (the radix path is the one
+    # that triggers the "force page_size=1" branch). Identified via the
+    # path label/model_id (Qwen3.5* / Qwen3_5*); identity for every other
+    # model — Qwen3-8B etc. keep their existing args.
+    if ("Qwen3.5" in (hf_id or "") or "Qwen3.5" in model_id
+            or "Qwen3_5" in (hf_id or "") or "Qwen3_5" in model_id):
+        cmd += ["--page-size", "64", "--disable-radix-cache"]
     f = log_path.open("w")
     f.write(f"# launching: {' '.join(cmd)}\n")
     f.flush()

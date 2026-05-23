@@ -230,6 +230,22 @@
       "model_id": "meta-llama/Llama-3.1-8B-Instruct",
       "status": "FAIL",
       "error": "You are trying to access a gated repo.\nMake sure to have access to it at https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct.\n401 Client Error. (Request ID: Root=1-6a094724-02a2925615cb03697594c4a"
+    },
+    {
+      "model": "Qwen3.5-0.8B",
+      "model_id": "/tt-metal/models/weights/Qwen3.5-0.8B",
+      "status": "UNKNOWN",
+      "arch": "Qwen3_5ForConditionalGeneration",
+      "hidden": 1024,
+      "layers": 24,
+      "ttft_warmup_ms": null,
+      "ttft_logits_ms": null,
+      "tpot_ms": null,
+      "tpot_min_ms": null,
+      "tpot_max_ms": null,
+      "tok_s": null,
+      "jit_decode_ms": null,
+      "note": "WS-A.18 placeholder for bench_3run_server_alive --models filter; real perf measured separately"
     }
   ]
 }

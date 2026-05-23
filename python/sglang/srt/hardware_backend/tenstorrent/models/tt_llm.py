@@ -1374,18 +1374,39 @@ class TTModels(nn.Module):
         num_devices = (
             self.mesh_device.get_num_devices() // self.tt_data_parallel
         )  # Calculate num_kv_heads with tensor parallelism adjustment
-        total_kv_heads = getattr(
-            self.config,
+
+        # WS-A.18: multimodal HF configs (e.g. Qwen3_5Config) nest the text
+        # decoder params under ``config.text_config``; non-multimodal configs
+        # carry them at the top level. Prefer the nested values when present
+        # so head/dim lookups don't AttributeError on Qwen3.5. Identical to
+        # the top-level path for every flat-config model.
+        _txt_cfg = getattr(self.config, "text_config", None) or self.config
+
+        def _txt_attr(name, default=None):
+            return getattr(_txt_cfg, name, getattr(self.config, name, default))
+
+        total_kv_heads = _txt_attr(
             "num_key_value_heads",
-            getattr(self.config, "num_attention_heads", self.DEFAULT_NUM_KV_HEADS),
+            _txt_attr("num_attention_heads", self.DEFAULT_NUM_KV_HEADS),
         )
         num_kv_heads = total_kv_heads // min(
             num_devices, total_kv_heads
         )  # kv heads per device
-        head_size = getattr(
-            self.config,
+        # WS-A.18: Qwen3.5 needs the WS-A.10 KV-head replicate factor honored
+        # at KV-cache allocation time too — the per-device cache must have
+        # exactly the ``n_local_kv_heads`` slots that paged_update_cache will
+        # write, and ModelArgs.n_kv_heads is the post-replicate count. Read
+        # from the in-process ModelArgs (set during initialize_sglang_model)
+        # if available; falls back to the HF-config-derived value for every
+        # other model.
+        try:
+            _ma = self.tt_model.model_args[0]
+            num_kv_heads = int(_ma.n_kv_heads) // min(int(_ma.num_devices), int(_ma.n_kv_heads))
+        except (AttributeError, IndexError, TypeError):
+            pass
+        head_size = _txt_attr(
             "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads,
+            _txt_attr("hidden_size", 0) // max(_txt_attr("num_attention_heads", 1), 1),
         )
 
         kv_cache_shape = (
@@ -1395,13 +1416,12 @@ class TTModels(nn.Module):
             head_size,  # head_size
         )
         # Get num_layers from config (like sglang's model_config.get_num_layers_by_block_type())
-        num_layers = getattr(
-            self.config,
+        # WS-A.18: same multimodal-aware lookup as the head/dim attrs.
+        num_layers = _txt_attr(
             "num_hidden_layers",
-            getattr(
-                self.config,
+            _txt_attr(
                 "n_layers",
-                getattr(self.config, "n_layer", self.DEFAULT_NUM_LAYERS),
+                _txt_attr("n_layer", self.DEFAULT_NUM_LAYERS),
             ),
         )  # Llama/Mistral, GPT-Neo, GPT-2
         dtype = torch.bfloat16
@@ -1571,6 +1591,125 @@ class TTModels(nn.Module):
                 logger.info("Mesh device closed in destructor")
 
 
+_QWEN35_LOADER_SHIMS_INSTALLED = False
+
+
+def _is_qwen35_config(config) -> bool:
+    """True iff this HF config describes a Qwen3.5-* model.
+
+    Detection precedence: ``model_type`` first (most robust — set by the
+    HF Qwen3_5Config subclass), then architecture name, then a path-name
+    fallback for offline checkpoints whose ``model_type`` may be missing.
+    """
+    mt = getattr(config, "model_type", "") or ""
+    if mt.startswith("qwen3_5"):
+        return True
+    archs = list(getattr(config, "architectures", None) or [])
+    if any(a.startswith("Qwen3_5") for a in archs):
+        return True
+    name = (getattr(config, "_name_or_path", "") or "").lower()
+    return "qwen3.5" in name or "qwen3_5" in name
+
+
+def _install_qwen35_loader_shims_once():
+    """Install the Qwen3.5 safetensors-direct loader + text-only shim.
+
+    Mirrors the standalone ``_qwen35_harness._install_qwen35_loader_shims``
+    so the server path runs the same loader as the standalone PCC/perf
+    harnesses (WS-A.8 / WS-A.10 / WS-A.15).
+
+    Why this is needed on the server path:
+
+      * Qwen3.5-0.8B ships ``architectures=["Qwen3_5ForConditionalGeneration"]``
+        with a ``vision_config`` block, so ``ModelArgs._set_hf_params`` flips
+        ``is_multimodal=True`` and ``ModelArgs.load_state_dict`` routes
+        through ``convert_vision_hf_to_meta_no_qkv_permute`` which does NOT
+        apply the WS-A.10 ``kv_head_replicate_factor=2`` transform.
+        Result: the first full-attention layer (layer 3) raises
+        ``RuntimeError: shape '[2, 256, 1024]' is invalid for input of
+        size 262144`` because the wk weight is still un-replicated.
+
+      * Forcing ``is_multimodal=False`` is consistent with WS-B's "vision
+        out of scope for first port" rule — the TT plugin only wires the
+        text decoder, the multimodal/vision tower is intentionally not
+        ported.
+
+      * Direct safetensors loading is faster (skips full HF model
+        construction) and matches the standalone PCC baseline byte-for-byte.
+
+    Idempotent: subsequent calls are no-ops via the module-level guard.
+    """
+    global _QWEN35_LOADER_SHIMS_INSTALLED
+    if _QWEN35_LOADER_SHIMS_INSTALLED:
+        return
+
+    import glob
+
+    import safetensors.torch as st
+
+    from models.tt_transformers.tt import model_config as _mc
+    from models.tt_transformers.tt.load_checkpoints import (
+        convert_hf_to_meta_no_qkv_permute,
+        standardize_hf_keys,
+    )
+
+    def _direct_safetensors_loader(self):
+        # Only intercept Qwen3.5; every other model falls through to the
+        # original canonical loader. The wrapper keeps Llama/Qwen3-8B/
+        # Mistral/GptOss byte-equivalent.
+        if not _is_qwen35_config(getattr(self, "hf_config", None)):
+            return _orig_load_state_dict(self)
+        sd = {}
+        for p in sorted(glob.glob(os.path.join(self.CKPT_DIR, "model.safetensors*.safetensors"))):
+            sd.update(st.load_file(p))
+        # Qwen3.5 nests text params under "model.language_model.*"
+        # (multimodal vision-prefix layout); standardize_hf_keys only knows
+        # the flat "model.*" layout, so we re-key up front.
+        sd = {k.replace("model.language_model.", "model.", 1): v for k, v in sd.items()}
+        # Drop the visual + MTP heads — text-only port doesn't need them and
+        # they confuse the downstream HF→Meta rename pass.
+        sd = {
+            k: v
+            for k, v in sd.items()
+            if not k.startswith("model.visual.") and not k.startswith("mtp.")
+        }
+        # Qwen3.5 ties word embeddings, so the safetensors only ship
+        # ``model.embed_tokens.weight`` (no ``lm_head.weight``). Synthesize
+        # ``lm_head.weight`` from the embedding before standardize_hf_keys
+        # collapses both to a single key.
+        if "lm_head.weight" not in sd and "model.embed_tokens.weight" in sd:
+            sd["lm_head.weight"] = sd["model.embed_tokens.weight"].clone()
+        sd = standardize_hf_keys(sd)
+        _orig_kv = int(getattr(self, "_n_kv_heads_orig", self.n_kv_heads))
+        _kv_replicate = int(getattr(self, "kv_head_replicate_factor", 1))
+        sd = convert_hf_to_meta_no_qkv_permute(
+            sd,
+            self.head_dim,
+            self.n_heads,
+            _orig_kv,
+            kv_head_replicate_factor=_kv_replicate,
+        )
+        return sd
+
+    _orig_load_state_dict = _mc.ModelArgs.load_state_dict
+    _orig_set_hf_params = _mc.ModelArgs._set_hf_params
+
+    def _set_hf_params_text_only(self, ckpt_dir):
+        _orig_set_hf_params(self, ckpt_dir)
+        # Only flip is_multimodal for Qwen3.5; leaves every other model
+        # (Llama-3.2-Vision, Mistral-Pixtral, etc.) untouched.
+        if _is_qwen35_config(getattr(self, "hf_config", None)) and getattr(self, "is_multimodal", False):
+            logger.info(
+                "[TT-Plugin] forcing is_multimodal=False for Qwen3.5 (text-only port)"
+            )
+            self.is_multimodal = False
+
+    _mc.ModelArgs.load_state_dict = _direct_safetensors_loader  # type: ignore[assignment]
+    _mc.ModelArgs._set_hf_params = _set_hf_params_text_only  # type: ignore[assignment]
+    _QWEN35_LOADER_SHIMS_INSTALLED = True
+    logger.info("[TT-Plugin] Qwen3.5 loader shims installed (idempotent)")
+
+
 def _create_tt_model_class(
     backend_module_path: str, backend_class_name: str, class_name: str
 ):
@@ -1607,6 +1746,14 @@ def _create_tt_model_class(
                 "GptOssForCausalLM": TT_GptOss,
             }
             tt_backend_class = backend_classes[backend_class_name]
+
+            # WS-A.18: Qwen3.5 needs the safetensors-direct loader + the
+            # is_multimodal=False shim so the canonical multimodal converter
+            # (which lacks WS-A.10 KV-replicate) is bypassed. Installed
+            # lazily and only fires for Qwen3.5 configs; every other model
+            # is byte-equivalent to the pre-WS-A.18 path.
+            if _is_qwen35_config(config):
+                _install_qwen35_loader_shims_once()
 
             # Tenstorrent-p1: DRAM prefetcher (decode-stage weight prefetch)
             # opt-in via SGLANG_TT_USE_PREFETCHER. Forwarded to tt-metal's
