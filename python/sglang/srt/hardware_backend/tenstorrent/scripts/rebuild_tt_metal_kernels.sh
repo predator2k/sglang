@@ -67,3 +67,20 @@ echo "  Done. Output libs:"
 ls -la "${BUILD_DIR}/ttnn/_ttnn.so" "${BUILD_DIR}/ttnn/_ttnncpp.so" 2>/dev/null || \
     echo "  (no _ttnn.so/_ttnncpp.so found — check target name)"
 echo "================================================================"
+
+# Critical post-build step: ninja only emits to ${BUILD_DIR}, but the Python
+# `ttnn` package loads `_ttnn.so` / `_ttnncpp.so` from the in-tree module
+# directory (/tt-metal/ttnn/ttnn/).  Without this sync the rebuild is a no-op
+# at runtime (the previous .so keeps loading), which silently invalidates any
+# host-side patches.  Discovered during U12 — symptom: cache had ENABLE_GLOBAL_CB
+# but new SGLANG_TT_PREFETCHER_* defines never propagated.
+INSTALL_DIR="${TT_METAL_DIR}/ttnn/ttnn"
+if [[ -d "${INSTALL_DIR}" ]]; then
+    echo "  Syncing libs to Python module directory: ${INSTALL_DIR}"
+    cp -fp "${BUILD_DIR}/ttnn/_ttnn.so"    "${INSTALL_DIR}/_ttnn.so"
+    cp -fp "${BUILD_DIR}/ttnn/_ttnncpp.so" "${INSTALL_DIR}/_ttnncpp.so"
+    ls -la "${INSTALL_DIR}/_ttnn.so" "${INSTALL_DIR}/_ttnncpp.so"
+else
+    echo "  WARNING: ${INSTALL_DIR} not found; Python imports may use stale libs."
+fi
+echo "================================================================"
