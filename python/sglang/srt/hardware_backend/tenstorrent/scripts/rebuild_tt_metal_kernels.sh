@@ -10,6 +10,27 @@
 # rebuild the affected .o + relink the shared lib. This takes
 # 2-5 min instead.
 #
+# CRITICAL — HOST-vs-CONTAINER SOURCE SPLIT (discovered U13 2026-05-24):
+# The container's /tt-metal/ tree is a SEPARATE WORKING COPY from the host
+# /home/mhnie/tt-metal-sglang/.  Editing source files on the host has
+# NO EFFECT until you copy them into the container.  Symptom: the
+# rebuild succeeds, _ttnn.so is synced to the install dir, but new
+# defines / probe code never appears in the runtime kernels.
+#
+# BEFORE running this script, sync any host edits into the container:
+#   podman cp /home/mhnie/tt-metal-sglang/<path>/<file> p3a-ngram:/tt-metal/<path>/<file>
+#
+# Verify with:
+#   podman exec p3a-ngram bash -c 'grep <SENTINEL_STRING> /tt-metal/<path>/<file>'
+#
+# After rebuild, verify _ttnn.so / _ttnncpp.so contain expected env-var
+# strings (host factory code):
+#   podman exec p3a-ngram bash -c 'strings /tt-metal/ttnn/ttnn/_ttnncpp.so | grep <SENTINEL>'
+#
+# This trap, combined with the install-dir sync trap below, has wasted
+# multiple session hours.  ALWAYS verify both layers before claiming a
+# probe didn't fire.
+#
 # USAGE (from host):
 #   podman exec p3a-ngram bash \
 #     /sglang/python/sglang/srt/hardware_backend/tenstorrent/scripts/rebuild_tt_metal_kernels.sh
