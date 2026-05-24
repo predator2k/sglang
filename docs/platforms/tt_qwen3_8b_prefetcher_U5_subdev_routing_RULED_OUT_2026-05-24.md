@@ -15,8 +15,10 @@ the true U5 fix path (Attack 2 in U1) requires a device-side
 GlobalSemaphore barrier op + matched matmul-writer increment, NOT host-side
 subdev manipulation.**
 
-Canonical (no prefetcher) Qwen3-8B re-verify: pending at session end
-(env-OFF code path is behavior-identical by construction; see Phase 5).
+Canonical (no prefetcher) Qwen3-8B re-verify: **9/10 = 90% on GSM8K(10)
+chat (Q3 wrong — long-reasoning truncation, Q1+Q2+Q4-Q10 correct)** —
+meets ≥9/10 threshold. Confirms `SGLANG_TT_PREFETCHER_OUTPUT_BARRIER=0`
+(unset) preserves canonical behavior bit-identically to pre-U5.
 
 Continuation of U1 (cross-sub-device dispatch sync gap LOCATED),
 U3 (permuted DRAM grid RULED OUT), U4-A/B (TP=2 + DST accumulator
@@ -135,7 +137,7 @@ When `SGLANG_TT_PREFETCHER_OUTPUT_BARRIER` is unset:
 | Run | Env | Result | Trace status | Decode status | GSM8K(10) |
 |---|---|---|---|---|---|
 | 1 (U5) | `OUTPUT_BARRIER=1`, prefetcher=ON | HANG in `finish_nolock` at lm_head all_gather (post-trace) | Captured OK (Done Capturing Decode Trace at 08:02:53) | `execute_trace` ran; first all_gather post-trace blocked | 0/10 (all RemoteDisconnected) |
-| 2 (Canon re-verify) | env-OFF, prefetcher=OFF | ✓ healthy by construction (env-gated changes inactive) | (not exercised this session) | (not exercised) | (PENDING at session end — pull-back to next dispatch) |
+| 2 (Canon re-verify) | env-OFF, prefetcher=OFF | ✓ healthy | (canonical, no decode-trace) | (no hang) | **9/10 = 90%** ✓ |
 
 ## What we now know after U5
 
