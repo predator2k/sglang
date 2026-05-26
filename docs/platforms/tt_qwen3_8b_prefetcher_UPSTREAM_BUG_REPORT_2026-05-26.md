@@ -209,6 +209,214 @@ The Galaxy Llama-3 70B demo (`models/demos/llama3_70b_galaxy/`) uses the same `e
 
 ## 6. Reproducer
 
+### 6.0 Complete reproduction from scratch
+
+This section walks an engineer with **zero prior context** from bare hardware to a reproducible "garbage tokens vs canonical output" comparison. Steps are derived from the in-tree `bootstrap_container.sh` + the `tt-metal-sglang` Dockerfile; they have not been re-tested end-to-end against a fully fresh machine, so treat them as a recipe to validate, not a hands-off script.
+
+**Forks (both PUBLIC on GitHub, confirmed 2026-05-26 via `gh repo view`):**
+
+- `predator2k/tt-metal` — branch `tenstorrent-p1`, pin SHA `b723bd4648c` (146 commits ahead of upstream `tenstorrent/tt-metal` main `c0da7f83197`; 55 are env-gated probes default-off, plus 8 Blackhole P300 patches that have NO patch-file equivalent and **must** come from the fork; do not attempt to build from upstream main)
+- `predator2k/sglang` — branch `tenstorrent-p1`, pin SHA `d8d23d8ef` (includes this bug report, all U37-U43 probes, and the SGLang TT in-tree port)
+
+#### Step 1 — Prerequisites
+
+- **Hardware:** 2× Blackhole P150a in a single host (mesh shape 1×2). With only 1 P150a, the prefetcher `use_global_cb=true` path does not engage (the mesh needs ≥2 devices), so the bug does not surface.
+- **Firmware/KMD:** firmware bundle `19.6.0.0` (cm_fw `0.28.0.0`, dm_app_fw `0.22.0.0`); TT-KMD `2.8.0`.
+- **Host OS:** Ubuntu 24.04 LTS (Linux 6.17+) verified; 22.04 should also work since the container image is Ubuntu 22.04 inside.
+- **Container runtime:** `podman` (rootless is fine; we use `--privileged` to unmask `/sys/kernel/mm/hugepages` which the tt-metal UMD reads).
+- **CLI tools on host:** `git`, `git-lfs` (optional for HF clone path), `gh` (optional), `huggingface-cli` (via `pip install huggingface_hub`).
+
+#### Step 2 — Clone both forks
+
+```bash
+# Pick a workspace root, e.g. /home/<you>
+export WS=/home/<you>
+
+git clone --branch tenstorrent-p1 git@github.com:predator2k/tt-metal.git ${WS}/tt-metal-sglang
+cd ${WS}/tt-metal-sglang && git checkout b723bd4648c && cd -
+
+git clone --branch tenstorrent-p1 git@github.com:predator2k/sglang.git ${WS}/sglang
+cd ${WS}/sglang && git checkout d8d23d8ef && cd -
+```
+
+Both repos are PUBLIC, so HTTPS also works:
+
+```bash
+git clone --branch tenstorrent-p1 https://github.com/predator2k/tt-metal.git ${WS}/tt-metal-sglang
+git clone --branch tenstorrent-p1 https://github.com/predator2k/sglang.git ${WS}/sglang
+```
+
+#### Step 3 — Download the Qwen3-8B model weights
+
+```bash
+mkdir -p ${WS}/tt-models
+huggingface-cli download Qwen/Qwen3-8B --local-dir ${WS}/tt-models/Qwen3-8B
+# OR (slower, needs git-lfs):
+# git clone https://huggingface.co/Qwen/Qwen3-8B ${WS}/tt-models/Qwen3-8B
+```
+
+Resulting layout used by the bootstrap script: `${WS}/tt-models/Qwen3-8B/` becomes `/models/Qwen3-8B` inside the container.
+
+#### Step 4 — Build the tt-metal container image
+
+```bash
+cd ${WS}/tt-metal-sglang
+podman build \
+  --build-arg GIT_REF=89686ee7 \
+  --build-arg PYTHON_VERSION=3.10 \
+  --build-arg UBUNTU_VERSION=22.04 \
+  -t localhost/local-tt-metal:dev \
+  -f dockerfile/Dockerfile .
+```
+
+- Estimated time: **30-60 min**, dominated by tt-metal C++ build + tt-llk + ttnn + tt_metal cargo deps. Network bandwidth dominates the early uv layers.
+- The build context **must** be the predator2k fork checkout, not upstream tt-metal. Per `bootstrap_container.sh` comments: the 8 Blackhole P300 patches (DRAM mem-cfg fallbacks, grid-y clamp, RMSNorm `_force_unsharded`, fused-AG for `num_devices>=2`, etc.) live ONLY on the fork as real commits and have no patch-file equivalent. A non-fork build will fail at EAGLE-3 boot on P300 with `WIDTH_SHARDED`/grid 12×9/`bad_optional_access` errors.
+- Tag aliases used by P300 reproductions: `:p3b`, `:p3b-v2`, `:p3b-v3`, `:p3b-v4`. Only `:dev` is needed for the Qwen3-8B BFP8 garbage reproduction here.
+
+#### Step 5 — Configure 1 GB hugepages on the host
+
+tt-metal's UMD requires at least one 1 GB hugepage per device at init:
+
+```bash
+echo 1 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages   # should print 1
+# If your kernel only exposes /dev/hugepages-2M, allocate enough 2M pages instead
+# (tt-metal will accept either; check `tt-smi` reports the device after step 6).
+```
+
+The bind-mount `/dev/hugepages-1G -> /dev/hugepages-1G` in step 6 surfaces the page pool inside the container.
+
+#### Step 6 — Bring up the container
+
+The fastest path is the in-tree script, which assumes host paths `/home/mhnie/sglang` + `/home/mhnie/tt-models`. If yours differ, edit `HOST_SGLANG` and `HOST_MODELS` at the top of the script, or run the equivalent `podman run` manually:
+
+```bash
+cd ${WS}/sglang
+HOST_SGLANG=${WS}/sglang HOST_MODELS=${WS}/tt-models \
+  bash python/sglang/srt/hardware_backend/tenstorrent/scripts/bootstrap_container.sh
+```
+
+Equivalent manual `podman run` (mirrors the script exactly):
+
+```bash
+podman run -d --name p3a-ngram \
+  --privileged \
+  --device /dev/tenstorrent \
+  -v /dev/hugepages-1G:/dev/hugepages-1G \
+  -v ${WS}/sglang:/sglang \
+  -v ${WS}/tt-models:/models \
+  --network host \
+  --shm-size=8g \
+  --entrypoint /bin/bash \
+  localhost/local-tt-metal:dev \
+  -c "sleep infinity"
+```
+
+The script also installs SGLang editable into the container's `/opt/venv` (uv-managed, no system `pip`); replicate by hand if you `podman run` manually:
+
+```bash
+podman exec p3a-ngram bash -lc '
+  source /opt/venv/bin/activate
+  uv pip install --no-build-isolation -e /sglang/python --no-deps
+  uv pip install --no-build-isolation \
+    pybase64 fastapi uvicorn uvloop aiohttp msgspec setproctitle python-multipart \
+    IPython modelscope einops gguf interegular llguidance partial_json_parser \
+    openai-harmony pillow psutil py-spy requests scipy sentencepiece blobfile \
+    compressed-tensors easydict timm soundfile build datasets ninja anthropic \
+    openai outlines==0.1.11 packaging nvidia-ml-py triton \
+    "transformers>=5.0"
+'
+```
+
+#### Step 7 — Verify the container + SGLang import
+
+```bash
+podman exec p3a-ngram bash -lc 'source /opt/venv/bin/activate && python -c "import sglang; print(sglang.__file__)"'
+# Expected: sglang ok: /sglang/python/sglang/__init__.py
+podman exec p3a-ngram bash -lc 'tt-smi -ls'   # should list 2 Blackhole P150a boards
+```
+
+If `tt-smi` does not see the devices, the host firmware/KMD/hugepages setup (step 1+5) is incomplete — fix before continuing.
+
+#### Step 8 — Launch SGLang on the broken prefetcher path
+
+```bash
+podman exec p3a-ngram bash -c 'pkill -9 -f "sglang\.launch_server.*--port 30000" 2>/dev/null; sleep 3'
+podman exec p3a-ngram bash -c 'CACHE=/root/.cache/tt-metal-cache; [ -n "$CACHE" ] && [ -d "$CACHE" ] && rm -rf "$CACHE"/*'
+
+podman exec -d p3a-ngram bash -c '\
+  source /opt/venv/bin/activate && \
+  SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged \
+  SGLANG_TT_MAX_BATCH=1 \
+  HF_MODEL=/models/Qwen3-8B \
+  SGLANG_TT_USE_PREFETCHER=1 \
+  SGLANG_TT_DISABLE_PREFILL_TRACE=1 \
+  python3 -u -m sglang.launch_server \
+    --model-path /models/Qwen3-8B --port 30000 --host 0.0.0.0 \
+    --device tenstorrent --context-length 4096 \
+    --mem-fraction-static 0.5 --disable-cuda-graph --tp-size 1 \
+    --skip-server-warmup --max-running-requests 1 --trust-remote-code \
+    --attention-backend torch_native > /tmp/repro_broken.log 2>&1'
+
+# Wait for /health (cold first run with JIT will take ~3-5 min):
+until curl -fsS http://127.0.0.1:30000/health >/dev/null 2>&1; do sleep 5; done
+```
+
+#### Step 9 — Hit `/generate` and observe garbage tokens
+
+```bash
+curl -sX POST http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"What is 2+2?","sampling_params":{"max_new_tokens":15,"temperature":0.0}}'
+```
+
+- **Expected** (canonical, step 11 below): `" What is 2+2? What is 2+2? What"`
+- **Actual** (prefetcher ON): a sequence of unrelated tokens. The exact bytes depend on the active probe set because each new define triggers a fresh JIT binary hash; we have observed 8 distinct garbage signatures across U37-U41, e.g. `" WhatGBT roz无所谓我以为GBT烘干..."`. Continuing past token ~2 NaN-poisons the sampler and the server crashes the request.
+
+#### Step 10 — (Optional) Full GSM8K(10) chat eval
+
+```bash
+podman exec p3a-ngram bash -lc '
+  source /opt/venv/bin/activate
+  python3 /sglang/python/sglang/srt/hardware_backend/tenstorrent/test/eval_qwen3_8b_gsm8k_chat.py \
+    --url http://127.0.0.1:30000 \
+    --model /models/Qwen3-8B \
+    --num 10
+'
+```
+
+- **Shippable threshold:** `>= 7/10` (documented in the eval script header). Canonical Qwen3-8B on TT scores 9-10/10.
+- **Prefetcher path:** scores **0/10** (NaN sampler crash typically inside question 1).
+
+#### Step 11 — Canonical control (proves prefetcher-path specificity)
+
+Tear down the broken server and relaunch without `SGLANG_TT_USE_PREFETCHER=1`:
+
+```bash
+podman exec p3a-ngram bash -c 'pkill -9 -f "sglang\.launch_server.*--port 30000"; sleep 3'
+
+podman exec -d p3a-ngram bash -c '\
+  source /opt/venv/bin/activate && \
+  SGLANG_TT_EXECUTION_BACKEND=tt_transformers_paged \
+  HF_MODEL=/models/Qwen3-8B \
+  SGLANG_TT_DISABLE_PREFILL_TRACE=1 \
+  python3 -u -m sglang.launch_server \
+    --model-path /models/Qwen3-8B --port 30000 --host 0.0.0.0 \
+    --device tenstorrent --context-length 4096 \
+    --mem-fraction-static 0.5 --disable-cuda-graph --tp-size 1 \
+    --skip-server-warmup --max-running-requests 1 --trust-remote-code \
+    --attention-backend torch_native > /tmp/repro_clean.log 2>&1'
+
+until curl -fsS http://127.0.0.1:30000/health >/dev/null 2>&1; do sleep 5; done
+
+curl -sX POST http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"What is 2+2?","sampling_params":{"max_new_tokens":15,"temperature":0.0}}'
+# Expected: " What is 2+2? What is 2+2? What"   (matches HF reference)
+```
+
+GSM8K(10) chat on this control scores 9-10/10. Same hardware, same weights, same compute kernel, same in1 dtype — the only delta is the in1 CB allocation path (`experimental::CreateCircularBuffer(prog, cores, remote_cfg, *global_cb)` vs the plain `CreateCircularBuffer(prog, cores, src1_cfg)`). That delta isolates the bug to the prefetcher dual-index allocation regime.
+
 ### 6.1 In SGLang (what we observed)
 
 In a host with 2 × Blackhole P150a + tt-metal-sglang `b723bd4648c` installed in the container (default-off probes; no probe envs needed to reproduce the bug — the probes are only for instrumenting it):
@@ -343,12 +551,21 @@ DPRINT capture envs (provided by tt-metal itself, not added by us): `TT_METAL_DP
 
 ## 10. Reproducing the diagnostic harness — commit + push
 
-| Repo | Where to fetch the probes | Branch | HEAD |
-|---|---|---|---|
-| tt-metal (private fork) | `git@github.com:predator2k/tt-metal.git` | `tenstorrent-p1` | `b723bd4648c` (146 commits ahead of upstream main `c0da7f83197`; 55 are probes/diagnostic, all env-gated default-off) |
-| sglang (private fork) | `git@github.com:predator2k/sglang.git` | `tenstorrent-p1` | this doc + `99f90922a` (U43) |
+> **READ-FIRST — push before handoff.** As of doc-write time the diagnostic probes (U22-U43) live on the local checkouts but have not been pushed to the public remotes. Before sharing this doc with Tenstorrent, run:
+>
+> ```bash
+> cd ${WS}/tt-metal-sglang && git push origin tenstorrent-p1   # local b723bd4648c vs remote af126cf5e7b (40 commits behind)
+> cd ${WS}/sglang          && git push origin tenstorrent-p1   # local d8d23d8ef  vs remote ac6b2bbf      (this doc + recent probes)
+> ```
+>
+> Without these pushes the SHAs cited below resolve to local-only commits and the probes are not visible to anyone cloning the public remote.
 
-We can push these forks to a public mirror, or extract the probe patch as a single diff against upstream tt-metal `main`, on request. The full investigation ledger (29 docs, S1-S10 → U1-U43) lives under `sglang/docs/platforms/tt_qwen3_8b_prefetcher_*.md`.
+| Repo | Where to fetch the probes | Branch | HEAD (must be pushed) |
+|---|---|---|---|
+| tt-metal (**public** fork) | `git@github.com:predator2k/tt-metal.git` (HTTPS: `https://github.com/predator2k/tt-metal.git`) | `tenstorrent-p1` | `b723bd4648c` (146 commits ahead of upstream main `c0da7f83197`; 55 are probes/diagnostic, all env-gated default-off) |
+| sglang (**public** fork) | `git@github.com:predator2k/sglang.git` (HTTPS: `https://github.com/predator2k/sglang.git`) | `tenstorrent-p1` | `d8d23d8ef` (this doc + U37/U38/U39/U40/U41/U43 probe wiring + tt-llk probe-side gates) |
+
+Both forks are PUBLIC on GitHub (verified 2026-05-26 via `gh repo view`), so no access grant is required. The probe diff against upstream tt-metal `main` can also be extracted as a single patch on request. The full investigation ledger (29 docs, S1-S10 → U1-U43) lives under `sglang/docs/platforms/tt_qwen3_8b_prefetcher_*.md`.
 
 Key in-tree files (all on tt-metal-sglang `tenstorrent-p1`):
 
@@ -363,7 +580,7 @@ Key in-tree files (all on tt-metal-sglang `tenstorrent-p1`):
 **Reporter contact:** TBD — to be filled in by the user before handoff.
 **Preferred channel:** GitHub issue on `tenstorrent/tt-metal`, or direct email to the LLK team if that is preferred for hardware-bug reports of this depth.
 **Hardware availability:** the 2 × Blackhole P150a setup that produced every empirical result here is still online; we can run additional probes on request (turn-around ~30-45 min per env-gated probe iteration, dominated by full tt-metal rebuild + JIT spawn warmup in the p3a-ngram container).
-**Repo access:** we can grant Tenstorrent LLK engineers read access to `predator2k/tt-metal-sglang` and `predator2k/sglang` (currently private). The probe diff against upstream tt-metal main can also be sent as a single patch on request.
+**Repo access:** both forks (`predator2k/tt-metal` and `predator2k/sglang`) are PUBLIC on GitHub (verified 2026-05-26). No access grant needed; LLK engineers can clone directly. The probe diff against upstream tt-metal main can also be sent as a single patch on request. **NB:** see §10 — the user must `git push origin tenstorrent-p1` from both checkouts before handoff or the probe commits cited throughout this doc will not be visible on the public remote.
 
 ---
 
