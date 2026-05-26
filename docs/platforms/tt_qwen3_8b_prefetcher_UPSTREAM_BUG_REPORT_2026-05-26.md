@@ -617,7 +617,6 @@ Key in-tree files (all on tt-metal-sglang `tenstorrent-p1`):
 
 ## 11. Contact / next steps
 
-**Reporter contact:** TBD — to be filled in by the user before handoff.
 **Preferred channel:** GitHub issue on `tenstorrent/tt-metal`, or direct email to the LLK team if that is preferred for hardware-bug reports of this depth.
 **Hardware availability:** the 2 × Blackhole P150a setup that produced every empirical result here is still online; we can run additional probes on request (turn-around ~30-45 min per env-gated probe iteration, dominated by full tt-metal rebuild + JIT spawn warmup in the p3a-ngram container).
 **Repo access:** both forks (`predator2k/tt-metal` and `predator2k/sglang`) are PUBLIC on GitHub (verified 2026-05-26). No access grant needed; LLK engineers can clone directly. The probe diff against upstream tt-metal main can also be sent as a single patch on request. **NB:** see §10 — the user must `git push origin tenstorrent-p1` from both checkouts before handoff or the probe commits cited throughout this doc will not be visible on the public remote.
