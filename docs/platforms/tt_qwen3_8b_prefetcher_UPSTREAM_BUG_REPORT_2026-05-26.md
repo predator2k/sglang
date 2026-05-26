@@ -460,47 +460,52 @@ curl -sX POST http://127.0.0.1:30000/generate -d '{"text":"What is 2+2?","sampli
 
 GSM8K-10 chat on canonical = 9-10/10; on prefetcher = 0/10 (NaN sampler crash within question 1).
 
-### 6.2 Minimal standalone tt-metal test (strongly recommended next deliverable)
+### 6.2 Standalone tt-metal test scaffold + key negative finding (2026-05-26)
 
-We do not currently have a standalone reproducer that does not depend on SGLang + Qwen3-8B. The cleanest place to build one is `tests/tt_metal/tt_metal/test_kernels/` using the existing `dram_prefetcher` op + `matmul_multicore_reuse_mcast_1d`. Outline:
+A first-pass standalone reproducer lives in the tt-metal-sglang fork at:
 
-```cpp
-// Pseudocode — Tenstorrent LLK test infra is the best place to flesh this out.
-
-// 1. Bring up a (1, 2) Blackhole P150a mesh.
-auto mesh = ttnn::MeshDevice::create({1, 2});
-
-// 2. Construct a GlobalCircularBuffer sized like Qwen3-8B-balanced (835584 B/receiver works;
-//    smaller sizes likely also reproduce as long as in1_single_tile_size = 1088 and
-//    `(gcb.size() / in1_block_size_bytes) * in1_block_size_bytes == gcb.size()`).
-auto global_cb = ttnn::experimental::CreateGlobalCircularBuffer(mesh, /*size=*/835584, …);
-
-// 3. Insert at least ONE BFP8 weight tile filled with KNOWN, NON-ZERO bytes (e.g. all 0x7a).
-//    Use dram_prefetcher to stream it into the GCB.
-auto W = ttnn::from_torch(torch::full({32, 32}, 0.5, torch::kBFloat16),
-                          ttnn::DataType::BFLOAT8_B, /*tile_layout*/ true);
-ttnn::experimental::dram_prefetcher::insert_tensor(global_cb, W);
-
-// 4. Run a single gathered matmul:
-auto out = ttnn::matmul(
-    /*in0=*/ones_like_activations,
-    /*in1=*/W,
-    /*program_config=*/MatmulMultiCoreReuseMultiCast1DProgramConfig{
-        /*compute_with_storage_grid_size=*/...,
-        /*in0_block_w=*/4, /*out_subblock_h=*/1, /*out_subblock_w=*/2,
-        /*per_core_M=*/1, /*per_core_N=*/2, /*fuse_batch=*/true, /*mcast_in0=*/true,
-    },
-    /*use_global_cb=*/true);
-
-// 5. Compare to torch reference.
-auto ref = torch::matmul(ones_torch, W_torch);   // ~32 (sum of 1 × 0.5 across 64 cols)
-auto got = ttnn::to_torch(out);                  // expected: ~32; actual: ~2^60
-EXPECT_NEAR(got.abs().max().item<float>(), 32.0, 1e-2);   // FAILS
+```
+tests/ttnn/unit_tests/operations/transformers/test_prefetcher_BFP8_corruption_BH.py
 ```
 
-Expected: with BFP8 in1, the matmul output has magnitude many orders of magnitude larger than the torch reference. With BFP4 (change `from_torch` dtype + page_size to 576), the assertion passes.
+Run inside the `p3a-ngram` container against the 2× Blackhole P150a mesh:
 
-If a standalone reproducer is helpful for Tenstorrent's internal investigation we can collaborate on building one against the team's preferred test scaffold.
+```bash
+podman exec p3a-ngram bash -lc '\
+  source /opt/venv/bin/activate && \
+  cd /tt-metal && \
+  MESH_DEVICE=P300 HF_MODEL=Qwen3-8B \
+  pytest -xvs \
+    tests/ttnn/unit_tests/operations/transformers/test_prefetcher_BFP8_corruption_BH.py \
+    2>&1 | tee /tmp/u46_repro.log'
+```
+
+The scaffold mirrors `test_prefetcher_BH.py`'s setup but parameterizes the weight dtype (`bfloat4_b` vs `bfloat8_b`) and uses Qwen3-8B-balanced dims with `num_receiver_cores=4` so `ring_size=32` matches the four broken ELFs in §3.1. Weights are `torch.randn(seed=0xBADC0FFE)`; 50 trace replays exercise GCB wrap.
+
+**Key negative finding:** on the same 2× Blackhole P150a hardware where the full SGLang Qwen3-8B decode crashes the sampler with `|out| > 1e10` 100% of the time, this minimal scaffold reports **`2 passed`** — both BFP4 and BFP8 cleanly produce `max_abs_diff ∈ [1.2, 7.1]` against the torch reference. Output excerpt:
+
+```
+[BFP8-corruption-repro] CLEAN dtype=DataType.BFLOAT4_B num_layers=1 - all 10 (layer, matmul, device) tuples passed.
+[BFP8-corruption-repro] CLEAN dtype=DataType.BFLOAT8_B num_layers=1 - all 10 (layer, matmul, device) tuples passed.
+========================= 2 passed, 1 warning in 6.74s =========================
+```
+
+So the bug is **strictly more selective** than "BFP8 + the dual-index `experimental::CreateCircularBuffer(prog, cores, remote_cfg, *global_cb)` allocation regime + the gathered `matmul_multicore_reuse_mcast_1d` factory". The five elements present in production but absent from this scaffold are:
+
+1. **CCL ops between matmuls** (reduce_scatter on K-sharded outputs, RMSNorm, RoPE, SDPA, residual add). Production attention is `QKV → SDPA → WO → reduce_scatter → residual`; MLP is `FF1, FF3 → SiLU → mul → FF2 → reduce_scatter → residual`. The CCL/norm/rotary kernels dispatch on the *same* worker sub-device pool as the matmul kernels and the prefetcher's receiver reader/writer kernels, and reshape L1 / NoC traffic in ways the scaffold does not exercise.
+2. **36 decoder layers per trace**, not 1. Per-tensor wr_ptr arithmetic and the producer's GCB-page-size re-alignment (writer_l1.cpp:95 + remote_circular_buffer.h:110) compound differently across 36 vs 1.
+3. **Real HF Qwen3-8B weights**, not `torch.randn`. Hypothesis 5.3(1) (MOP-replay-buffer tile-stride aliasing) is most plausibly triggered when the wrong tile stride lands on a face whose decoded shared-exponent magnifies the misread mantissa bits — `randn` spreads magnitudes too uniformly across faces for this to surface reliably.
+4. **Concurrent prefill + decode traces** (production captures both, switches sub-device managers between them, replays decode in a tight loop).
+5. **Greater number of trace replays.** Production decode runs ~1000+ steps before observing the failure; the scaffold runs 50.
+
+The cleanest next steps for collapsing the failure surface, in increasing engineering cost:
+
+- (a) Add a tt-metal-side `ccl_async::reduce_scatter` between matmuls in this scaffold and see if BFP8 fails.
+- (b) Increase `num_layers` from 1 → 36 (will need more GCB headroom + larger trace region).
+- (c) Drop `torch.randn` and load real `Qwen3-8B.safetensors` (or sample the actual layer-0 weight magnitudes from a SGLang dump).
+- (d) Add a `_run_decode_trace` loop that captures prefill + decode separately and replays decode 1000+ times.
+
+The Tenstorrent LLK team may prefer to land (a) or (c) on their existing test infra; we can supply real Qwen3-8B layer-0 weight tensors as a single safetensors blob on request.
 
 ## 7. Probe inventory (env-gated, default-off; in tree on branch `tenstorrent-p1`)
 
