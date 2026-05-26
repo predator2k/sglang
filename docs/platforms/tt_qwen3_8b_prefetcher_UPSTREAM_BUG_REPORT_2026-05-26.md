@@ -541,9 +541,49 @@ DPRINT capture envs (provided by tt-metal itself, not added by us): `TT_METAL_DP
 
 ## 9. Suggested next debugging steps for Tenstorrent
 
+### 9.0 Prior-art context for the LLK team (CFGSHIFTMASK saga)
+
+The unpacker MOP/replay buffer cfg-register manipulation path in `llk_unpack_AB_matmul.h` has **prior known unresolved silicon issues on Blackhole**. Relevant history (Feb-Mar 2025):
+
+| Ref | Date | What happened |
+|---|---|---|
+| `tt-llk-bh#4` | 2025-02-19 | Proposed using `TTI_CFGSHIFTMASK` to update unpacker `THCON_SEC0_REG3_Base_address` inside the MOP/replay buffer for perf |
+| `tt-llk#21` | 2025-02-19 | Merged the CFGSHIFTMASK change |
+| `tt-metal#18250` | 2025-02-24 | **Resnet50 on Blackhole HANGS** with `act_dtype=BFLOAT8_B, weight_dtype=BFLOAT8_B, math_fidelity=LoFi` after the CFGSHIFTMASK change. Non-deterministic — "sometimes passes, but hangs mostly" |
+| `tt-llk#21 revert` | 2025-02-25 | First revert (`3af85498`) |
+| `tt-llk#34` | 2025-03-07 | Re-added CFGSHIFTMASK (`f2e18882`) |
+| `tt-llk#53` | 2025-03-13 | **Re-reverted, never re-applied since** (`84be1b21`) |
+
+Confirmed via grep on our `tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_AB_matmul.h` HEAD: zero CFGSHIFTMASK references. Our codepath uses the surviving "safe" RDCFG → ADDDMAREG → STALLWAIT → WRCFG fallback (the pre-#21 code).
+
+**Why this is relevant for our handoff**:
+- Same file, same instruction surface (unpacker cfg-register update inside MOP/replay)
+- Same silicon (Blackhole-only — Wormhole was not affected)
+- Same datum format class (BFP8 inputs)
+- Symptom is different (their bug: hang; our bug: silent garbage) but plausibly the same underlying silicon state-machine instability around how the unpacker handles cfg updates in the MOP replay context
+- Our trigger (`experimental::CreateCircularBuffer(prog, cores, remote_cfg, *global_cb)` allocation pattern) is one of only **4 production code paths** in the entire tt-metal tree that uses dual-index remote+local CB allocation — the others are also matmul/CCL ops or tests
+
+LLK team: please check whether the deferred CFGSHIFTMASK investigation overlaps with this bug. A bug class that has caused both deterministic garbage AND non-deterministic hangs under different triggers is a meaningful signal.
+
+### 9.1 Upstream-search summary (what we checked)
+
+| Check | Result |
+|---|---|
+| Upstream commits touching `llk_unpack_AB_matmul.h` since our base `89686ee78d` | **0** functional changes; one `LLK_ASSERT` for tiny tiles (`#1301`) |
+| Upstream commits touching `matmul_multicore_reuse_mcast_1d_program_factory.cpp` | 3 (#44529, #44528, #44341) — all "bad optional access" fixes or `allowed_worker_cores` plumbing; none address the BFP8 garbage |
+| Upstream `dram_prefetcher` op commits | 2 (#44243, #43619) — API publish + descriptor migration; not data correctness |
+| Upstream `bmm_large_block_*` kernel commits | 2 (#43934, #44872) — `#44872` is `[Bug Fix] DRAM Matmul - Fix Compute Reading Un-pushed Data` for the *DRAM-sharded* factory; already evaluated in our Lead 2, ruled out (different factory path) |
+| Upstream `tt-llk` PRs mentioning BFP8/unpacker | `#1276` LLK_ASSERTs for pack/unpack format compat (closed); `#739` open BFP8 tilize-packer failure for num_faces=1,2 (different surface — tilize, not gather) |
+| GitHub issues for "BFP8 garbage prefetcher" or similar | **0** matching ours |
+| Commits behind upstream | 401 |
+
+No upstream fix exists for our bug at this snapshot.
+
+### 9.2 Concrete attack plan
+
 1. **Galaxy-diff.** Side-by-side the `dram_prefetcher` + `matmul_multicore_reuse_mcast_1d` config used by `models/demos/llama3_70b_galaxy/` (which works with BFP8 + `experimental::CreateCircularBuffer(prog, cores, remote_cfg, *global_cb)`) vs the four Qwen3-8B configs above. Likely differences live in `in0_block_w`, `out_subblock_w`, `in1_num_subblocks`, `ring_size`, or `num_cores`. The single CT-arg that makes Galaxy land in a working silicon regime would be the key.
-2. **Standalone tt-llk reproducer.** Build the minimal-reproducer outline in §6.2 inside `tt-llk/tests/` (or wherever the LLK team's preferred test scaffold lives). Once reproducible without SGLang dependencies, it can be bisected independently.
-3. **tt-llk bisection.** Bisect against `tt-llk` commit history: does an older revision handle BFP8 + the dual-index `remote_cfg + *global_cb` allocation correctly? The active path is `tt_metal/tt-llk/tt_llk_blackhole/` (NOT the orphan `tt_metal/third_party/tt_llk/`); both contain the same structural `else { TTI_UNPACR(SrcA, ...); }` branch.
+2. **Standalone tt-metal reproducer.** Build the minimal-reproducer outline in §6.2 inside `tests/ttnn/unit_tests/operations/transformers/` next to the existing `test_prefetcher_BH.py` (660-line Blackhole prefetcher unit test that exercises the same `Prefetcher` + 5 matmul scaffold). Once reproducible without SGLang dependencies, it can be bisected independently.
+3. **tt-llk bisection.** Bisect against `tt-llk` commit history: does an older revision handle BFP8 + the dual-index `remote_cfg + *global_cb` allocation correctly? Focus on Feb-Mar 2025 PRs #21/#34/#53 + their fallback code. The active path is `tt_metal/tt-llk/tt_llk_blackhole/` (NOT the orphan `tt_metal/third_party/tt_llk/`); both contain the same structural `else { TTI_UNPACR(SrcA, ...); }` branch.
 4. **Tensix ISA disasm comparison.** Disassemble the UNPACR microcode actually emitted on the broken (gathered) vs working (canonical) paths, against the same in1 BFP8 weights. The MOP replay buffer programmed at `_llk_unpack_AB_matmul_init_` time is the highest-value target — its replay-buffer contents are not user-visible at runtime today but should be inspectable from a debugger.
 5. **Tensix debug-status / ADC inspection.** After the failing matmul fires, read `TENSIX_DEBUG` + ADC channel registers to confirm or refute Hypothesis 5.3(2) (ADC counter leakage).
 6. **SrcA AllowedClient trace.** Per `UNPACR_Regular.md:354-356`, the unpacker spins on `SrcA[Bank].AllowedClient`. If silicon trace shows the unpacker proceeding before the bank is truly owned (race on the `ALLOW_CLIENT` write from MATH), that would directly evidence Hypothesis 5.3(1).
