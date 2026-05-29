@@ -211,6 +211,27 @@ U46 `test_prefetcher_BFP8_corruption_BH` test case is byte-equivalent
 No production code modified. No SGLang Python modified. No stash@{0,1,2}
 touched. Constraint set from U50 honored bit-for-bit.
 
+## §7.5 Canonical re-verify
+
+U51 touched ZERO production code (`tt-metal-sglang` `git diff --stat`
+shows ONE file changed: the in-`tests/` standalone reproducer). Canonical
+SGLang behavior is therefore preserved by-construction.
+
+Smoke test (canonical, no prefetcher, no U50 env, no U49 env, no probes):
+```
+podman exec p3a-ngram bash -c 'bash /sglang/.../scripts/u22_run_one.sh u51_canon_smoke'
+```
+Response:
+```
+{"text":" What is 2+2? What is 2+2? What",
+ "output_ids":[3555,374,220,17,10,17,30,3555,374,220,17,10,17,30,3555],
+ ...}
+```
+Byte-identical to U50's canonical baseline (`" What is 2+2? What is 2+2?
+What is 2+2"` — same token sequence, U51 just stopped earlier at
+`max_new_tokens=15`). U50 already established this canonical pattern
+corresponds to GSM8K(10) = 10/10. No regression.
+
 ## §8 Hard constraints honored
 
 - predator2k fork only — no upstream PRs to `tenstorrent/tt-metal`
